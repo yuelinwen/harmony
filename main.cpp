@@ -1,6 +1,10 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
+
+#include "src/node/master_node.h"
+#include "src/node/worker_node.h"
 
 int main(int argc, char** argv) {
     int id = -1;
@@ -14,14 +18,16 @@ int main(int argc, char** argv) {
     }
 
     if (id < 0) {
-        std::cerr << "usage: " << argv[0] << " -id=0 (master) | -id=1,2,... (worker)" << std::endl;
+        std::cout << "usage: " << argv[0] << " -id=0 (master) | -id=1,2,... (worker)" << std::endl;
         return 1;
     }
 
+    std::unique_ptr<harmony::Node> node;
     if (id == 0) {
-        std::cout << "master node started" << std::endl;
+        node = std::make_unique<harmony::MasterNode>();
     } else {
-        std::cout << "worker node started, id=" << id << std::endl;
+        node = std::make_unique<harmony::WorkerNode>(id);
     }
-    return 0;
+
+    return node->run();
 }
