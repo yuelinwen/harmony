@@ -21,9 +21,9 @@ if(MINGW)
 endif()
 
 # windows:
-# g++ -std=c++20 -I. main.cpp src/node/master_node.cpp src/node/worker_node.cpp -static -static-libgcc -static-libstdc++ -o harmony.exe
+#   g++ -std=c++20 -I. main.cpp src/node/master_node.cpp src/node/worker_node.cpp -static -static-libgcc -static-libstdc++ -o harmony.exe
 # mac:
-# g++ -std=c++20 -I. main.cpp src/node/*.cpp src/index/*.cpp -o main
+#   g++ -std=c++20 -I. main.cpp src/node/*.cpp src/index/*.cpp -o main
 # dataset script:
-# python3 util/convert_hdf5.py Data/sift-128-euclidean.hdf5 Data/sift
+#   python3 util/convert_hdf5.py Data/sift-128-euclidean.hdf5 Data/sift
 # macos: ./cmake-build-debug/harmony -id=0
