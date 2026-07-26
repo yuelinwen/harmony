@@ -1,6 +1,7 @@
 .idea
 .vscode
 main
+data
 
 ### C++ template
 # Prerequisites

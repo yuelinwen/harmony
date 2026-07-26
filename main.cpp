@@ -3,6 +3,7 @@
 #include <iostream>
 #include <memory>
 
+#include "src/index/dataset.h"
 #include "src/node/master_node.h"
 #include "src/node/worker_node.h"
 
@@ -21,6 +22,19 @@ int main(int argc, char** argv) {
         std::cout << "usage: " << argv[0] << " -id=0 (master) | -id=1,2,... (worker)" << std::endl;
         return 1;
     }
+
+    // --- temporary: check that the dataset loads correctly ---
+    harmony::Dataset base;
+    if (!base.load("Data/sift_base.bin")) {
+        return 1;
+    }
+    std::cout << "loaded base: n=" << base.getN() << " dim=" << base.getDim() << std::endl;
+
+    const float* v = base.vec(0);
+    for (int j = 0; j < base.getDim(); ++j) {
+        std::cout << v[j] << " ";
+    }
+    std::cout << std::endl;
 
     std::unique_ptr<harmony::Node> node;
     if (id == 0) {

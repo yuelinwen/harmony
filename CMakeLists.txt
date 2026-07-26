@@ -8,6 +8,7 @@ add_executable(harmony
         main.cpp
         src/node/master_node.cpp
         src/node/worker_node.cpp
+        src/index/dataset.cpp
 )
 
 # so that includes like "src/node/..." in main.cpp resolve from the project root
@@ -19,6 +20,10 @@ if(MINGW)
     target_link_options(harmony PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
 
+# windows:
 # g++ -std=c++20 -I. main.cpp src/node/master_node.cpp src/node/worker_node.cpp -static -static-libgcc -static-libstdc++ -o harmony.exe
-#
+# mac:
+# g++ -std=c++20 -I. main.cpp src/node/*.cpp src/index/*.cpp -o main
+# dataset script:
+# python3 util/convert_hdf5.py Data/sift-128-euclidean.hdf5 Data/sift
 # macos: ./cmake-build-debug/harmony -id=0
