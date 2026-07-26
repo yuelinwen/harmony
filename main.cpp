@@ -1,13 +1,37 @@
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <vector>
 
 #include "src/index/dataset.h"
-#include "src/node/master_node.h"
-#include "src/node/worker_node.h"
 #include "src/index/distance.h"
 #include "src/engine/topk_heap.h"
+#include "src/node/master_node.h"
+#include "src/node/worker_node.h"
+
+// Reads the groundtruth file (same layout as base/query, but int32 data):
+//     int32 n, int32 dim, then n * dim int32 values.
+// Row i = the ids of the true nearest neighbors of query i.
+static bool loadGroundtruth(const std::string& path, std::vector<int>& data, int& n, int& dim) {
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        std::cerr << "cannot open file: " << path << std::endl;
+        return false;
+    }
+    int header[2];
+    if (std::fread(header, sizeof(int), 2, file) != 2) {
+        std::fclose(file);
+        return false;
+    }
+    n = header[0];
+    dim = header[1];
+    data.resize((size_t)n * dim);
+    size_t got = std::fread(data.data(), sizeof(int), data.size(), file);
+    std::fclose(file);
+    return got == data.size();
+}
 
 int main(int argc, char** argv) {
     int id = -1;
@@ -25,18 +49,75 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // --- temporary: check that the dataset loads correctly ---
+    // --- temporary: brute-force search on query 0, check against groundtruth ---
+
     harmony::Dataset base;
-    if (!base.load("Data/sift_base.bin")) {
+    harmony::Dataset query;
+    if (!base.load("Data/sift_base.bin") || !query.load("Data/sift_query.bin")) {
         return 1;
     }
-    std::cout << "loaded base: n=" << base.getN() << " dim=" << base.getDim() << std::endl;
+    std::cout << "base:  n=" << base.getN() << " dim=" << base.getDim() << std::endl;
+    std::cout << "query: n=" << query.getN() << " dim=" << query.getDim() << std::endl;
 
-    const float* v = base.vec(0);
-    for (int j = 0; j < base.getDim(); ++j) {
-        std::cout << v[j] << " ";
+    std::vector<int> gt;
+    int gtN = 0;
+    int gtDim = 0;
+    if (!loadGroundtruth("Data/sift_gt.bin", gt, gtN, gtDim)) {
+        return 1;
+    }
+    std::cout << "gt:    n=" << gtN << " dim=" << gtDim << std::endl;
+
+    // Brute force: compare query 0 against every base vector, keep top 100.
+    int k = 100;
+    harmony::TopKHeap heap(k);
+    for (int i = 0; i < base.getN(); ++i) {
+        float d = harmony::l2DistanceSquared(query.vec(0), base.vec(i), base.getDim());
+        heap.push(i, d);
+    }
+
+    std::vector<harmony::Candidate> mine = heap.results();
+
+    // Compare: my top 10 ids vs groundtruth row 0 top 10 ids.
+    std::cout << "\nmine:  ";
+    for (int j = 0; j < 10; ++j) {
+        std::cout << mine[j].id << " ";
+    }
+    std::cout << "\ngt:    ";
+    for (int j = 0; j < 10; ++j) {
+        std::cout << gt[j] << " ";   // row 0 starts at index 0
     }
     std::cout << std::endl;
+
+    // Full check over all 100: count how many match position by position.
+    int match = 0;
+    for (int j = 0; j < k; ++j) {
+        if (mine[j].id == gt[j]) {
+            match = match + 1;
+        }
+    }
+    std::cout << "match: " << match << "/" << k << std::endl;
+
+    // See why the nearest neighbour is "near": print the query next to the
+    // closest and the farthest of the 100 results, first 20 dimensions.
+    int nearestId = mine[0].id;
+    int farthestId = mine[k - 1].id;
+
+    std::cout << "\nquery[0]        :";
+    for (int j = 0; j < 20; ++j) {
+        std::cout << " " << query.vec(0)[j];
+    }
+    std::cout << "\nnearest  " << nearestId << " :";
+    for (int j = 0; j < 20; ++j) {
+        std::cout << " " << base.vec(nearestId)[j];
+    }
+    std::cout << "\nfarthest " << farthestId << " :";
+    for (int j = 0; j < 20; ++j) {
+        std::cout << " " << base.vec(farthestId)[j];
+    }
+    std::cout << "\n\ndist to nearest  = " << mine[0].dist << std::endl;
+    std::cout << "dist to farthest = " << mine[k - 1].dist << std::endl;
+
+    // --- end temporary ---
 
     std::unique_ptr<harmony::Node> node;
     if (id == 0) {
@@ -45,24 +126,5 @@ int main(int argc, char** argv) {
         node = std::make_unique<harmony::WorkerNode>(id);
     }
 
-    // vector calculation verfiy
-    float a[2] = {1.0f, 2.0f};
-    float b[2] = {4.0f, 6.0f};
-    std::cout << harmony::l2DistanceSquared(a, b, 2) << std::endl;         // 应输出 25
-    std::cout << harmony::l2DistanceSquaredRange(a, b, 0, 1) << std::endl; // 应输出 9
-    std::cout << harmony::l2DistanceSquaredRange(a, b, 1, 2) << std::endl; // 应输出 16
-
-    // top k heap
-    harmony::TopKHeap heap(3);
-    heap.push(10, 5.0f);
-    heap.push(11, 2.0f);
-    heap.push(12, 8.0f);
-    heap.push(13, 1.0f);
-    heap.push(14, 9.0f);
-
-    std::cout << "worst = " << heap.worst() << std::endl;   // should be 5
-    for (auto& c : heap.results()) {
-        std::cout << "id=" << c.id << " dist=" << c.dist << std::endl;
-    }
     return node->run();
 }
