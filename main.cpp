@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -116,6 +117,65 @@ int main(int argc, char** argv) {
     }
     std::cout << "\n\ndist to nearest  = " << mine[0].dist << std::endl;
     std::cout << "dist to farthest = " << mine[k - 1].dist << std::endl;
+
+    // --- A4: dimension-level pruning experiment (paper Fig.2(a), Table 3) ---
+    //
+    // Same brute-force search, but the 128 dims are split into 4 slices.
+    // After each slice we check the accumulated partial distance against
+    // the current threshold (heap.worst()). Partial sums only grow, so if
+    // the sum already exceeds the threshold, the remaining slices can be
+    // skipped safely: this vector can never enter the top-K.
+
+    int nSlices = 4;
+    int sliceSize = base.getDim() / nSlices;          // 128 / 4 = 32
+    std::vector<long> prunedAt(nSlices, 0);           // pruned after slice s
+    long survived = 0;                                // computed all slices
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    harmony::TopKHeap pheap(k);
+    for (int i = 0; i < base.getN(); ++i) {
+        float sum = 0.0f;
+        bool pruned = false;
+        for (int s = 0; s < nSlices; ++s) {
+            sum = sum + harmony::l2DistanceSquaredRange(
+                query.vec(0), base.vec(i), s * sliceSize, (s + 1) * sliceSize);
+            if (sum > pheap.worst()) {
+                prunedAt[s] = prunedAt[s] + 1;
+                pruned = true;
+                break;                                // skip remaining slices
+            }
+        }
+        if (!pruned) {
+            survived = survived + 1;
+            pheap.push(i, sum);
+        }
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // Correctness: pruning must not change the result at all.
+    std::vector<harmony::Candidate> pruneResults = pheap.results();
+    int pmatch = 0;
+    for (int j = 0; j < k; ++j) {
+        if (pruneResults[j].id == gt[j]) {
+            pmatch = pmatch + 1;
+        }
+    }
+
+    std::cout << "\n--- pruning experiment (4 slices of " << sliceSize << " dims) ---" << std::endl;
+    long total = base.getN();
+    long cumulative = 0;
+    for (int s = 0; s < nSlices; ++s) {
+        cumulative = cumulative + prunedAt[s];
+        std::cout << "pruned after slice " << (s + 1) << ": " << prunedAt[s]
+                  << "  (cumulative " << (100.0 * cumulative / total) << "%)" << std::endl;
+    }
+    std::cout << "survived all slices: " << survived
+              << "  (" << (100.0 * survived / total) << "%)" << std::endl;
+    std::cout << "match with gt: " << pmatch << "/" << k << "  (must be " << k << ")" << std::endl;
+    std::cout << "time: " << ms << " ms" << std::endl;
 
     // --- end temporary ---
 
