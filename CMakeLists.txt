@@ -9,6 +9,7 @@ add_executable(harmony
         src/node/master_node.cpp
         src/node/worker_node.cpp
         src/index/dataset.cpp
+        src/index/ivf_index.cpp
 )
 
 # so that includes like "src/node/..." in main.cpp resolve from the project root

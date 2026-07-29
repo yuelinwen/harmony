@@ -8,6 +8,7 @@
 
 #include "src/index/dataset.h"
 #include "src/index/distance.h"
+#include "src/index/ivf_index.h"
 #include "src/engine/topk_heap.h"
 #include "src/node/master_node.h"
 #include "src/node/worker_node.h"
@@ -176,6 +177,40 @@ int main(int argc, char** argv) {
               << "  (" << (100.0 * survived / total) << "%)" << std::endl;
     std::cout << "match with gt: " << pmatch << "/" << k << "  (must be " << k << ")" << std::endl;
     std::cout << "time: " << ms << " ms" << std::endl;
+
+    // --- A5: IVF index (own kmeans + own scan, no dependencies) ---
+
+    harmony::IvfIndex ivf;
+    int nlist = 256;
+    int nprobe = 32;
+
+    std::cout << "\n--- building IVF index (nlist=" << nlist << ") ---" << std::endl;
+    auto b0 = std::chrono::steady_clock::now();
+    ivf.build(base, nlist, 10);
+    auto b1 = std::chrono::steady_clock::now();
+    std::cout << "build time: "
+              << std::chrono::duration<double>(b1 - b0).count() << " s" << std::endl;
+
+    // search query 0 through the index
+    auto s0 = std::chrono::steady_clock::now();
+    std::vector<harmony::Candidate> ivfResults = ivf.search(base, query.vec(0), nprobe, k);
+    auto s1 = std::chrono::steady_clock::now();
+    double ivfMs = std::chrono::duration<double, std::milli>(s1 - s0).count();
+
+    // recall@100: how many of my 100 ids appear anywhere in the gt 100.
+    // (not position-by-position: IVF is approximate, order can shift)
+    int hit = 0;
+    for (int a = 0; a < k; ++a) {
+        for (int g = 0; g < k; ++g) {
+            if (ivfResults[a].id == gt[g]) {
+                hit = hit + 1;
+                break;
+            }
+        }
+    }
+    std::cout << "ivf search (nprobe=" << nprobe << "): " << ivfMs << " ms" << std::endl;
+    std::cout << "recall@100: " << hit << "/" << k
+              << " = " << (100.0 * hit / k) << "%" << std::endl;
 
     // --- end temporary ---
 
