@@ -9,6 +9,8 @@
 #include "src/index/dataset.h"
 #include "src/index/distance.h"
 #include "src/index/ivf_index.h"
+#include "src/engine/pruning_scanner.h"
+#include "src/engine/slice_plan.h"
 #include "src/engine/topk_heap.h"
 #include "src/node/master_node.h"
 #include "src/node/worker_node.h"
@@ -128,30 +130,13 @@ int main(int argc, char** argv) {
     // skipped safely: this vector can never enter the top-K.
 
     int nSlices = 4;
-    int sliceSize = base.getDim() / nSlices;          // 128 / 4 = 32
+    harmony::SlicePlan plan{base.getDim(), nSlices};
     std::vector<long> prunedAt(nSlices, 0);           // pruned after slice s
-    long survived = 0;                                // computed all slices
 
     auto t0 = std::chrono::steady_clock::now();
 
     harmony::TopKHeap pheap(k);
-    for (int i = 0; i < base.getN(); ++i) {
-        float sum = 0.0f;
-        bool pruned = false;
-        for (int s = 0; s < nSlices; ++s) {
-            sum = sum + harmony::l2DistanceSquaredRange(
-                query.vec(0), base.vec(i), s * sliceSize, (s + 1) * sliceSize);
-            if (sum > pheap.worst()) {
-                prunedAt[s] = prunedAt[s] + 1;
-                pruned = true;
-                break;                                // skip remaining slices
-            }
-        }
-        if (!pruned) {
-            survived = survived + 1;
-            pheap.push(i, sum);
-        }
-    }
+    harmony::scanAll(base, query.vec(0), plan, pheap, prunedAt);
 
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -165,7 +150,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::cout << "\n--- pruning experiment (4 slices of " << sliceSize << " dims) ---" << std::endl;
+    std::cout << "\n--- pruning experiment (" << nSlices << " slices) ---" << std::endl;
     long total = base.getN();
     long cumulative = 0;
     for (int s = 0; s < nSlices; ++s) {
@@ -173,6 +158,7 @@ int main(int argc, char** argv) {
         std::cout << "pruned after slice " << (s + 1) << ": " << prunedAt[s]
                   << "  (cumulative " << (100.0 * cumulative / total) << "%)" << std::endl;
     }
+    long survived = total - cumulative;               // computed all slices
     std::cout << "survived all slices: " << survived
               << "  (" << (100.0 * survived / total) << "%)" << std::endl;
     std::cout << "match with gt: " << pmatch << "/" << k << "  (must be " << k << ")" << std::endl;
