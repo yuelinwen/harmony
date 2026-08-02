@@ -20,6 +20,7 @@ class MasterNode : public Node {
 public:
     MasterNode() : Node(0) {
         numWorkers_ = 0;
+        scanned_ = 0;
     }
     ~MasterNode() override = default;
 
@@ -51,6 +52,10 @@ private:
     int numWorkers_;
     SlicePlan plan_;   // how the dimensions are cut up among the workers
     std::vector<WorkerNode> workers_;
+
+    // pruning counters (paper Table 3)
+    long scanned_;                  // candidates offered in total
+    std::vector<long> aliveAfter_;  // still alive after worker w's slice
 
     // ---- v1: vector partition, one process, direct method calls ----
     //

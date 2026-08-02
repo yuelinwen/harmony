@@ -5,26 +5,16 @@
 #include "../index/distance.h"
 
 namespace harmony {
-    void WorkerNode::setDimensions(int dimBegin, int dimEnd) {
-        dimBegin_ = dimBegin;
-        dimEnd_ = dimEnd;
+    void WorkerNode::setDimCount(int myDim) {
+        myDim_ = myDim;
     }
 
     void WorkerNode::addCluster(int clusterId, const std::vector<int>& ids,
-                            const Dataset& base) {
-        int myDim = dimEnd_ - dimBegin_;
-
+                                const std::vector<float>& data) {
         ClusterBlock block;
         block.clusterId = clusterId;
         block.ids = ids;
-        block.data.resize(ids.size() * myDim);
-
-        for (size_t i = 0; i < ids.size(); ++i) {
-            const float* v = base.vec(ids[i]);
-            for (int j = 0; j < myDim; ++j) {
-                block.data[i * myDim + j] = v[dimBegin_ + j];   // only my slice
-            }
-        }
+        block.data = data;      // already sliced by the master
 
         blocks_.push_back(block);
     }
@@ -37,27 +27,25 @@ namespace harmony {
         return n;
     }
 
-    std::vector<float> WorkerNode::partialDistances(const float* query,
-                                                    const std::vector<int>& clusterIds) {
-        int myDim = dimEnd_ - dimBegin_;
-        std::vector<float> out;
-
-        for (int i = 0; i < (int)clusterIds.size(); ++i) {
-            for (int b = 0; b < (int)blocks_.size(); ++b) {
-                if (blocks_[b].clusterId != clusterIds[i]) {
-                    continue;
+    void WorkerNode::accumulate(const float* querySlice, int clusterId, float threshold,
+                                std::vector<float>& sums, std::vector<char>& alive) {
+        for (int b = 0; b < (int)blocks_.size(); ++b) {
+            if (blocks_[b].clusterId != clusterId) {
+                continue;
+            }
+            const ClusterBlock& block = blocks_[b];
+            for (int v = 0; v < (int)block.ids.size(); ++v) {
+                if (!alive[v]) {
+                    continue;      // an earlier worker already dropped it
                 }
-                const ClusterBlock& block = blocks_[b];
-                for (int v = 0; v < (int)block.ids.size(); ++v) {
-                    // query is the full vector, so skip to my slice of it
-                    out.push_back(l2DistanceSquared(query + dimBegin_,
-                                                    &block.data[(size_t)v * myDim],
-                                                    myDim));
+                sums[v] = sums[v] + l2DistanceSquared(querySlice,
+                                                      &block.data[(size_t)v * myDim_],
+                                                      myDim_);
+                if (sums[v] > threshold) {
+                    alive[v] = 0;  // cannot reach the top-K, stop here
                 }
             }
         }
-
-        return out;
     }
 
 
