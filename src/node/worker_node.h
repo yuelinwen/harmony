@@ -14,41 +14,45 @@
 namespace harmony {
 
 // One cluster living on this worker: the global ids of its vectors, plus
-// this worker's own copy of those vectors.
+// this worker's copy of them, cut down to the dimensions it owns.
 struct ClusterBlock {
     int clusterId;            // id in the master's global clustering
     std::vector<int> ids;     // global vector ids
-    std::vector<float> data;  // ids.size() * dim, row-major
+    std::vector<float> data;  // ids.size() * (dimEnd - dimBegin), row-major
 };
 
 class WorkerNode : public Node {
 public:
     explicit WorkerNode(int id) : Node(id) {
-        dim_ = 0;
+        dimBegin_ = 0;
+        dimEnd_ = 0;
     }
     ~WorkerNode() override = default;
 
     int run() override;
 
-    // Copies one cluster's vectors out of base and keeps them here.
+    // Which dimensions of every vector this worker is responsible for.
+    // Must be called before addCluster.
+    void setDimensions(int dimBegin, int dimEnd);
+
+    // Copies one cluster out of base, keeping only this worker's dimensions.
     // Under MPI this becomes "receive the block the master sent".
     void addCluster(int clusterId, const std::vector<int>& ids, const Dataset& base);
 
     // How many vectors this worker ended up with.
     long vectorCount() const;
 
-    // Scans only the given clusters and returns the best k found here.
-    // The master merges what every worker returns.
-    std::vector<Candidate> search(const float* query,
-                                  const std::vector<int>& clusterIds, int k);
+    // Distance over this worker's dimensions only: one value per vector in
+    // the given clusters, in cluster order. A partial distance is not enough
+    // to rank anything, so unlike v1 the worker cannot return a top-k here --
+    // the master adds up what every worker sends before it can sort.
+    std::vector<float> partialDistances(const float* query,
+                                        const std::vector<int>& clusterIds);
 
 private:
-    int dim_;
+    int dimBegin_;
+    int dimEnd_;
     std::vector<ClusterBlock> blocks_;
-
-    // ---- v2: dimension partition ----
-    // TODO 3. hold only some dimensions of each vector, not the whole vector
-    // TODO 4. return a partial distance instead of a full one
 
     // ---- v3: pruning ----
     // TODO 5. keep the tau^2 last sent by the master

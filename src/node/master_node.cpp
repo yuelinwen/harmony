@@ -30,79 +30,72 @@ void MasterNode::buildIndex(int nlist, int iterations) {
               << std::chrono::duration<double>(t1 - t0).count() << " s" << std::endl;
 }
 
-// Round-robin: cluster 0 goes to worker 0, cluster 1 to worker 1, and so on.
-// Simple, and good enough while all clusters are treated as equally hot.
-// The paper assigns frequently accessed clusters more carefully (Section
-// 6.2.2), but that needs query history we do not have yet.
-void MasterNode::splitClusters(int numWorkers) {
+// Cut the dimensions into equal slices, one per worker. The paper gives each
+// machine a share of the dimensions proportional to its compute capacity,
+// which on a homogeneous cluster is just d/N (Section 4.2).
+void MasterNode::splitDimensions(int numWorkers) {
     numWorkers_ = numWorkers;
+    plan_ = SlicePlan{base_.getDim(), numWorkers};
 
-    int nlist = index_.getNlist();
-    clusterOwner_.resize(nlist);
-    for (int c = 0; c < nlist; ++c) {
-        clusterOwner_[c] = c % numWorkers;
-    }
-
-    // Report how even the split turned out. Uneven loads are the problem
-    // the paper is about, so it is worth seeing the numbers from the start.
-    std::vector<int> clusters(numWorkers, 0);
-    std::vector<long> vectors(numWorkers, 0);
-    for (int c = 0; c < nlist; ++c) {
-        int w = clusterOwner_[c];
-        clusters[w] = clusters[w] + 1;
-        vectors[w] = vectors[w] + index_.clusterSize(c);
-    }
-
-    std::cout << "split " << nlist << " clusters over " << numWorkers
-              << " workers" << std::endl;
+    std::cout << "split " << base_.getDim() << " dimensions over "
+              << numWorkers << " workers" << std::endl;
     for (int w = 0; w < numWorkers; ++w) {
-        std::cout << "  worker " << w << ": " << clusters[w] << " clusters, "
-                  << vectors[w] << " vectors" << std::endl;
+        std::cout << "  worker " << (w + 1) << ": dims ["
+                  << plan_.begin(w) << "," << plan_.end(w) << ")" << std::endl;
     }
 }
 
-// Each worker gets its own copy of the vectors in the clusters it owns, so
-// that no worker reads the full dataset. That costs one extra copy of the
-// base data here, but it is what a worker really holds under MPI.
+// Every worker gets every cluster, but only its own slice of each vector.
+// The load is identical on all workers by construction, whatever the query
+// pattern looks like -- that is the point of partitioning by dimension.
 void MasterNode::createWorkers() {
     workers_.clear();
     for (int w = 0; w < numWorkers_; ++w) {
         workers_.emplace_back(w + 1);   // ids start at 1, the master is 0
+        workers_[w].setDimensions(plan_.begin(w), plan_.end(w));
     }
 
     for (int c = 0; c < index_.getNlist(); ++c) {
-        int w = clusterOwner_[c];
-        workers_[w].addCluster(c, index_.clusterIds(c), base_);
+        for (int w = 0; w < numWorkers_; ++w) {
+            workers_[w].addCluster(c, index_.clusterIds(c), base_);
+        }
     }
 
     std::cout << "created " << numWorkers_ << " workers" << std::endl;
     for (int w = 0; w < numWorkers_; ++w) {
         std::cout << "  worker " << workers_[w].getId() << ": "
-                  << workers_[w].vectorCount() << " vectors" << std::endl;
+                  << workers_[w].vectorCount() << " vectors x "
+                  << (plan_.end(w) - plan_.begin(w)) << " dims" << std::endl;
     }
 }
 
 std::vector<Candidate> MasterNode::search(const float* query, int nprobe, int k) {
     std::vector<int> clusters = index_.nearestClusters(query, nprobe);
 
-    // group the chosen clusters by the worker that owns them, so each
-    // worker is asked once instead of once per cluster
-    std::vector<std::vector<int>> perWorker(numWorkers_);
+    // the candidate ids, in the order every worker walks them
+    std::vector<int> ids;
     for (int i = 0; i < (int)clusters.size(); ++i) {
-        int c = clusters[i];
-        perWorker[clusterOwner_[c]].push_back(c);
+        const std::vector<int>& list = index_.clusterIds(clusters[i]);
+        for (int j = 0; j < (int)list.size(); ++j) {
+            ids.push_back(list[j]);
+        }
     }
 
-    // merge every worker's answer into one heap
-    TopKHeap heap(k);
+    // Each worker reports the distance over its own dimensions only. Summing
+    // them gives the real distance, because the slices are disjoint and cover
+    // everything: D^2 = sum of d_k^2 (paper Section 3.1).
+    std::vector<float> sums(ids.size(), 0.0f);
     for (int w = 0; w < numWorkers_; ++w) {
-        if (perWorker[w].empty()) {
-            continue;
-        }
-        std::vector<Candidate> part = workers_[w].search(query, perWorker[w], k);
+        std::vector<float> part = workers_[w].partialDistances(query, clusters);
         for (int i = 0; i < (int)part.size(); ++i) {
-            heap.push(part[i].id, part[i].dist);
+            sums[i] = sums[i] + part[i];
         }
+    }
+
+    // only now is there a real distance to rank by
+    TopKHeap heap(k);
+    for (int i = 0; i < (int)ids.size(); ++i) {
+        heap.push(ids[i], sums[i]);
     }
 
     return heap.results();
@@ -116,7 +109,7 @@ int MasterNode::run() {
         return 1;
     }
     buildIndex(256, 10);
-    splitClusters(4);
+    splitDimensions(4);
     createWorkers();
 
     // v1 check: splitting the work over the workers and merging it back

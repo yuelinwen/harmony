@@ -5,19 +5,24 @@
 #include "../index/distance.h"
 
 namespace harmony {
+    void WorkerNode::setDimensions(int dimBegin, int dimEnd) {
+        dimBegin_ = dimBegin;
+        dimEnd_ = dimEnd;
+    }
+
     void WorkerNode::addCluster(int clusterId, const std::vector<int>& ids,
                             const Dataset& base) {
-        dim_ = base.getDim();
+        int myDim = dimEnd_ - dimBegin_;
 
         ClusterBlock block;
         block.clusterId = clusterId;
         block.ids = ids;
-        block.data.resize(ids.size() * dim_);
+        block.data.resize(ids.size() * myDim);
 
         for (size_t i = 0; i < ids.size(); ++i) {
             const float* v = base.vec(ids[i]);
-            for (int j = 0; j < dim_; ++j) {
-                block.data[i * dim_ + j] = v[j];
+            for (int j = 0; j < myDim; ++j) {
+                block.data[i * myDim + j] = v[dimBegin_ + j];   // only my slice
             }
         }
 
@@ -32,10 +37,10 @@ namespace harmony {
         return n;
     }
 
-    std::vector<Candidate> WorkerNode::search(const float* query,
-                                              const std::vector<int>& clusterIds,
-                                              int k) {
-        TopKHeap heap(k);
+    std::vector<float> WorkerNode::partialDistances(const float* query,
+                                                    const std::vector<int>& clusterIds) {
+        int myDim = dimEnd_ - dimBegin_;
+        std::vector<float> out;
 
         for (int i = 0; i < (int)clusterIds.size(); ++i) {
             for (int b = 0; b < (int)blocks_.size(); ++b) {
@@ -44,13 +49,15 @@ namespace harmony {
                 }
                 const ClusterBlock& block = blocks_[b];
                 for (int v = 0; v < (int)block.ids.size(); ++v) {
-                    float d = l2DistanceSquared(query, &block.data[(size_t)v * dim_], dim_);
-                    heap.push(block.ids[v], d);
+                    // query is the full vector, so skip to my slice of it
+                    out.push_back(l2DistanceSquared(query + dimBegin_,
+                                                    &block.data[(size_t)v * myDim],
+                                                    myDim));
                 }
             }
         }
 
-        return heap.results();
+        return out;
     }
 
 

@@ -6,6 +6,7 @@
 
 #include "node.h"
 #include "worker_node.h"
+#include "../engine/slice_plan.h"
 #include "../index/dataset.h"
 #include "../index/ivf_index.h"
 
@@ -31,8 +32,9 @@ public:
     // whole dataset, before anything is handed to the workers.
     void buildIndex(int nlist, int iterations);
 
-    // Decides which worker owns which cluster, round-robin.
-    void splitClusters(int numWorkers);
+    // Gives each worker an equal slice of the dimensions. Every worker holds
+    // every cluster, so there is nothing to route: B_vec = 1, B_dim = numWorkers.
+    void splitDimensions(int numWorkers);
 
     // Creates the workers and gives each one the clusters it owns.
     void createWorkers();
@@ -47,7 +49,7 @@ private:
     IvfIndex index_;  // global clustering: centroids + inverted lists
 
     int numWorkers_;
-    std::vector<int> clusterOwner_;  // cluster id -> worker id
+    SlicePlan plan_;   // how the dimensions are cut up among the workers
     std::vector<WorkerNode> workers_;
 
     // ---- v1: vector partition, one process, direct method calls ----
