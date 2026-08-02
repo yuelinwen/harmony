@@ -103,20 +103,30 @@ int IvfIndex::nearestCentroid(const float* v) {
     return best;
 }
 
-std::vector<Candidate> IvfIndex::search(const Dataset& base, const float* query,
-                                        int nprobe, int k) {
-    // 1. rank the centroids, keep the nprobe nearest clusters
+std::vector<int> IvfIndex::nearestClusters(const float* query, int nprobe) const {
     TopKHeap clusterHeap(nprobe);
     for (int c = 0; c < nlist_; ++c) {
         float d = l2DistanceSquared(query, &centroids_[(size_t)c * dim_], dim_);
         clusterHeap.push(c, d);
     }
-    std::vector<Candidate> clusters = clusterHeap.results();
+
+    std::vector<Candidate> best = clusterHeap.results();
+    std::vector<int> out;
+    for (int i = 0; i < (int)best.size(); ++i) {
+        out.push_back(best[i].id);
+    }
+    return out;
+}
+
+std::vector<Candidate> IvfIndex::search(const Dataset& base, const float* query,
+                                        int nprobe, int k) {
+    // 1. rank the centroids, keep the nprobe nearest clusters
+    std::vector<int> clusters = nearestClusters(query, nprobe);
 
     // 2. scan only the vectors inside those clusters
     TopKHeap heap(k);
     for (int ci = 0; ci < (int)clusters.size(); ++ci) {
-        int c = clusters[ci].id;
+        int c = clusters[ci];
         const std::vector<int>& list = invlists_[c];
         for (int j = 0; j < (int)list.size(); ++j) {
             int vid = list[j];

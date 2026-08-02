@@ -44,12 +44,21 @@ public:
     std::vector<Candidate> search(const Dataset& base, const float* query,
                                   int nprobe, int k);
 
+    // The nprobe clusters whose centroids are nearest the query.
+    // The master uses this to decide which workers a query has to visit.
+    std::vector<int> nearestClusters(const float* query, int nprobe) const;
+
     int getNlist() {
         return nlist_;
     }
 
     int clusterSize(int c) {
         return (int)invlists_[c].size();
+    }
+
+    // The ids of the vectors inside cluster c.
+    const std::vector<int>& clusterIds(int c) const {
+        return invlists_[c];
     }
 
 private:
