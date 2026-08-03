@@ -189,40 +189,55 @@ void MasterNode::collectCluster(int row, int n,
              MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 }
 
-// One cluster per row at a time. Everything is dispatched before anything is
-// collected, so while the master blocks on the first row the other rows are
-// already computing -- that is where the parallelism comes from.
+// Two levels of overlap, which multiply out to one busy worker per machine:
 //
-// Survivors go into the heap as soon as their row reports, so the threshold
-// keeps tightening. (The paper only updates it after a whole partition,
-// Algorithm 1 line 18; updating sooner prunes strictly more.)
+//   across rows   -- every row is dispatched before anything is collected,
+//                    so the rows compute at the same time (paper Fig. 5a)
+//   within a row  -- up to bDim clusters are kept in flight, so while worker
+//                    2 handles one cluster's second slice, worker 1 is
+//                    already on the next cluster's first (paper Fig. 5b)
+//
+// Results come back in dispatch order: MPI keeps messages between a given
+// pair of ranks ordered, and each worker handles its jobs in the order they
+// arrive, so no request tracking is needed to match them up.
+//
+// Survivors go into the heap as soon as their cluster reports, so the
+// threshold keeps tightening. (The paper only updates it after a whole
+// partition, Algorithm 1 line 18; updating sooner prunes strictly more.)
 void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
                                 int prewarmClusterId, int prewarmed, TopKHeap& heap) {
-    std::vector<size_t> next(bVec_, 0);   // per row: which cluster comes next
-    std::vector<int> busy;                // rows dispatched this round
+    std::vector<size_t> next(bVec_, 0);      // per row: next cluster to dispatch
+    std::vector<size_t> done(bVec_, 0);      // per row: next cluster to collect
     std::vector<float> sums;
     std::vector<char> alive;
 
     while (true) {
-        busy.clear();
+        // top every row's window back up to bDim clusters in flight
+        bool anyInFlight = false;
         for (int r = 0; r < bVec_; ++r) {
-            if (next[r] < perRow[r].size()) {
+            while (next[r] < perRow[r].size() && next[r] - done[r] < (size_t)bDim_) {
                 int c = perRow[r][next[r]];
                 int n = (int)index_.clusterIds(c).size();
                 // skip: prewarm already put these in the heap with their real
                 // distances, so running them again would push duplicates
                 int skip = (c == prewarmClusterId) ? prewarmed : 0;
                 dispatchCluster(c, n, skip, heap.worst());
-                busy.push_back(r);
+                next[r] = next[r] + 1;
+            }
+            if (done[r] < next[r]) {
+                anyInFlight = true;
             }
         }
-        if (busy.empty()) {
+        if (!anyInFlight) {
             break;
         }
 
-        for (int i = 0; i < (int)busy.size(); ++i) {
-            int r = busy[i];
-            const std::vector<int>& ids = index_.clusterIds(perRow[r][next[r]]);
+        // take one finished cluster off each row, then loop round to refill
+        for (int r = 0; r < bVec_; ++r) {
+            if (done[r] >= next[r]) {
+                continue;
+            }
+            const std::vector<int>& ids = index_.clusterIds(perRow[r][done[r]]);
             int n = (int)ids.size();
 
             collectCluster(r, n, sums, alive);
@@ -236,7 +251,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
                     heap.push(ids[j], sums[j]);
                 }
             }
-            next[r] = next[r] + 1;
+            done[r] = done[r] + 1;
         }
     }
 }
