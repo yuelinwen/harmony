@@ -210,8 +210,16 @@ int MasterNode::run() {
 
     scanned_ = 0;
 
+    // Only the distributed search is timed. index_.search() below is the
+    // single-machine reference used to check the answer, not part of the work.
+    double seconds = 0.0;
+
     for (int q = 0; q < nq; ++q) {
+        auto t0 = std::chrono::steady_clock::now();
         std::vector<Candidate> spread = search(query_.vec(q), nprobe, k);
+        auto t1 = std::chrono::steady_clock::now();
+        seconds = seconds + std::chrono::duration<double>(t1 - t0).count();
+
         std::vector<Candidate> single = index_.search(base_, query_.vec(q), nprobe, k);
 
         std::vector<int> a;
@@ -230,6 +238,8 @@ int MasterNode::run() {
 
     std::cout << "queries differing from single machine: "
               << differing << "/" << nq << std::endl;
+    std::cout << "QPS: " << (nq / seconds)
+              << "   (" << (1000.0 * seconds / nq) << " ms per query)" << std::endl;
 
     shutdown();   // stop the workers and collect their counters
 
