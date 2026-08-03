@@ -59,13 +59,17 @@ namespace harmony {
                  MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
         myDim_ = setup[0];
-        int nlist = setup[1];
-        int numWorkers = setup[2];
+        int nClusters = setup[1];   // only the clusters of this worker's row
+        int bDim = setup[2];
 
-        // last worker reports back to the master, everyone else forwards
-        nextRank_ = (id_ == numWorkers) ? MASTER_RANK : id_ + 1;
+        // My place in the row is (id_-1) % bDim. The first slice starts the
+        // running totals; the last one reports back to the master; everyone
+        // else forwards to the next slice in the row.
+        int col = (id_ - 1) % bDim;
+        first_ = (col == 0);
+        nextRank_ = (col == bDim - 1) ? MASTER_RANK : id_ + 1;
 
-        for (int c = 0; c < nlist; ++c) {
+        for (int c = 0; c < nClusters; ++c) {
             int header[2];
             MPI_Recv(header, 2, MPI_INT, MASTER_RANK, TAG_CLUSTER,
                      MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -121,8 +125,8 @@ namespace harmony {
             MPI_Recv(&threshold, 1, MPI_FLOAT, MASTER_RANK, TAG_THRESHOLD,
                      MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-            if (id_ == 1) {
-                // first in the chain: start the running totals from scratch
+            if (first_) {
+                // first slice in the row: start the running totals from scratch
                 sums.assign(n, 0.0f);
                 alive.assign(n, 1);
                 for (int j = 0; j < skip; ++j) {

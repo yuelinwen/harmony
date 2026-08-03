@@ -28,6 +28,7 @@ public:
     explicit WorkerNode(int id) : Node(id) {
         myDim_ = 0;
         nextRank_ = 0;
+        first_ = false;
         aliveCount_ = 0;
     }
     ~WorkerNode() override = default;
@@ -65,7 +66,9 @@ private:
     void receiveSetup();
 
     int myDim_;
-    int nextRank_;    // where partial results go: the next worker, or the master
+    int nextRank_;    // where partial results go: the next worker in the row,
+                      // or the master if this is the last dimension slice
+    bool first_;      // first slice in the row: starts the running totals
     long aliveCount_; // survivors after this worker, summed over every job
     std::vector<ClusterBlock> blocks_;
 };

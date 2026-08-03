@@ -20,6 +20,8 @@ class MasterNode : public Node {
 public:
     explicit MasterNode(int numWorkers) : Node(0) {
         numWorkers_ = numWorkers;
+        bVec_ = 1;
+        bDim_ = numWorkers;
         scanned_ = 0;
     }
     ~MasterNode() override = default;
@@ -33,9 +35,13 @@ public:
     // whole dataset, before anything is handed to the workers.
     void buildIndex(int nlist, int iterations);
 
-    // Gives each worker an equal slice of the dimensions. Every worker holds
-    // every cluster, so there is nothing to route: B_vec = 1, B_dim = numWorkers.
-    void splitDimensions(int numWorkers);
+    // Lays the workers out as a bVec x bDim grid (paper Fig. 4a). Row r holds
+    // the clusters with c % bVec == r; within a row, each worker holds one
+    // slice of the dimensions. bVec * bDim must equal the worker count.
+    //   bVec=1          -> pure dimension partition (Harmony-dimension)
+    //   bDim=1          -> pure vector partition    (Harmony-vector)
+    //   both > 1        -> the hybrid the paper calls Harmony
+    void splitGrid(int bVec, int bDim);
 
     // Cuts every cluster into per-worker slices and sends them out.
     void distributeData();
@@ -54,12 +60,23 @@ public:
     // many it computed.
     int prewarmHeap(const float* query, int clusterId, int count, TopKHeap& heap);
 
-    // Algorithm 1, lines 6-12. The paper's "foreach d in DSet" loop: here each
-    // iteration hands one dimension block to the worker that owns it, and the
-    // workers pass the running totals down the chain. Only the last one
-    // reports back, so sums and alive come out holding the final state.
-    void dimensionPipeline(int clusterId, int n, int skip, float threshold,
-                           std::vector<float>& sums, std::vector<char>& alive);
+    // Algorithm 1, lines 13-18. Runs the clusters of every vector partition
+    // through the dimension pipeline and pushes the survivors into the heap.
+    //
+    // The pseudocode calls this once per partition (line 21-23), but Fig. 5a
+    // has the partitions running at the same time -- "Stage B does not need to
+    // follow Stage A" -- so all rows are driven together here instead: one
+    // cluster is dispatched into every row before anything is collected.
+    void vectorPipeline(const std::vector<std::vector<int>>& perRow,
+                        int prewarmClusterId, int prewarmed, TopKHeap& heap);
+
+    // Algorithm 1, lines 6-12, split in two so a row can be started without
+    // waiting on it. Together they are the paper's "foreach d in DSet": the
+    // job goes to every worker in the cluster's row, those workers pass the
+    // running totals down the chain, and only the last one reports back.
+    void dispatchCluster(int clusterId, int n, int skip, float threshold);
+    void collectCluster(int row, int n,
+                        std::vector<float>& sums, std::vector<char>& alive);
 
 private:
     Dataset base_;    // the vectors being searched
@@ -67,11 +84,15 @@ private:
     IvfIndex index_;  // global clustering: centroids + inverted lists
 
     int numWorkers_;
-    SlicePlan plan_;   // how the dimensions are cut up among the workers
+    int bVec_;                       // rows: vector partitions
+    int bDim_;                       // columns: dimension slices per row
+    SlicePlan plan_;                 // how a row cuts up the dimensions
+    std::vector<int> clusterOwner_;  // cluster id -> vector partition (row)
 
     // pruning counters (paper Table 3)
-    long scanned_;                  // candidates offered in total
-    std::vector<long> aliveAfter_;  // still alive after worker w's slice
+    long scanned_;                   // candidates offered in total
+    std::vector<long> scannedRow_;   // per vector partition
+    std::vector<long> aliveAfter_;   // still alive after worker w's slice
 
     // ---- v1: vector partition, one process, direct method calls ----
     //

@@ -34,42 +34,72 @@ void MasterNode::buildIndex(int nlist, int iterations) {
               << std::chrono::duration<double>(t1 - t0).count() << " s" << std::endl;
 }
 
-// Cut the dimensions into equal slices, one per worker. The paper gives each
-// machine a share of the dimensions proportional to its compute capacity,
-// which on a homogeneous cluster is just d/N (Section 4.2).
-void MasterNode::splitDimensions(int numWorkers) {
-    numWorkers_ = numWorkers;
-    plan_ = SlicePlan{base_.getDim(), numWorkers};
+// The worker with rank w sits at row (w-1)/bDim, column (w-1)%bDim of the
+// grid. Rows are vector partitions, columns are dimension slices.
+//
+// Clusters go to rows round-robin (c % bVec), the same simple rule the old
+// vector-only split used. Dimensions are cut evenly across a row, which is
+// what the paper does on a homogeneous cluster (Section 4.2).
+void MasterNode::splitGrid(int bVec, int bDim) {
+    bVec_ = bVec;
+    bDim_ = bDim;
+    plan_ = SlicePlan{base_.getDim(), bDim};
 
-    std::cout << "split " << base_.getDim() << " dimensions over "
-              << numWorkers << " workers" << std::endl;
-    for (int w = 0; w < numWorkers; ++w) {
-        std::cout << "  worker " << (w + 1) << ": dims ["
-                  << plan_.begin(w) << "," << plan_.end(w) << ")" << std::endl;
+    int nlist = index_.getNlist();
+    clusterOwner_.resize(nlist);
+    for (int c = 0; c < nlist; ++c) {
+        clusterOwner_[c] = c % bVec_;
+    }
+
+    std::cout << "grid: " << bVec_ << " vector partitions x "
+              << bDim_ << " dimension slices" << std::endl;
+    for (int r = 0; r < bVec_; ++r) {
+        long vectors = 0;
+        for (int c = 0; c < nlist; ++c) {
+            if (clusterOwner_[c] == r) {
+                vectors = vectors + index_.clusterSize(c);
+            }
+        }
+        for (int col = 0; col < bDim_; ++col) {
+            std::cout << "  worker " << (r * bDim_ + col + 1)
+                      << ": partition " << r << ", dims ["
+                      << plan_.begin(col) << "," << plan_.end(col)
+                      << "), " << vectors << " vectors" << std::endl;
+        }
     }
 }
 
-// Every worker gets every cluster, but only its own slice of each vector.
-// The load is identical on all workers by construction, whatever the query
-// pattern looks like -- that is the point of partitioning by dimension.
+// Each cluster goes only to the workers in its row, and each of those gets
+// only its own slice of the dimensions -- so a worker holds 1/bVec of the
+// vectors x 1/bDim of the dimensions, one block of the paper's grid.
 //
 // The master does the cutting and sends only the slice, so no worker ever
-// holds a dimension it does not own.
+// holds data it does not own.
 void MasterNode::distributeData() {
+    // how many clusters each row will receive
+    std::vector<int> rowClusters(bVec_, 0);
+    for (int c = 0; c < index_.getNlist(); ++c) {
+        rowClusters[clusterOwner_[c]] = rowClusters[clusterOwner_[c]] + 1;
+    }
+
     for (int w = 1; w <= numWorkers_; ++w) {
+        int row = (w - 1) / bDim_;
+        int col = (w - 1) % bDim_;
         int setup[3];
-        setup[0] = plan_.end(w - 1) - plan_.begin(w - 1);
-        setup[1] = index_.getNlist();
-        setup[2] = numWorkers_;
+        setup[0] = plan_.end(col) - plan_.begin(col);
+        setup[1] = rowClusters[row];
+        setup[2] = bDim_;
         MPI_Send(setup, 3, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
     }
 
     for (int c = 0; c < index_.getNlist(); ++c) {
         const std::vector<int>& ids = index_.clusterIds(c);
+        int row = clusterOwner_[c];
 
-        for (int w = 1; w <= numWorkers_; ++w) {
-            int begin = plan_.begin(w - 1);
-            int myDim = plan_.end(w - 1) - begin;
+        for (int col = 0; col < bDim_; ++col) {
+            int w = row * bDim_ + col + 1;
+            int begin = plan_.begin(col);
+            int myDim = plan_.end(col) - begin;
 
             std::vector<float> data(ids.size() * myDim);
             for (size_t i = 0; i < ids.size(); ++i) {
@@ -88,7 +118,8 @@ void MasterNode::distributeData() {
         }
     }
 
-    std::cout << "sent every cluster to " << numWorkers_ << " workers" << std::endl;
+    std::cout << "distributed " << index_.getNlist() << " clusters over the grid"
+              << std::endl;
 }
 
 void MasterNode::shutdown() {
@@ -131,23 +162,83 @@ int MasterNode::prewarmHeap(const float* query, int clusterId, int count, TopKHe
     return n;
 }
 
-// The workers run one after another, not in parallel -- running them in
-// parallel would compute every slice in full and save nothing (paper Section
-// 3.2, Challenge 3).
-void MasterNode::dimensionPipeline(int clusterId, int n, int skip, float threshold,
-                                   std::vector<float>& sums, std::vector<char>& alive) {
-    for (int w = 1; w <= numWorkers_; ++w) {
+// Hands one cluster to every worker in its row and returns immediately. The
+// workers of a row then run one after another, not in parallel -- running
+// them in parallel would compute every slice in full and save nothing (paper
+// Section 3.2, Challenge 3).
+void MasterNode::dispatchCluster(int clusterId, int n, int skip, float threshold) {
+    int row = clusterOwner_[clusterId];
+
+    for (int col = 0; col < bDim_; ++col) {
+        int w = row * bDim_ + col + 1;
         int job[3] = {clusterId, n, skip};
         MPI_Send(job, 3, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
         MPI_Send(&threshold, 1, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
     }
+}
+
+void MasterNode::collectCluster(int row, int n,
+                                std::vector<float>& sums, std::vector<char>& alive) {
+    int last = row * bDim_ + bDim_;   // final worker in the row
 
     sums.resize(n);
     alive.resize(n);
-    MPI_Recv(sums.data(), n, MPI_FLOAT, numWorkers_, TAG_SUMS,
+    MPI_Recv(sums.data(), n, MPI_FLOAT, last, TAG_SUMS,
              MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    MPI_Recv(alive.data(), n, MPI_CHAR, numWorkers_, TAG_ALIVE,
+    MPI_Recv(alive.data(), n, MPI_CHAR, last, TAG_ALIVE,
              MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+}
+
+// One cluster per row at a time. Everything is dispatched before anything is
+// collected, so while the master blocks on the first row the other rows are
+// already computing -- that is where the parallelism comes from.
+//
+// Survivors go into the heap as soon as their row reports, so the threshold
+// keeps tightening. (The paper only updates it after a whole partition,
+// Algorithm 1 line 18; updating sooner prunes strictly more.)
+void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
+                                int prewarmClusterId, int prewarmed, TopKHeap& heap) {
+    std::vector<size_t> next(bVec_, 0);   // per row: which cluster comes next
+    std::vector<int> busy;                // rows dispatched this round
+    std::vector<float> sums;
+    std::vector<char> alive;
+
+    while (true) {
+        busy.clear();
+        for (int r = 0; r < bVec_; ++r) {
+            if (next[r] < perRow[r].size()) {
+                int c = perRow[r][next[r]];
+                int n = (int)index_.clusterIds(c).size();
+                // skip: prewarm already put these in the heap with their real
+                // distances, so running them again would push duplicates
+                int skip = (c == prewarmClusterId) ? prewarmed : 0;
+                dispatchCluster(c, n, skip, heap.worst());
+                busy.push_back(r);
+            }
+        }
+        if (busy.empty()) {
+            break;
+        }
+
+        for (int i = 0; i < (int)busy.size(); ++i) {
+            int r = busy[i];
+            const std::vector<int>& ids = index_.clusterIds(perRow[r][next[r]]);
+            int n = (int)ids.size();
+
+            collectCluster(r, n, sums, alive);
+
+            scanned_ = scanned_ + (long)n;
+            scannedRow_[r] = scannedRow_[r] + (long)n;
+
+            // whatever survived every slice has a real distance now
+            for (int j = 0; j < n; ++j) {
+                if (alive[j]) {
+                    heap.push(ids[j], sums[j]);
+                }
+            }
+            next[r] = next[r] + 1;
+        }
+    }
 }
 
 std::vector<Candidate> MasterNode::queryPipeline(const float* query, int nprobe, int k) {
@@ -158,37 +249,27 @@ std::vector<Candidate> MasterNode::queryPipeline(const float* query, int nprobe,
         int job[3] = {JOB_QUERY, 0, 0};
         MPI_Send(job, 3, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
 
-        int begin = plan_.begin(w - 1);
-        int myDim = plan_.end(w - 1) - begin;
-        MPI_Send(query + begin, myDim, MPI_FLOAT, w, TAG_QUERY, MPI_COMM_WORLD);
+        int col = (w - 1) % bDim_;
+        int begin = plan_.begin(col);
+        MPI_Send(query + begin, plan_.end(col) - begin, MPI_FLOAT, w,
+                 TAG_QUERY, MPI_COMM_WORLD);
     }
 
+    // Stage 0: prewarming (Algorithm 1 line 20)
     TopKHeap heap(k);
     int prewarmed = prewarmHeap(query, clusters[0], 500, heap);
 
-    // One cluster at a time. Survivors go into the heap right away, so the
-    // threshold keeps tightening as the clusters go by. (The paper batches by
-    // vector partition instead, Algorithm 1 line 21, which needs B_vec > 1.)
-    std::vector<float> sums;
-    std::vector<char> alive;
-
+    // Stage I: vector-level pipeline (Algorithm 1 lines 21-23). Group the
+    // probed clusters by the vector partition that owns them, then run each
+    // partition. (The paper's filterQueries picks the queries that need a
+    // partition; with one query at a time, the same step becomes picking the
+    // clusters of that query that live in the partition.)
+    std::vector<std::vector<int>> perRow(bVec_);
     for (int i = 0; i < (int)clusters.size(); ++i) {
-        const std::vector<int>& ids = index_.clusterIds(clusters[i]);
-        int n = (int)ids.size();
-        scanned_ = scanned_ + (long)n;
-
-        // skip: prewarm already put these in the heap with their real
-        // distances, so running them again would push duplicates
-        int skip = (i == 0) ? prewarmed : 0;
-        dimensionPipeline(clusters[i], n, skip, heap.worst(), sums, alive);
-
-        // whatever survived every slice has a real distance now
-        for (int j = 0; j < n; ++j) {
-            if (alive[j]) {
-                heap.push(ids[j], sums[j]);
-            }
-        }
+        perRow[clusterOwner_[clusters[i]]].push_back(clusters[i]);
     }
+
+    vectorPipeline(perRow, clusters[0], prewarmed, heap);
 
     return heap.results();
 }
@@ -201,7 +282,17 @@ int MasterNode::run() {
         return 1;
     }
     buildIndex(256, 10);
-    splitDimensions(numWorkers_);
+
+    // Grid shape: edit these two numbers to switch mode (their product must
+    // equal the worker count). 2x2 = Harmony, 4x1 = Harmony-vector,
+    // 1x4 = Harmony-dimension.
+    int bVec = 2;
+    int bDim = 2;
+    if (bVec * bDim != numWorkers_) {
+        bVec = 1;
+        bDim = numWorkers_;   // fall back to pure dimension partition
+    }
+    splitGrid(bVec, bDim);
     distributeData();
 
     // v1 check: splitting the work over the workers and merging it back
@@ -214,8 +305,10 @@ int MasterNode::run() {
     int nprobe = 32;
     int nq = 100;
     int differing = 0;
+    int ties = 0;
 
     scanned_ = 0;
+    scannedRow_.assign(bVec_, 0);
 
     // Only the distributed search is timed. index_.search() below is the
     // single-machine reference used to check the answer, not part of the work.
@@ -231,39 +324,58 @@ int MasterNode::run() {
 
         std::vector<int> a;
         std::vector<int> b;
+        std::vector<float> da;
+        std::vector<float> db;
         for (int j = 0; j < k; ++j) {
             a.push_back(spread[j].id);
             b.push_back(single[j].id);
+            da.push_back(spread[j].dist);
+            db.push_back(single[j].dist);
         }
         std::sort(a.begin(), a.end());
         std::sort(b.begin(), b.end());
+        std::sort(da.begin(), da.end());
+        std::sort(db.begin(), db.end());
 
         if (a != b) {
-            differing = differing + 1;
+            // Same distances but different members means a tie at rank k was
+            // broken the other way -- both answers are equally correct. Only
+            // a differing distance sequence is an actual wrong result.
+            if (da == db) {
+                ties = ties + 1;
+            } else {
+                differing = differing + 1;
+            }
         }
     }
 
     std::cout << "queries differing from single machine: "
-              << differing << "/" << nq << std::endl;
+              << differing << "/" << nq
+              << "   (ties broken differently: " << ties << ")" << std::endl;
     std::cout << "QPS: " << (nq / seconds)
               << "   (" << (1000.0 * seconds / nq) << " ms per query)" << std::endl;
 
     shutdown();   // stop the workers and collect their counters
 
-    // Pruning ratios in the shape of the paper's Table 3: the share of
-    // candidates that never had to reach worker w. Worker 0 is always 0 --
-    // everyone computes the first slice, there is nothing to skip yet.
-    std::cout << "\npruning (" << numWorkers_ << " slices)" << std::endl;
+    // Pruning ratios in the shape of the paper's Table 3: the share of a
+    // row's candidates that never had to reach each of its workers. The first
+    // column is always 0 -- everyone computes the first slice, there is
+    // nothing to skip yet.
+    std::cout << "\npruning (" << bVec_ << " rows x " << bDim_ << " slices)"
+              << std::endl;
     long done = 0;
-    for (int w = 0; w < numWorkers_; ++w) {
-        double skipped = 1.0 - (double)(w == 0 ? scanned_ : aliveAfter_[w - 1])
-                                   / (double)scanned_;
-        std::cout << "  worker " << (w + 1) << ": skipped " << (100.0 * skipped)
-                  << "%" << std::endl;
-        done = done + (w == 0 ? scanned_ : aliveAfter_[w - 1]);
+    for (int r = 0; r < bVec_; ++r) {
+        for (int col = 0; col < bDim_; ++col) {
+            int w = r * bDim_ + col;   // worker index, 0-based
+            long processed = (col == 0) ? scannedRow_[r] : aliveAfter_[w - 1];
+            std::cout << "  worker " << (w + 1) << ": skipped "
+                      << (100.0 * (1.0 - (double)processed / (double)scannedRow_[r]))
+                      << "%" << std::endl;
+            done = done + processed;
+        }
     }
     std::cout << "distance work vs no pruning: "
-              << (100.0 * done / (double)(scanned_ * numWorkers_)) << "%" << std::endl;
+              << (100.0 * done / (double)(scanned_ * bDim_)) << "%" << std::endl;
 
     return 0;
 }
