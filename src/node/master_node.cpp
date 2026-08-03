@@ -4,6 +4,8 @@
 #include <chrono>
 #include <iostream>
 
+#include <mpi.h>
+
 #include "../index/distance.h"
 
 namespace harmony {
@@ -51,22 +53,23 @@ void MasterNode::splitDimensions(int numWorkers) {
 // The load is identical on all workers by construction, whatever the query
 // pattern looks like -- that is the point of partitioning by dimension.
 //
-// The master does the cutting and hands over only the slice, so no worker
-// ever holds a dimension it does not own. Under MPI the buffer built here is
-// exactly what gets sent.
-void MasterNode::createWorkers() {
-    workers_.clear();
-    for (int w = 0; w < numWorkers_; ++w) {
-        workers_.emplace_back(w + 1);   // ids start at 1, the master is 0
-        workers_[w].setDimCount(plan_.end(w) - plan_.begin(w));
+// The master does the cutting and sends only the slice, so no worker ever
+// holds a dimension it does not own.
+void MasterNode::distributeData() {
+    for (int w = 1; w <= numWorkers_; ++w) {
+        int setup[3];
+        setup[0] = plan_.end(w - 1) - plan_.begin(w - 1);
+        setup[1] = index_.getNlist();
+        setup[2] = numWorkers_;
+        MPI_Send(setup, 3, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
     }
 
     for (int c = 0; c < index_.getNlist(); ++c) {
         const std::vector<int>& ids = index_.clusterIds(c);
 
-        for (int w = 0; w < numWorkers_; ++w) {
-            int begin = plan_.begin(w);
-            int myDim = plan_.end(w) - begin;
+        for (int w = 1; w <= numWorkers_; ++w) {
+            int begin = plan_.begin(w - 1);
+            int myDim = plan_.end(w - 1) - begin;
 
             std::vector<float> data(ids.size() * myDim);
             for (size_t i = 0; i < ids.size(); ++i) {
@@ -76,15 +79,28 @@ void MasterNode::createWorkers() {
                 }
             }
 
-            workers_[w].addCluster(c, ids, data);
+            int header[2];
+            header[0] = c;
+            header[1] = (int)ids.size();
+            MPI_Send(header, 2, MPI_INT, w, TAG_CLUSTER, MPI_COMM_WORLD);
+            MPI_Send(ids.data(), (int)ids.size(), MPI_INT, w, TAG_IDS, MPI_COMM_WORLD);
+            MPI_Send(data.data(), (int)data.size(), MPI_FLOAT, w, TAG_DATA, MPI_COMM_WORLD);
         }
     }
 
-    std::cout << "created " << numWorkers_ << " workers" << std::endl;
-    for (int w = 0; w < numWorkers_; ++w) {
-        std::cout << "  worker " << workers_[w].getId() << ": "
-                  << workers_[w].vectorCount() << " vectors x "
-                  << (plan_.end(w) - plan_.begin(w)) << " dims" << std::endl;
+    std::cout << "sent every cluster to " << numWorkers_ << " workers" << std::endl;
+}
+
+void MasterNode::shutdown() {
+    aliveAfter_.assign(numWorkers_, 0);
+
+    for (int w = 1; w <= numWorkers_; ++w) {
+        int job[3] = {JOB_SHUTDOWN, 0, 0};
+        MPI_Send(job, 3, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+    }
+    for (int w = 1; w <= numWorkers_; ++w) {
+        MPI_Recv(&aliveAfter_[w - 1], 1, MPI_LONG, w, TAG_STATS,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     }
 }
 
@@ -118,6 +134,16 @@ int MasterNode::prewarm(const float* query, int clusterId, int count, TopKHeap& 
 std::vector<Candidate> MasterNode::search(const float* query, int nprobe, int k) {
     std::vector<int> clusters = index_.nearestClusters(query, nprobe);
 
+    // hand every worker its slice of the query, cut the same way as the data
+    for (int w = 1; w <= numWorkers_; ++w) {
+        int job[3] = {JOB_QUERY, 0, 0};
+        MPI_Send(job, 3, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+
+        int begin = plan_.begin(w - 1);
+        int myDim = plan_.end(w - 1) - begin;
+        MPI_Send(query + begin, myDim, MPI_FLOAT, w, TAG_QUERY, MPI_COMM_WORLD);
+    }
+
     TopKHeap heap(k);
     int prewarmed = prewarm(query, clusters[0], 500, heap);
 
@@ -125,41 +151,32 @@ std::vector<Candidate> MasterNode::search(const float* query, int nprobe, int k)
     // threshold keeps tightening as the clusters go by.
     for (int i = 0; i < (int)clusters.size(); ++i) {
         const std::vector<int>& ids = index_.clusterIds(clusters[i]);
+        int n = (int)ids.size();
+        scanned_ = scanned_ + (long)n;
 
-        std::vector<float> sums(ids.size(), 0.0f);
-        std::vector<char> alive(ids.size(), 1);
-
-        // prewarm already put these in the heap with their real distances;
-        // running them through the pipeline again would push duplicates
-        if (i == 0) {
-            for (int j = 0; j < prewarmed; ++j) {
-                alive[j] = 0;
-            }
+        // Dimension pipeline: worker 1 starts the running totals, hands them
+        // to worker 2, and so on; only the last one reports back here. The
+        // workers run one after another, not in parallel -- running them in
+        // parallel would compute every slice in full and save nothing
+        // (paper Section 3.2, Challenge 3).
+        float threshold = heap.worst();
+        for (int w = 1; w <= numWorkers_; ++w) {
+            // skip: prewarm already put these in the heap with their real
+            // distances, so running them again would push duplicates
+            int job[3] = {clusters[i], n, (i == 0 ? prewarmed : 0)};
+            MPI_Send(job, 3, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+            MPI_Send(&threshold, 1, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
         }
 
-        scanned_ = scanned_ + (long)ids.size();
-
-        // Dimension pipeline: the workers run one after another, not in
-        // parallel. Each adds its slice to the running total and drops what
-        // has already passed the threshold, so later workers see fewer and
-        // fewer candidates. Running them in parallel would compute every
-        // slice in full and save nothing (paper Section 3.2, Challenge 3).
-        for (int w = 0; w < numWorkers_; ++w) {
-            // the master cuts the query the same way it cut the data
-            workers_[w].accumulate(query + plan_.begin(w), clusters[i],
-                                   heap.worst(), sums, alive);
-
-            long n = 0;
-            for (int j = 0; j < (int)alive.size(); ++j) {
-                if (alive[j]) {
-                    n = n + 1;
-                }
-            }
-            aliveAfter_[w] = aliveAfter_[w] + n;
-        }
+        std::vector<float> sums(n);
+        std::vector<char> alive(n);
+        MPI_Recv(sums.data(), n, MPI_FLOAT, numWorkers_, TAG_SUMS,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(alive.data(), n, MPI_CHAR, numWorkers_, TAG_ALIVE,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
         // whatever survived all the slices has a real distance now
-        for (int j = 0; j < (int)ids.size(); ++j) {
+        for (int j = 0; j < n; ++j) {
             if (alive[j]) {
                 heap.push(ids[j], sums[j]);
             }
@@ -177,8 +194,8 @@ int MasterNode::run() {
         return 1;
     }
     buildIndex(256, 10);
-    splitDimensions(4);
-    createWorkers();
+    splitDimensions(numWorkers_);
+    distributeData();
 
     // v1 check: splitting the work over the workers and merging it back
     // must give exactly what one machine would have returned.
@@ -192,7 +209,6 @@ int MasterNode::run() {
     int differing = 0;
 
     scanned_ = 0;
-    aliveAfter_.assign(numWorkers_, 0);
 
     for (int q = 0; q < nq; ++q) {
         std::vector<Candidate> spread = search(query_.vec(q), nprobe, k);
@@ -214,6 +230,8 @@ int MasterNode::run() {
 
     std::cout << "queries differing from single machine: "
               << differing << "/" << nq << std::endl;
+
+    shutdown();   // stop the workers and collect their counters
 
     // Pruning ratios in the shape of the paper's Table 3: the share of
     // candidates that never had to reach worker w. Worker 0 is always 0 --

@@ -2,6 +2,9 @@
 
 #include <iostream>
 
+#include <mpi.h>
+
+#include "../comm/messages.h"
 #include "../index/distance.h"
 
 namespace harmony {
@@ -50,18 +53,103 @@ namespace harmony {
 
 
 
-int WorkerNode::run() {
-    running_ = true;
-    std::cout << "worker node started, id=" << id_ << std::endl;
+    void WorkerNode::receiveSetup() {
+        int setup[3];
+        MPI_Recv(setup, 3, MPI_INT, MASTER_RANK, TAG_SETUP,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-    // In v1 the worker has no loop of its own: the master builds it, calls
-    // setData() once, then calls search() per query. run() only matters
-    // from v4 on, when the worker becomes its own process and waits for
-    // messages instead.
-    //
-    //   TODO(v4): loop { receive query -> search -> send back }
+        myDim_ = setup[0];
+        int nlist = setup[1];
+        int numWorkers = setup[2];
 
-    return 0;
-}
+        // last worker reports back to the master, everyone else forwards
+        nextRank_ = (id_ == numWorkers) ? MASTER_RANK : id_ + 1;
+
+        for (int c = 0; c < nlist; ++c) {
+            int header[2];
+            MPI_Recv(header, 2, MPI_INT, MASTER_RANK, TAG_CLUSTER,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            int clusterId = header[0];
+            int nIds = header[1];
+
+            std::vector<int> ids(nIds);
+            MPI_Recv(ids.data(), nIds, MPI_INT, MASTER_RANK, TAG_IDS,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            std::vector<float> data((size_t)nIds * myDim_);
+            MPI_Recv(data.data(), (int)data.size(), MPI_FLOAT, MASTER_RANK, TAG_DATA,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            addCluster(clusterId, ids, data);
+        }
+
+        std::cout << "worker " << id_ << " ready: " << vectorCount()
+                  << " vectors x " << myDim_ << " dims" << std::endl;
+    }
+
+    int WorkerNode::run() {
+        running_ = true;
+        receiveSetup();
+
+        std::vector<float> querySlice(myDim_);
+        std::vector<float> sums;
+        std::vector<char> alive;
+
+        while (true) {
+            int job[3];
+            MPI_Recv(job, 3, MPI_INT, MASTER_RANK, TAG_JOB,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            if (job[0] == JOB_SHUTDOWN) {
+                MPI_Send(&aliveCount_, 1, MPI_LONG, MASTER_RANK, TAG_STATS,
+                         MPI_COMM_WORLD);
+                break;
+            }
+
+            if (job[0] == JOB_QUERY) {
+                MPI_Recv(querySlice.data(), myDim_, MPI_FLOAT, MASTER_RANK, TAG_QUERY,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                continue;
+            }
+
+            int clusterId = job[0];
+            int n = job[1];
+            int skip = job[2];
+
+            float threshold = 0.0f;
+            MPI_Recv(&threshold, 1, MPI_FLOAT, MASTER_RANK, TAG_THRESHOLD,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            if (id_ == 1) {
+                // first in the chain: start the running totals from scratch
+                sums.assign(n, 0.0f);
+                alive.assign(n, 1);
+                for (int j = 0; j < skip; ++j) {
+                    alive[j] = 0;   // the master prewarmed these already
+                }
+            } else {
+                sums.resize(n);
+                alive.resize(n);
+                MPI_Recv(sums.data(), n, MPI_FLOAT, id_ - 1, TAG_SUMS,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                MPI_Recv(alive.data(), n, MPI_CHAR, id_ - 1, TAG_ALIVE,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+
+            accumulate(querySlice.data(), clusterId, threshold, sums, alive);
+
+            for (int j = 0; j < n; ++j) {
+                if (alive[j]) {
+                    aliveCount_ = aliveCount_ + 1;
+                }
+            }
+
+            MPI_Send(sums.data(), n, MPI_FLOAT, nextRank_, TAG_SUMS, MPI_COMM_WORLD);
+            MPI_Send(alive.data(), n, MPI_CHAR, nextRank_, TAG_ALIVE, MPI_COMM_WORLD);
+        }
+
+        return 0;
+    }
 
 }  // namespace harmony

@@ -4,7 +4,7 @@ project(harmony CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_executable(harmony
+add_executable(main
         main.cpp
         src/node/master_node.cpp
         src/node/worker_node.cpp
@@ -13,18 +13,20 @@ add_executable(harmony
 )
 
 # so that includes like "src/node/..." in main.cpp resolve from the project root
-target_include_directories(harmony PRIVATE ${CMAKE_SOURCE_DIR})
+target_include_directories(main PRIVATE ${CMAKE_SOURCE_DIR})
+
+find_package(MPI REQUIRED)
+target_link_libraries(main PRIVATE MPI::MPI_CXX)
 
 # On Windows/MinGW: bundle the C++ runtime into the .exe so it runs standalone
 # (no missing libstdc++-6.dll / libgcc_s / libwinpthread when run outside CLion)
 if(MINGW)
-    target_link_options(harmony PRIVATE -static -static-libgcc -static-libstdc++)
+    target_link_options(main PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
 
-# windows:
-#   g++ -std=c++20 -I. main.cpp src/node/master_node.cpp src/node/worker_node.cpp -static -static-libgcc -static-libstdc++ -o harmony.exe
-# mac:
-#   g++ -std=c++20 -I. main.cpp src/node/*.cpp src/index/*.cpp -o main
+# build:
+#   mpicxx -std=c++20 -O2 -march=native -I. main.cpp src/node/*.cpp src/index/*.cpp -o main
+# run (1 master + 4 workers, from the project root so Data/ resolves):
+#   mpirun -n 5 ./main
 # dataset script:
 #   python3 util/convert_hdf5.py Data/sift-128-euclidean.hdf5 Data/sift
-# macos: ./cmake-build-debug/harmony -id=0

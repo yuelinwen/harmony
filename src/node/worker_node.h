@@ -27,9 +27,13 @@ class WorkerNode : public Node {
 public:
     explicit WorkerNode(int id) : Node(id) {
         myDim_ = 0;
+        nextRank_ = 0;
+        aliveCount_ = 0;
     }
     ~WorkerNode() override = default;
 
+    // Receive loop: take setup from the master, then serve jobs until told
+    // to stop.
     int run() override;
 
     // How many dimensions per vector the master will be sending.
@@ -57,11 +61,13 @@ public:
                     std::vector<float>& sums, std::vector<char>& alive);
 
 private:
-    int myDim_;
-    std::vector<ClusterBlock> blocks_;
+    // Takes myDim, the cluster count, and then every cluster block.
+    void receiveSetup();
 
-    // ---- v4: MPI ----
-    // TODO 8. receive queries and send results as messages
+    int myDim_;
+    int nextRank_;    // where partial results go: the next worker, or the master
+    long aliveCount_; // survivors after this worker, summed over every job
+    std::vector<ClusterBlock> blocks_;
 };
 
 }  // namespace harmony

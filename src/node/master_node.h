@@ -5,7 +5,7 @@
 #include <vector>
 
 #include "node.h"
-#include "worker_node.h"
+#include "../comm/messages.h"
 #include "../engine/slice_plan.h"
 #include "../index/dataset.h"
 #include "../index/ivf_index.h"
@@ -18,8 +18,8 @@ namespace harmony {
 
 class MasterNode : public Node {
 public:
-    MasterNode() : Node(0) {
-        numWorkers_ = 0;
+    explicit MasterNode(int numWorkers) : Node(0) {
+        numWorkers_ = numWorkers;
         scanned_ = 0;
     }
     ~MasterNode() override = default;
@@ -37,8 +37,11 @@ public:
     // every cluster, so there is nothing to route: B_vec = 1, B_dim = numWorkers.
     void splitDimensions(int numWorkers);
 
-    // Creates the workers and gives each one the clusters it owns.
-    void createWorkers();
+    // Cuts every cluster into per-worker slices and sends them out.
+    void distributeData();
+
+    // Tells the workers to stop, and collects their pruning counters.
+    void shutdown();
 
     // Picks the nprobe nearest clusters, asks the workers that own them,
     // and merges their answers into one top-K.
@@ -55,7 +58,6 @@ private:
 
     int numWorkers_;
     SlicePlan plan_;   // how the dimensions are cut up among the workers
-    std::vector<WorkerNode> workers_;
 
     // pruning counters (paper Table 3)
     long scanned_;                  // candidates offered in total
