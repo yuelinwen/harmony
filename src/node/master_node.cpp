@@ -116,7 +116,7 @@ void MasterNode::shutdown() {
 // the real one, and using one as the threshold would drop candidates that
 // belonged in the top-K. Only the master can do this -- a worker holds a
 // fraction of each vector.
-int MasterNode::prewarm(const float* query, int clusterId, int count, TopKHeap& heap) {
+int MasterNode::prewarmHeap(const float* query, int clusterId, int count, TopKHeap& heap) {
     const std::vector<int>& ids = index_.clusterIds(clusterId);
 
     int n = (int)ids.size();
@@ -131,7 +131,26 @@ int MasterNode::prewarm(const float* query, int clusterId, int count, TopKHeap& 
     return n;
 }
 
-std::vector<Candidate> MasterNode::search(const float* query, int nprobe, int k) {
+// The workers run one after another, not in parallel -- running them in
+// parallel would compute every slice in full and save nothing (paper Section
+// 3.2, Challenge 3).
+void MasterNode::dimensionPipeline(int clusterId, int n, int skip, float threshold,
+                                   std::vector<float>& sums, std::vector<char>& alive) {
+    for (int w = 1; w <= numWorkers_; ++w) {
+        int job[3] = {clusterId, n, skip};
+        MPI_Send(job, 3, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+        MPI_Send(&threshold, 1, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
+    }
+
+    sums.resize(n);
+    alive.resize(n);
+    MPI_Recv(sums.data(), n, MPI_FLOAT, numWorkers_, TAG_SUMS,
+             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    MPI_Recv(alive.data(), n, MPI_CHAR, numWorkers_, TAG_ALIVE,
+             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+}
+
+std::vector<Candidate> MasterNode::queryPipeline(const float* query, int nprobe, int k) {
     std::vector<int> clusters = index_.nearestClusters(query, nprobe);
 
     // hand every worker its slice of the query, cut the same way as the data
@@ -145,37 +164,25 @@ std::vector<Candidate> MasterNode::search(const float* query, int nprobe, int k)
     }
 
     TopKHeap heap(k);
-    int prewarmed = prewarm(query, clusters[0], 500, heap);
+    int prewarmed = prewarmHeap(query, clusters[0], 500, heap);
 
     // One cluster at a time. Survivors go into the heap right away, so the
-    // threshold keeps tightening as the clusters go by.
+    // threshold keeps tightening as the clusters go by. (The paper batches by
+    // vector partition instead, Algorithm 1 line 21, which needs B_vec > 1.)
+    std::vector<float> sums;
+    std::vector<char> alive;
+
     for (int i = 0; i < (int)clusters.size(); ++i) {
         const std::vector<int>& ids = index_.clusterIds(clusters[i]);
         int n = (int)ids.size();
         scanned_ = scanned_ + (long)n;
 
-        // Dimension pipeline: worker 1 starts the running totals, hands them
-        // to worker 2, and so on; only the last one reports back here. The
-        // workers run one after another, not in parallel -- running them in
-        // parallel would compute every slice in full and save nothing
-        // (paper Section 3.2, Challenge 3).
-        float threshold = heap.worst();
-        for (int w = 1; w <= numWorkers_; ++w) {
-            // skip: prewarm already put these in the heap with their real
-            // distances, so running them again would push duplicates
-            int job[3] = {clusters[i], n, (i == 0 ? prewarmed : 0)};
-            MPI_Send(job, 3, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
-            MPI_Send(&threshold, 1, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
-        }
+        // skip: prewarm already put these in the heap with their real
+        // distances, so running them again would push duplicates
+        int skip = (i == 0) ? prewarmed : 0;
+        dimensionPipeline(clusters[i], n, skip, heap.worst(), sums, alive);
 
-        std::vector<float> sums(n);
-        std::vector<char> alive(n);
-        MPI_Recv(sums.data(), n, MPI_FLOAT, numWorkers_, TAG_SUMS,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        MPI_Recv(alive.data(), n, MPI_CHAR, numWorkers_, TAG_ALIVE,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-        // whatever survived all the slices has a real distance now
+        // whatever survived every slice has a real distance now
         for (int j = 0; j < n; ++j) {
             if (alive[j]) {
                 heap.push(ids[j], sums[j]);
@@ -216,7 +223,7 @@ int MasterNode::run() {
 
     for (int q = 0; q < nq; ++q) {
         auto t0 = std::chrono::steady_clock::now();
-        std::vector<Candidate> spread = search(query_.vec(q), nprobe, k);
+        std::vector<Candidate> spread = queryPipeline(query_.vec(q), nprobe, k);
         auto t1 = std::chrono::steady_clock::now();
         seconds = seconds + std::chrono::duration<double>(t1 - t0).count();
 

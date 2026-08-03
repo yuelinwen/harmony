@@ -43,13 +43,23 @@ public:
     // Tells the workers to stop, and collects their pruning counters.
     void shutdown();
 
-    // Picks the nprobe nearest clusters, asks the workers that own them,
-    // and merges their answers into one top-K.
-    std::vector<Candidate> search(const float* query, int nprobe, int k);
+    // Algorithm 1, lines 19-23. Picks the nprobe nearest clusters, runs each
+    // one through the dimension pipeline, and merges what survives into one
+    // top-K. The paper's version takes a whole query set; this one takes a
+    // single query, since each query needs its own heap.
+    std::vector<Candidate> queryPipeline(const float* query, int nprobe, int k);
 
-    // Seeds the heap with real distances so there is a threshold to prune
-    // against from the very first candidate. Returns how many it computed.
-    int prewarm(const float* query, int clusterId, int count, TopKHeap& heap);
+    // Algorithm 1, lines 1-5. Seeds the heap with real distances so there is
+    // a threshold to prune against from the very first candidate. Returns how
+    // many it computed.
+    int prewarmHeap(const float* query, int clusterId, int count, TopKHeap& heap);
+
+    // Algorithm 1, lines 6-12. The paper's "foreach d in DSet" loop: here each
+    // iteration hands one dimension block to the worker that owns it, and the
+    // workers pass the running totals down the chain. Only the last one
+    // reports back, so sums and alive come out holding the final state.
+    void dimensionPipeline(int clusterId, int n, int skip, float threshold,
+                           std::vector<float>& sums, std::vector<char>& alive);
 
 private:
     Dataset base_;    // the vectors being searched

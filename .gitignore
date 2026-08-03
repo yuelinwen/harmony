@@ -2,6 +2,7 @@
 .vscode
 main
 data
+.claude
 
 ### C++ template
 # Prerequisites
