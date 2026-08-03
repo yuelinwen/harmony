@@ -44,6 +44,10 @@ public:
     // and merges their answers into one top-K.
     std::vector<Candidate> search(const float* query, int nprobe, int k);
 
+    // Seeds the heap with real distances so there is a threshold to prune
+    // against from the very first candidate. Returns how many it computed.
+    int prewarm(const float* query, int clusterId, int count, TopKHeap& heap);
+
 private:
     Dataset base_;    // the vectors being searched
     Dataset query_;   // the vectors to search for

@@ -4,6 +4,8 @@
 #include <chrono>
 #include <iostream>
 
+#include "../index/distance.h"
+
 namespace harmony {
 
 bool MasterNode::loadData(const std::string& basePath, const std::string& queryPath) {
@@ -86,20 +88,55 @@ void MasterNode::createWorkers() {
     }
 }
 
+// Without this the heap starts empty, worst() is infinite, and nothing can be
+// pruned until a whole cluster has been through the pipeline (paper Algorithm
+// 1, lines 1-5).
+//
+// The samples come from the nearest cluster rather than at random: vectors in
+// it are far more likely to be real neighbours, which makes the starting
+// threshold much tighter.
+//
+// Distances here are over every dimension. A partial distance is smaller than
+// the real one, and using one as the threshold would drop candidates that
+// belonged in the top-K. Only the master can do this -- a worker holds a
+// fraction of each vector.
+int MasterNode::prewarm(const float* query, int clusterId, int count, TopKHeap& heap) {
+    const std::vector<int>& ids = index_.clusterIds(clusterId);
+
+    int n = (int)ids.size();
+    if (count < n) {
+        n = count;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        heap.push(ids[i], l2DistanceSquared(query, base_.vec(ids[i]), base_.getDim()));
+    }
+
+    return n;
+}
+
 std::vector<Candidate> MasterNode::search(const float* query, int nprobe, int k) {
     std::vector<int> clusters = index_.nearestClusters(query, nprobe);
 
     TopKHeap heap(k);
+    int prewarmed = prewarm(query, clusters[0], 500, heap);
 
     // One cluster at a time. Survivors go into the heap right away, so the
-    // threshold is already tight when the next cluster starts. The first
-    // cluster has an empty heap and nothing to prune against, so it just
-    // fills it -- that is what gets pruning started.
+    // threshold keeps tightening as the clusters go by.
     for (int i = 0; i < (int)clusters.size(); ++i) {
         const std::vector<int>& ids = index_.clusterIds(clusters[i]);
 
         std::vector<float> sums(ids.size(), 0.0f);
         std::vector<char> alive(ids.size(), 1);
+
+        // prewarm already put these in the heap with their real distances;
+        // running them through the pipeline again would push duplicates
+        if (i == 0) {
+            for (int j = 0; j < prewarmed; ++j) {
+                alive[j] = 0;
+            }
+        }
+
         scanned_ = scanned_ + (long)ids.size();
 
         // Dimension pipeline: the workers run one after another, not in
