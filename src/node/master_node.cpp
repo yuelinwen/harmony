@@ -123,15 +123,21 @@ void MasterNode::distributeData() {
 }
 
 void MasterNode::shutdown() {
-    aliveAfter_.assign(numWorkers_, 0);
+    aliveAfterStage_.assign(bDim_, 0);
 
     for (int w = 1; w <= numWorkers_; ++w) {
-        int job[3] = {JOB_SHUTDOWN, 0, 0};
-        MPI_Send(job, 3, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+        int job[4] = {JOB_SHUTDOWN, 0, 0, 0};
+        MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
     }
+
+    // every worker reports its counts per chain position; sum them up
+    std::vector<long> perWorker(bDim_);
     for (int w = 1; w <= numWorkers_; ++w) {
-        MPI_Recv(&aliveAfter_[w - 1], 1, MPI_LONG, w, TAG_STATS,
+        MPI_Recv(perWorker.data(), bDim_, MPI_LONG, w, TAG_STATS,
                  MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        for (int s = 0; s < bDim_; ++s) {
+            aliveAfterStage_[s] = aliveAfterStage_[s] + perWorker[s];
+        }
     }
 }
 
@@ -162,24 +168,45 @@ int MasterNode::prewarmHeap(const float* query, int clusterId, int count, TopKHe
     return n;
 }
 
-// Hands one cluster to every worker in its row and returns immediately. The
-// workers of a row then run one after another, not in parallel -- running
-// them in parallel would compute every slice in full and save nothing (paper
-// Section 3.2, Challenge 3).
-void MasterNode::dispatchCluster(int clusterId, int n, int skip, float threshold) {
-    int row = clusterOwner_[clusterId];
+// Hands a batch of clusters to a row and returns immediately. The cluster at
+// position p in the batch starts its chain at column p, so every worker is
+// the first stop for one of them -- which matters because the first stop can
+// prune nothing and therefore does the most work (paper Section 4.3, Load
+// Balancing Strategies). Within one cluster the workers still run one after
+// another; running them in parallel would compute every slice in full and
+// save nothing (Section 3.2, Challenge 3).
+//
+// Each worker's jobs go out in the order it will actually reach them: at
+// step t, the worker in column `col` handles batch[(col - t) mod m]. Sending
+// them in any other order would leave a worker blocked on a cluster that has
+// not arrived while one it could start sits behind it in the queue.
+void MasterNode::dispatchBatch(int row, const std::vector<int>& batch,
+                               int prewarmClusterId, int prewarmed, float threshold) {
+    int m = (int)batch.size();
 
     for (int col = 0; col < bDim_; ++col) {
         int w = row * bDim_ + col + 1;
-        int job[3] = {clusterId, n, skip};
-        MPI_Send(job, 3, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
-        MPI_Send(&threshold, 1, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
+
+        for (int t = 0; t < m; ++t) {
+            int p = ((col - t) % m + m) % m;
+            int c = batch[p];
+            int n = (int)index_.clusterIds(c).size();
+            // skip: prewarm already put these in the heap with their real
+            // distances, so running them again would push duplicates
+            int skip = (c == prewarmClusterId) ? prewarmed : 0;
+
+            int job[4] = {c, n, skip, p};
+            MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+            MPI_Send(&threshold, 1, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
+        }
     }
 }
 
-void MasterNode::collectCluster(int row, int n,
+void MasterNode::collectCluster(int row, int startCol, int n,
                                 std::vector<float>& sums, std::vector<char>& alive) {
-    int last = row * bDim_ + bDim_;   // final worker in the row
+    // the chain ends one step before it began, going round the row
+    int lastCol = (startCol + bDim_ - 1) % bDim_;
+    int last = row * bDim_ + lastCol + 1;
 
     sums.resize(n);
     alive.resize(n);
@@ -206,52 +233,47 @@ void MasterNode::collectCluster(int row, int n,
 // partition, Algorithm 1 line 18; updating sooner prunes strictly more.)
 void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
                                 int prewarmClusterId, int prewarmed, TopKHeap& heap) {
-    std::vector<size_t> next(bVec_, 0);      // per row: next cluster to dispatch
-    std::vector<size_t> done(bVec_, 0);      // per row: next cluster to collect
+    std::vector<size_t> pos(bVec_, 0);            // per row: clusters handled
+    std::vector<std::vector<int>> batch(bVec_);   // per row: the batch in flight
     std::vector<float> sums;
     std::vector<char> alive;
 
     while (true) {
-        // top every row's window back up to bDim clusters in flight
-        bool anyInFlight = false;
+        // Send one batch into every row before collecting anything, so the
+        // rows compute at the same time.
+        bool any = false;
         for (int r = 0; r < bVec_; ++r) {
-            while (next[r] < perRow[r].size() && next[r] - done[r] < (size_t)bDim_) {
-                int c = perRow[r][next[r]];
-                int n = (int)index_.clusterIds(c).size();
-                // skip: prewarm already put these in the heap with their real
-                // distances, so running them again would push duplicates
-                int skip = (c == prewarmClusterId) ? prewarmed : 0;
-                dispatchCluster(c, n, skip, heap.worst());
-                next[r] = next[r] + 1;
+            batch[r].clear();
+            for (int p = 0; p < bDim_ && pos[r] + p < perRow[r].size(); ++p) {
+                batch[r].push_back(perRow[r][pos[r] + p]);
             }
-            if (done[r] < next[r]) {
-                anyInFlight = true;
+            if (!batch[r].empty()) {
+                dispatchBatch(r, batch[r], prewarmClusterId, prewarmed, heap.worst());
+                any = true;
             }
         }
-        if (!anyInFlight) {
+        if (!any) {
             break;
         }
 
-        // take one finished cluster off each row, then loop round to refill
         for (int r = 0; r < bVec_; ++r) {
-            if (done[r] >= next[r]) {
-                continue;
-            }
-            const std::vector<int>& ids = index_.clusterIds(perRow[r][done[r]]);
-            int n = (int)ids.size();
+            for (int p = 0; p < (int)batch[r].size(); ++p) {
+                const std::vector<int>& ids = index_.clusterIds(batch[r][p]);
+                int n = (int)ids.size();
 
-            collectCluster(r, n, sums, alive);
+                collectCluster(r, p, n, sums, alive);
 
-            scanned_ = scanned_ + (long)n;
-            scannedRow_[r] = scannedRow_[r] + (long)n;
+                scanned_ = scanned_ + (long)n;
+                scannedRow_[r] = scannedRow_[r] + (long)n;
 
-            // whatever survived every slice has a real distance now
-            for (int j = 0; j < n; ++j) {
-                if (alive[j]) {
-                    heap.push(ids[j], sums[j]);
+                // whatever survived every slice has a real distance now
+                for (int j = 0; j < n; ++j) {
+                    if (alive[j]) {
+                        heap.push(ids[j], sums[j]);
+                    }
                 }
             }
-            done[r] = done[r] + 1;
+            pos[r] = pos[r] + batch[r].size();
         }
     }
 }
@@ -261,8 +283,8 @@ std::vector<Candidate> MasterNode::queryPipeline(const float* query, int nprobe,
 
     // hand every worker its slice of the query, cut the same way as the data
     for (int w = 1; w <= numWorkers_; ++w) {
-        int job[3] = {JOB_QUERY, 0, 0};
-        MPI_Send(job, 3, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+        int job[4] = {JOB_QUERY, 0, 0, 0};
+        MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
 
         int col = (w - 1) % bDim_;
         int begin = plan_.begin(col);
@@ -372,22 +394,18 @@ int MasterNode::run() {
 
     shutdown();   // stop the workers and collect their counters
 
-    // Pruning ratios in the shape of the paper's Table 3: the share of a
-    // row's candidates that never had to reach each of its workers. The first
-    // column is always 0 -- everyone computes the first slice, there is
-    // nothing to skip yet.
-    std::cout << "\npruning (" << bVec_ << " rows x " << bDim_ << " slices)"
-              << std::endl;
+    // Pruning ratios in the shape of the paper's Table 3: the share of
+    // candidates that never had to reach the s-th slice of the chain. Slice 1
+    // is always 0 -- everyone computes the first slice, there is nothing to
+    // skip yet.
+    std::cout << "\npruning (" << bDim_ << " slices per chain)" << std::endl;
     long done = 0;
-    for (int r = 0; r < bVec_; ++r) {
-        for (int col = 0; col < bDim_; ++col) {
-            int w = r * bDim_ + col;   // worker index, 0-based
-            long processed = (col == 0) ? scannedRow_[r] : aliveAfter_[w - 1];
-            std::cout << "  worker " << (w + 1) << ": skipped "
-                      << (100.0 * (1.0 - (double)processed / (double)scannedRow_[r]))
-                      << "%" << std::endl;
-            done = done + processed;
-        }
+    for (int s = 0; s < bDim_; ++s) {
+        long processed = (s == 0) ? scanned_ : aliveAfterStage_[s - 1];
+        std::cout << "  slice " << (s + 1) << ": skipped "
+                  << (100.0 * (1.0 - (double)processed / (double)scanned_))
+                  << "%" << std::endl;
+        done = done + processed;
     }
     std::cout << "distance work vs no pruning: "
               << (100.0 * done / (double)(scanned_ * bDim_)) << "%" << std::endl;

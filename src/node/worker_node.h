@@ -27,9 +27,9 @@ class WorkerNode : public Node {
 public:
     explicit WorkerNode(int id) : Node(id) {
         myDim_ = 0;
-        nextRank_ = 0;
-        first_ = false;
-        aliveCount_ = 0;
+        bDim_ = 1;
+        myCol_ = 0;
+        rowBase_ = id;
     }
     ~WorkerNode() override = default;
 
@@ -66,10 +66,14 @@ private:
     void receiveSetup();
 
     int myDim_;
-    int nextRank_;    // where partial results go: the next worker in the row,
-                      // or the master if this is the last dimension slice
-    bool first_;      // first slice in the row: starts the running totals
-    long aliveCount_; // survivors after this worker, summed over every job
+    int bDim_;      // how many workers share this row
+    int myCol_;     // which of them this one is
+    int rowBase_;   // rank of column 0 in this row
+
+    // Survivors counted by position in the chain, not by worker: with
+    // rotation a worker is the first stop for some clusters and the last for
+    // others, so a single per-worker total would mix the two.
+    std::vector<long> aliveAtStage_;
     std::vector<ClusterBlock> blocks_;
 };
 

@@ -74,8 +74,9 @@ public:
     // waiting on it. Together they are the paper's "foreach d in DSet": the
     // job goes to every worker in the cluster's row, those workers pass the
     // running totals down the chain, and only the last one reports back.
-    void dispatchCluster(int clusterId, int n, int skip, float threshold);
-    void collectCluster(int row, int n,
+    void dispatchBatch(int row, const std::vector<int>& batch,
+                       int prewarmClusterId, int prewarmed, float threshold);
+    void collectCluster(int row, int startCol, int n,
                         std::vector<float>& sums, std::vector<char>& alive);
 
 private:
@@ -89,10 +90,12 @@ private:
     SlicePlan plan_;                 // how a row cuts up the dimensions
     std::vector<int> clusterOwner_;  // cluster id -> vector partition (row)
 
-    // pruning counters (paper Table 3)
-    long scanned_;                   // candidates offered in total
-    std::vector<long> scannedRow_;   // per vector partition
-    std::vector<long> aliveAfter_;   // still alive after worker w's slice
+    // pruning counters (paper Table 3). Counted by position in the chain
+    // rather than by worker: rotation makes each worker the first stop for
+    // some clusters and the last for others.
+    long scanned_;                      // candidates offered in total
+    std::vector<long> scannedRow_;      // per vector partition
+    std::vector<long> aliveAfterStage_; // still alive after the s-th slice
 
     // ---- v1: vector partition, one process, direct method calls ----
     //

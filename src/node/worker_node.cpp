@@ -60,14 +60,13 @@ namespace harmony {
 
         myDim_ = setup[0];
         int nClusters = setup[1];   // only the clusters of this worker's row
-        int bDim = setup[2];
+        bDim_ = setup[2];
 
-        // My place in the row is (id_-1) % bDim. The first slice starts the
-        // running totals; the last one reports back to the master; everyone
-        // else forwards to the next slice in the row.
-        int col = (id_ - 1) % bDim;
-        first_ = (col == 0);
-        nextRank_ = (col == bDim - 1) ? MASTER_RANK : id_ + 1;
+        // Where this worker sits in its row. Which end of a chain it is
+        // depends on the job, since clusters start at different columns.
+        myCol_ = (id_ - 1) % bDim_;
+        rowBase_ = id_ - myCol_;
+        aliveAtStage_.assign(bDim_, 0);
 
         for (int c = 0; c < nClusters; ++c) {
             int header[2];
@@ -100,14 +99,30 @@ namespace harmony {
         std::vector<float> sums;
         std::vector<char> alive;
 
+        // Forwarding has to be non-blocking. Clusters start at different
+        // columns, so two workers can be sending to each other at the same
+        // moment; with blocking sends both would sit in MPI_Send waiting for
+        // the other to post a receive, and the row would deadlock. This is
+        // why the paper uses MPI_Isend / MPI_Irecv (Section 5).
+        //
+        // An outgoing buffer must stay untouched until its send completes, and
+        // sums/alive are reused by the next job, so sends go out of a small
+        // rotating pool instead.
+        int slots = bDim_ + 1;
+        std::vector<std::vector<float>> outSums(slots);
+        std::vector<std::vector<char>> outAlive(slots);
+        std::vector<MPI_Request> reqSums(slots, MPI_REQUEST_NULL);
+        std::vector<MPI_Request> reqAlive(slots, MPI_REQUEST_NULL);
+        int slot = 0;
+
         while (true) {
-            int job[3];
-            MPI_Recv(job, 3, MPI_INT, MASTER_RANK, TAG_JOB,
+            int job[4];
+            MPI_Recv(job, 4, MPI_INT, MASTER_RANK, TAG_JOB,
                      MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             if (job[0] == JOB_SHUTDOWN) {
-                MPI_Send(&aliveCount_, 1, MPI_LONG, MASTER_RANK, TAG_STATS,
-                         MPI_COMM_WORLD);
+                MPI_Send(aliveAtStage_.data(), bDim_, MPI_LONG, MASTER_RANK,
+                         TAG_STATS, MPI_COMM_WORLD);
                 break;
             }
 
@@ -120,13 +135,23 @@ namespace harmony {
             int clusterId = job[0];
             int n = job[1];
             int skip = job[2];
+            int startCol = job[3];
+
+            // This cluster's chain runs startCol, startCol+1, ... around the
+            // row. Where this worker sits in that chain decides everything.
+            int stage = (myCol_ - startCol + bDim_) % bDim_;   // 0 = first stop
+            bool isFirst = (stage == 0);
+            bool isLast = (myCol_ == (startCol + bDim_ - 1) % bDim_);
+            int prevRank = rowBase_ + (myCol_ - 1 + bDim_) % bDim_;
+            int nextRank = isLast ? MASTER_RANK
+                                  : rowBase_ + (myCol_ + 1) % bDim_;
 
             float threshold = 0.0f;
             MPI_Recv(&threshold, 1, MPI_FLOAT, MASTER_RANK, TAG_THRESHOLD,
                      MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-            if (first_) {
-                // first slice in the row: start the running totals from scratch
+            if (isFirst) {
+                // first stop of the chain: start the running totals from scratch
                 sums.assign(n, 0.0f);
                 alive.assign(n, 1);
                 for (int j = 0; j < skip; ++j) {
@@ -135,9 +160,9 @@ namespace harmony {
             } else {
                 sums.resize(n);
                 alive.resize(n);
-                MPI_Recv(sums.data(), n, MPI_FLOAT, id_ - 1, TAG_SUMS,
+                MPI_Recv(sums.data(), n, MPI_FLOAT, prevRank, TAG_SUMS,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                MPI_Recv(alive.data(), n, MPI_CHAR, id_ - 1, TAG_ALIVE,
+                MPI_Recv(alive.data(), n, MPI_CHAR, prevRank, TAG_ALIVE,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             }
 
@@ -145,12 +170,27 @@ namespace harmony {
 
             for (int j = 0; j < n; ++j) {
                 if (alive[j]) {
-                    aliveCount_ = aliveCount_ + 1;
+                    aliveAtStage_[stage] = aliveAtStage_[stage] + 1;
                 }
             }
 
-            MPI_Send(sums.data(), n, MPI_FLOAT, nextRank_, TAG_SUMS, MPI_COMM_WORLD);
-            MPI_Send(alive.data(), n, MPI_CHAR, nextRank_, TAG_ALIVE, MPI_COMM_WORLD);
+            // reclaim this slot before overwriting it
+            MPI_Wait(&reqSums[slot], MPI_STATUS_IGNORE);
+            MPI_Wait(&reqAlive[slot], MPI_STATUS_IGNORE);
+
+            outSums[slot] = sums;
+            outAlive[slot] = alive;
+            MPI_Isend(outSums[slot].data(), n, MPI_FLOAT, nextRank, TAG_SUMS,
+                      MPI_COMM_WORLD, &reqSums[slot]);
+            MPI_Isend(outAlive[slot].data(), n, MPI_CHAR, nextRank, TAG_ALIVE,
+                      MPI_COMM_WORLD, &reqAlive[slot]);
+            slot = (slot + 1) % slots;
+        }
+
+        // let any still-outstanding sends finish before the process goes away
+        for (int s = 0; s < slots; ++s) {
+            MPI_Wait(&reqSums[s], MPI_STATUS_IGNORE);
+            MPI_Wait(&reqAlive[s], MPI_STATUS_IGNORE);
         }
 
         return 0;
