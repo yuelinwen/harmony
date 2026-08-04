@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "node.h"
+#include "../config.h"
 #include "../comm/messages.h"
 #include "../engine/slice_plan.h"
 #include "../index/dataset.h"
@@ -18,10 +19,13 @@ namespace harmony {
 
 class MasterNode : public Node {
 public:
-    explicit MasterNode(int numWorkers) : Node(0) {
+    MasterNode(int numWorkers, const Config& cfg) : Node(0) {
         numWorkers_ = numWorkers;
-        bVec_ = 1;
-        bDim_ = numWorkers;
+        cfg_ = cfg;
+        bVec_ = cfg.bVec;
+        bDim_ = cfg.bDim;
+        gtCount_ = 0;
+        gtDim_ = 0;
         scanned_ = 0;
     }
     ~MasterNode() override = default;
@@ -30,6 +34,13 @@ public:
 
     // Reads the base and query vectors. Returns false if either file fails.
     bool loadData(const std::string& basePath, const std::string& queryPath);
+
+    // Reads the true nearest neighbours: same layout as the vector files, but
+    // int32 ids. Row q holds the real answer for query q, nearest first.
+    bool loadGroundtruth(const std::string& path);
+
+    // Share of the true top-k this result actually found (paper Section 6).
+    double recallAt(int queryId, const std::vector<Candidate>& got, int k) const;
 
     // Clusters the base vectors into nlist groups. This runs once, over the
     // whole dataset, before anything is handed to the workers.
@@ -84,6 +95,11 @@ private:
     Dataset query_;   // the vectors to search for
     IvfIndex index_;  // global clustering: centroids + inverted lists
 
+    std::vector<int> gt_;   // gtCount_ rows of gtDim_ ids, row-major
+    int gtCount_;
+    int gtDim_;
+
+    Config cfg_;
     int numWorkers_;
     int bVec_;                       // rows: vector partitions
     int bDim_;                       // columns: dimension slices per row

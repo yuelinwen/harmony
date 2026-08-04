@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <iostream>
 
 #include <mpi.h>
@@ -21,6 +22,56 @@ bool MasterNode::loadData(const std::string& basePath, const std::string& queryP
     std::cout << "base:  n=" << base_.getN() << " dim=" << base_.getDim() << std::endl;
     std::cout << "query: n=" << query_.getN() << " dim=" << query_.getDim() << std::endl;
     return true;
+}
+
+bool MasterNode::loadGroundtruth(const std::string& path) {
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        std::cerr << "cannot open file: " << path << std::endl;
+        return false;
+    }
+
+    int header[2];
+    if (std::fread(header, sizeof(int), 2, file) != 2) {
+        std::cerr << "cannot read header: " << path << std::endl;
+        std::fclose(file);
+        return false;
+    }
+    gtCount_ = header[0];
+    gtDim_ = header[1];
+
+    gt_.resize((size_t)gtCount_ * gtDim_);
+    size_t got = std::fread(gt_.data(), sizeof(int), gt_.size(), file);
+    std::fclose(file);
+
+    if (got != gt_.size()) {
+        std::cerr << "short read: " << path << std::endl;
+        return false;
+    }
+
+    std::cout << "gt:    n=" << gtCount_ << " dim=" << gtDim_ << std::endl;
+    return true;
+}
+
+// Counts how many of the true top-k this result found, as a fraction. Order
+// does not matter -- a neighbour found at a different rank is still found.
+double MasterNode::recallAt(int queryId, const std::vector<Candidate>& got, int k) const {
+    if (queryId >= gtCount_ || k <= 0) {
+        return 0.0;
+    }
+    int want = (k < gtDim_) ? k : gtDim_;   // the file may hold fewer than k
+    const int* truth = &gt_[(size_t)queryId * gtDim_];
+
+    int hits = 0;
+    for (int i = 0; i < want; ++i) {
+        for (int j = 0; j < (int)got.size(); ++j) {
+            if (got[j].id == truth[i]) {
+                hits = hits + 1;
+                break;
+            }
+        }
+    }
+    return (double)hits / (double)want;
 }
 
 void MasterNode::buildIndex(int nlist, int iterations) {
@@ -248,7 +299,10 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
                 batch[r].push_back(perRow[r][pos[r] + p]);
             }
             if (!batch[r].empty()) {
-                dispatchBatch(r, batch[r], prewarmClusterId, prewarmed, heap.worst());
+                // an infinite threshold means nothing is ever dropped, which
+                // is the no-pruning arm of the ablation (paper Fig. 10)
+                float threshold = cfg_.pruning ? heap.worst() : 1e30f;
+                dispatchBatch(r, batch[r], prewarmClusterId, prewarmed, threshold);
                 any = true;
             }
         }
@@ -294,7 +348,7 @@ std::vector<Candidate> MasterNode::queryPipeline(const float* query, int nprobe,
 
     // Stage 0: prewarming (Algorithm 1 line 20)
     TopKHeap heap(k);
-    int prewarmed = prewarmHeap(query, clusters[0], 500, heap);
+    int prewarmed = prewarmHeap(query, clusters[0], cfg_.prewarm, heap);
 
     // Stage I: vector-level pipeline (Algorithm 1 lines 21-23). Group the
     // probed clusters by the vector partition that owns them, then run each
@@ -315,21 +369,12 @@ int MasterNode::run() {
     running_ = true;
     std::cout << "master node started" << std::endl;
 
-    if (!loadData("Data/sift_base.bin", "Data/sift_query.bin")) {
+    if (!loadData(cfg_.basePath, cfg_.queryPath) ||
+        !loadGroundtruth(cfg_.gtPath)) {
         return 1;
     }
-    buildIndex(256, 10);
-
-    // Grid shape: edit these two numbers to switch mode (their product must
-    // equal the worker count). 2x2 = Harmony, 4x1 = Harmony-vector,
-    // 1x4 = Harmony-dimension.
-    int bVec = 2;
-    int bDim = 2;
-    if (bVec * bDim != numWorkers_) {
-        bVec = 1;
-        bDim = numWorkers_;   // fall back to pure dimension partition
-    }
-    splitGrid(bVec, bDim);
+    buildIndex(cfg_.nlist, cfg_.iters);
+    splitGrid(cfg_.bVec, cfg_.bDim);
     distributeData();
 
     // v1 check: splitting the work over the workers and merging it back
@@ -338,9 +383,9 @@ int MasterNode::run() {
     // Compared as sets, not position by position. Squared distances on SIFT
     // are integers and ties are common near rank k, and which of two equally
     // distant vectors comes first is not defined either way.
-    int k = 100;
-    int nprobe = 32;
-    int nq = 100;
+    int k = cfg_.k;
+    int nprobe = cfg_.nprobe;
+    int nq = cfg_.nq;
     int differing = 0;
     int ties = 0;
 
@@ -350,12 +395,15 @@ int MasterNode::run() {
     // Only the distributed search is timed. index_.search() below is the
     // single-machine reference used to check the answer, not part of the work.
     double seconds = 0.0;
+    double recallSum = 0.0;
 
     for (int q = 0; q < nq; ++q) {
         auto t0 = std::chrono::steady_clock::now();
         std::vector<Candidate> spread = queryPipeline(query_.vec(q), nprobe, k);
         auto t1 = std::chrono::steady_clock::now();
         seconds = seconds + std::chrono::duration<double>(t1 - t0).count();
+
+        recallSum = recallSum + recallAt(q, spread, k);
 
         std::vector<Candidate> single = index_.search(base_, query_.vec(q), nprobe, k);
 
@@ -389,6 +437,7 @@ int MasterNode::run() {
     std::cout << "queries differing from single machine: "
               << differing << "/" << nq
               << "   (ties broken differently: " << ties << ")" << std::endl;
+    std::cout << "recall@" << k << ": " << (recallSum / nq) << std::endl;
     std::cout << "QPS: " << (nq / seconds)
               << "   (" << (1000.0 * seconds / nq) << " ms per query)" << std::endl;
 

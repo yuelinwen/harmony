@@ -2,6 +2,7 @@
 
 #include <mpi.h>
 
+#include "src/config.h"
 #include "src/node/master_node.h"
 #include "src/node/worker_node.h"
 
@@ -18,9 +19,18 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+    // every rank sees the same argv, so they all parse it rather than having
+    // the master broadcast the settings
+    harmony::Config cfg;
+    if (!harmony::parseArgs(argc, argv, cfg) ||
+        !harmony::resolveGrid(cfg, size - 1)) {
+        MPI_Finalize();
+        return 1;
+    }
+
     std::unique_ptr<harmony::Node> node;
     if (rank == harmony::MASTER_RANK) {
-        node = std::make_unique<harmony::MasterNode>(size - 1);
+        node = std::make_unique<harmony::MasterNode>(size - 1, cfg);
     } else {
         node = std::make_unique<harmony::WorkerNode>(rank);
     }
