@@ -253,18 +253,10 @@ void MasterNode::dispatchBatch(int row, const std::vector<int>& batch,
     }
 }
 
-void MasterNode::collectCluster(int row, int startCol, int n,
-                                std::vector<float>& sums, std::vector<char>& alive) {
+int MasterNode::lastRankOf(int row, int startCol) const {
     // the chain ends one step before it began, going round the row
     int lastCol = (startCol + bDim_ - 1) % bDim_;
-    int last = row * bDim_ + lastCol + 1;
-
-    sums.resize(n);
-    alive.resize(n);
-    MPI_Recv(sums.data(), n, MPI_FLOAT, last, TAG_SUMS,
-             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    MPI_Recv(alive.data(), n, MPI_CHAR, last, TAG_ALIVE,
-             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    return row * bDim_ + lastCol + 1;
 }
 
 // Two levels of overlap, which multiply out to one busy worker per machine:
@@ -284,50 +276,82 @@ void MasterNode::collectCluster(int row, int startCol, int n,
 // partition, Algorithm 1 line 18; updating sooner prunes strictly more.)
 void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
                                 int prewarmClusterId, int prewarmed, TopKHeap& heap) {
-    std::vector<size_t> pos(bVec_, 0);            // per row: clusters handled
-    std::vector<std::vector<int>> batch(bVec_);   // per row: the batch in flight
-    std::vector<float> sums;
-    std::vector<char> alive;
+    // One slot per cluster that can be in flight: bDim per row, so every
+    // worker always has something queued.
+    struct Slot {
+        int row;
+        int clusterId;
+        int n;
+        std::vector<float> sums;
+    };
+    int maxInFlight = bVec_ * bDim_;
+    std::vector<Slot> slot(maxInFlight);
+    std::vector<MPI_Request> req(maxInFlight, MPI_REQUEST_NULL);
+
+    std::vector<size_t> pos(bVec_, 0);      // per row: clusters finished
+    std::vector<int> inFlight(bVec_, 0);
+    std::vector<std::vector<int>> batch(bVec_);
+    int free = 0;                           // next slot to hand out
 
     while (true) {
-        // Send one batch into every row before collecting anything, so the
-        // rows compute at the same time.
-        bool any = false;
+        // A row whose batch has come back entirely gets the next one. Rows
+        // refill on their own, so a slow row never holds up a fast one.
         for (int r = 0; r < bVec_; ++r) {
+            if (inFlight[r] > 0 || pos[r] >= perRow[r].size()) {
+                continue;
+            }
             batch[r].clear();
             for (int p = 0; p < bDim_ && pos[r] + p < perRow[r].size(); ++p) {
                 batch[r].push_back(perRow[r][pos[r] + p]);
             }
-            if (!batch[r].empty()) {
-                // an infinite threshold means nothing is ever dropped, which
-                // is the no-pruning arm of the ablation (paper Fig. 10)
-                float threshold = cfg_.pruning ? heap.worst() : 1e30f;
-                dispatchBatch(r, batch[r], prewarmClusterId, prewarmed, threshold);
-                any = true;
-            }
-        }
-        if (!any) {
-            break;
-        }
 
-        for (int r = 0; r < bVec_; ++r) {
+            // an infinite threshold means nothing is ever dropped, which is
+            // the no-pruning arm of the ablation (paper Fig. 10)
+            float threshold = cfg_.pruning ? heap.worst() : PRUNED;
+            dispatchBatch(r, batch[r], prewarmClusterId, prewarmed, threshold);
+
+            // Post the receives straight away. Results are matched by source
+            // rank, and MPI keeps messages between a pair of ranks in order,
+            // so posting in dispatch order is enough to line them up.
             for (int p = 0; p < (int)batch[r].size(); ++p) {
-                const std::vector<int>& ids = index_.clusterIds(batch[r][p]);
-                int n = (int)ids.size();
-
-                collectCluster(r, p, n, sums, alive);
-
-                scanned_ = scanned_ + (long)n;
-                scannedRow_[r] = scannedRow_[r] + (long)n;
-
-                // whatever survived every slice has a real distance now
-                for (int j = 0; j < n; ++j) {
-                    if (alive[j]) {
-                        heap.push(ids[j], sums[j]);
-                    }
+                while (req[free] != MPI_REQUEST_NULL) {
+                    free = (free + 1) % maxInFlight;
                 }
+                int c = batch[r][p];
+                int n = (int)index_.clusterIds(c).size();
+
+                slot[free].row = r;
+                slot[free].clusterId = c;
+                slot[free].n = n;
+                slot[free].sums.resize(n);
+
+                MPI_Irecv(slot[free].sums.data(), n, MPI_FLOAT,
+                          lastRankOf(r, p), TAG_SUMS, MPI_COMM_WORLD, &req[free]);
+                inFlight[r] = inFlight[r] + 1;
             }
-            pos[r] = pos[r] + batch[r].size();
+        }
+
+        int index = MPI_UNDEFINED;
+        MPI_Waitany(maxInFlight, req.data(), &index, MPI_STATUS_IGNORE);
+        if (index == MPI_UNDEFINED) {
+            break;   // nothing left in flight and nothing left to send
+        }
+
+        // whatever survived every slice has a real distance now
+        const Slot& s = slot[index];
+        const std::vector<int>& ids = index_.clusterIds(s.clusterId);
+        for (int j = 0; j < s.n; ++j) {
+            if (s.sums[j] < PRUNED) {
+                heap.push(ids[j], s.sums[j]);
+            }
+        }
+
+        scanned_ = scanned_ + (long)s.n;
+        scannedRow_[s.row] = scannedRow_[s.row] + (long)s.n;
+
+        inFlight[s.row] = inFlight[s.row] - 1;
+        if (inFlight[s.row] == 0) {
+            pos[s.row] = pos[s.row] + batch[s.row].size();
         }
     }
 }

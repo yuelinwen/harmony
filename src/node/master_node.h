@@ -87,8 +87,9 @@ public:
     // running totals down the chain, and only the last one reports back.
     void dispatchBatch(int row, const std::vector<int>& batch,
                        int prewarmClusterId, int prewarmed, float threshold);
-    void collectCluster(int row, int startCol, int n,
-                        std::vector<float>& sums, std::vector<char>& alive);
+
+    // Which worker reports the result of a cluster that started at startCol.
+    int lastRankOf(int row, int startCol) const;
 
 private:
     Dataset base_;    // the vectors being searched

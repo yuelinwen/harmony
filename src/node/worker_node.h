@@ -57,11 +57,12 @@ public:
     // whose running total has passed the threshold: partial sums only grow,
     // so it can never come back and reach the top-K.
     //
-    // querySlice is the master's cut of the query, myDim floats long.
-    // sums and alive hold one entry per vector in the cluster and are carried
-    // from worker to worker (paper Algorithm 1, lines 6-12).
+    // querySlice is the master's cut of the query, myDim floats long. sums
+    // holds one running total per vector in the cluster and is carried from
+    // worker to worker; a pruned entry is marked with PRUNED
+    // (paper Algorithm 1, lines 6-12).
     void accumulate(const float* querySlice, int clusterId, float threshold,
-                    std::vector<float>& sums, std::vector<char>& alive);
+                    std::vector<float>& sums);
 
 private:
     // Takes myDim, the cluster count, and then every cluster block.

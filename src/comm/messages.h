@@ -23,8 +23,13 @@ const int TAG_JOB       = 5;   // int[4], see below
 const int TAG_QUERY     = 6;   // float[myDim]: this worker's slice of the query
 const int TAG_THRESHOLD = 7;   // float: tau^2
 const int TAG_SUMS      = 8;   // float[n]: running partial distances
-const int TAG_ALIVE     = 9;   // char[n]: 0 = pruned
-const int TAG_STATS     = 10;  // long: how many survived this worker, in total
+const int TAG_STATS     = 10;  // long[bDim]: survivors per chain position
+
+// A pruned candidate is marked by setting its running sum to this instead of
+// carrying a separate alive flag: it is larger than any real squared distance
+// and larger than any threshold, so downstream workers skip it on their own
+// and only one array has to travel between workers.
+const float PRUNED = 1e38f;
 
 // TAG_JOB carries int[4] = {what, n, skip, startCol}.
 // `what` >= 0 is a cluster id to work on; n is how many vectors it holds,

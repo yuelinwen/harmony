@@ -35,7 +35,7 @@ namespace harmony {
     }
 
     void WorkerNode::accumulate(const float* querySlice, int clusterId, float threshold,
-                                std::vector<float>& sums, std::vector<char>& alive) {
+                                std::vector<float>& sums) {
         for (int b = 0; b < (int)blocks_.size(); ++b) {
             if (blocks_[b].clusterId != clusterId) {
                 continue;
@@ -44,20 +44,20 @@ namespace harmony {
             int n = (int)block.ids.size();
 
             // The hot loop, and the only place a worker spends real time.
-            // Iterations touch different sums[v] and alive[v], so the threads
-            // never write the same memory and no locking is needed. This is
-            // the node-level parallelism of paper Section 5; across nodes the
-            // work is already split by MPI.
+            // Iterations touch different sums[v], so the threads never write
+            // the same memory and no locking is needed. This is the node-level
+            // parallelism of paper Section 5; across nodes the work is already
+            // split by MPI.
             #pragma omp parallel for schedule(static)
             for (int v = 0; v < n; ++v) {
-                if (!alive[v]) {
+                if (sums[v] >= PRUNED) {
                     continue;      // an earlier worker already dropped it
                 }
                 sums[v] = sums[v] + l2DistanceSquared(querySlice,
                                                       &block.data[(size_t)v * myDim_],
                                                       myDim_);
                 if (sums[v] > threshold) {
-                    alive[v] = 0;  // cannot reach the top-K, stop here
+                    sums[v] = PRUNED;   // cannot reach the top-K, stop here
                 }
             }
         }
@@ -119,7 +119,6 @@ namespace harmony {
 
         std::vector<float> querySlice(myDim_);
         std::vector<float> sums;
-        std::vector<char> alive;
 
         // Forwarding has to be non-blocking. Clusters start at different
         // columns, so two workers can be sending to each other at the same
@@ -128,13 +127,11 @@ namespace harmony {
         // why the paper uses MPI_Isend / MPI_Irecv (Section 5).
         //
         // An outgoing buffer must stay untouched until its send completes, and
-        // sums/alive are reused by the next job, so sends go out of a small
-        // rotating pool instead.
+        // sums is reused by the next job, so sends go out of a small rotating
+        // pool instead.
         int slots = bDim_ + 1;
         std::vector<std::vector<float>> outSums(slots);
-        std::vector<std::vector<char>> outAlive(slots);
         std::vector<MPI_Request> reqSums(slots, MPI_REQUEST_NULL);
-        std::vector<MPI_Request> reqAlive(slots, MPI_REQUEST_NULL);
         int slot = 0;
 
         while (true) {
@@ -175,44 +172,35 @@ namespace harmony {
             if (isFirst) {
                 // first stop of the chain: start the running totals from scratch
                 sums.assign(n, 0.0f);
-                alive.assign(n, 1);
                 for (int j = 0; j < skip; ++j) {
-                    alive[j] = 0;   // the master prewarmed these already
+                    sums[j] = PRUNED;   // the master prewarmed these already
                 }
             } else {
                 sums.resize(n);
-                alive.resize(n);
                 MPI_Recv(sums.data(), n, MPI_FLOAT, prevRank, TAG_SUMS,
-                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                MPI_Recv(alive.data(), n, MPI_CHAR, prevRank, TAG_ALIVE,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             }
 
-            accumulate(querySlice.data(), clusterId, threshold, sums, alive);
+            accumulate(querySlice.data(), clusterId, threshold, sums);
 
             for (int j = 0; j < n; ++j) {
-                if (alive[j]) {
+                if (sums[j] < PRUNED) {
                     aliveAtStage_[stage] = aliveAtStage_[stage] + 1;
                 }
             }
 
             // reclaim this slot before overwriting it
             MPI_Wait(&reqSums[slot], MPI_STATUS_IGNORE);
-            MPI_Wait(&reqAlive[slot], MPI_STATUS_IGNORE);
 
             outSums[slot] = sums;
-            outAlive[slot] = alive;
             MPI_Isend(outSums[slot].data(), n, MPI_FLOAT, nextRank, TAG_SUMS,
                       MPI_COMM_WORLD, &reqSums[slot]);
-            MPI_Isend(outAlive[slot].data(), n, MPI_CHAR, nextRank, TAG_ALIVE,
-                      MPI_COMM_WORLD, &reqAlive[slot]);
             slot = (slot + 1) % slots;
         }
 
         // let any still-outstanding sends finish before the process goes away
         for (int s = 0; s < slots; ++s) {
             MPI_Wait(&reqSums[s], MPI_STATUS_IGNORE);
-            MPI_Wait(&reqAlive[s], MPI_STATUS_IGNORE);
         }
 
         return 0;
