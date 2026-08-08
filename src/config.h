@@ -21,9 +21,21 @@ struct Config {
     int nlist = 256;    // clusters in the index
     int iters = 10;     // kmeans rounds
 
-    std::string mode = "harmony";   // harmony | vector | dimension
+    std::string mode = "harmony";   // harmony | vector | dimension | auto
     int bVec = 0;       // set directly to override the mode
     int bDim = 0;
+
+    // Cost model (paper Section 4.2.1), used when mode is "auto".
+    //   alpha    weight on the imbalance term of C(pi,Q)
+    //   commCost cost of one byte between workers, relative to one multiply-
+    //            add. Shared memory is nearly free; a real network is not,
+    //            and this is the number that decides whether splitting by
+    //            dimension is worth its extra hops.
+    //   warmup   queries used to learn which clusters are hot before the plan
+    //            is fixed (the paper's pre-query phase, Section 6.2.1)
+    double alpha = 0.3;
+    double commCost = 1.0;
+    int warmup = 1000;
 
     int nprobe = 32;    // clusters visited per query
     int k = 100;        // neighbours returned
@@ -46,7 +58,10 @@ inline void printUsage(const char* prog) {
         << "  --gt <path>        groundtruth ids         (Data/sift_gt.bin)\n"
         << "  --nlist <int>      clusters in the index   (256)\n"
         << "  --iters <int>      kmeans rounds           (10)\n"
-        << "  --mode <name>      harmony | vector | dimension  (harmony)\n"
+        << "  --mode <name>      harmony | vector | dimension | auto  (harmony)\n"
+        << "  --alpha <float>    imbalance weight in the cost model (0.3)\n"
+        << "  --commcost <float> cost per transferred byte vs one flop (1.0)\n"
+        << "  --warmup <int>     queries used to learn hot clusters (1000)\n"
         << "  --bvec <int>       vector partitions, overrides --mode\n"
         << "  --bdim <int>       dimension slices, overrides --mode\n"
         << "  --nprobe <int>     clusters per query      (32)\n"
@@ -91,6 +106,12 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.pruning = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--threads" && hasValue) {
             cfg.threads = std::atoi(argv[++i]);
+        } else if (opt == "--alpha" && hasValue) {
+            cfg.alpha = std::atof(argv[++i]);
+        } else if (opt == "--commcost" && hasValue) {
+            cfg.commCost = std::atof(argv[++i]);
+        } else if (opt == "--warmup" && hasValue) {
+            cfg.warmup = std::atoi(argv[++i]);
         } else {
             std::cerr << "bad option: " << opt << std::endl;
             printUsage(argv[0]);
@@ -118,6 +139,9 @@ inline bool resolveGrid(Config& cfg, int numWorkers) {
         cfg.bDim = 1;
     } else if (cfg.mode == "dimension") {
         cfg.bVec = 1;
+        cfg.bDim = numWorkers;
+    } else if (cfg.mode == "auto") {
+        cfg.bVec = 1;          // provisional; choosePlan() replaces it
         cfg.bDim = numWorkers;
     } else if (cfg.mode == "harmony") {
         cfg.bDim = 1;

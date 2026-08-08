@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <iostream>
 
@@ -83,6 +84,95 @@ void MasterNode::buildIndex(int nlist, int iterations) {
 
     std::cout << "build time: "
               << std::chrono::duration<double>(t1 - t0).count() << " s" << std::endl;
+}
+
+// Centroid assignment only -- no worker is involved and nothing is searched,
+// so this is cheap: it just records which clusters the workload touches.
+void MasterNode::warmupPlan(int queries, int nprobe) {
+    clusterHits_.assign(index_.getNlist(), 0);
+
+    int n = query_.getN();
+    if (queries < n) {
+        n = queries;
+    }
+    for (int q = 0; q < n; ++q) {
+        std::vector<int> clusters = index_.nearestClusters(query_.vec(q), nprobe);
+        for (int i = 0; i < (int)clusters.size(); ++i) {
+            clusterHits_[clusters[i]] = clusterHits_[clusters[i]] + 1;
+        }
+    }
+
+    std::cout << "warmup: " << n << " queries profiled" << std::endl;
+}
+
+double MasterNode::imbalanceOf(int bVec, int bDim) const {
+    // Work landing on each row: probes x cluster size x dimensions per machine.
+    // Every machine in a row carries the same amount once the rotation has
+    // evened out first-stop duty, so per-row is enough.
+    std::vector<double> load(bVec, 0.0);
+    for (int c = 0; c < index_.getNlist(); ++c) {
+        long hits = clusterHits_.empty() ? 1 : clusterHits_[c];
+        load[c % bVec] += (double)hits
+                        * (double)index_.clusterIds(c).size()
+                        * ((double)base_.getDim() / bDim);
+    }
+
+    double mean = 0.0;
+    for (int r = 0; r < bVec; ++r) {
+        mean = mean + load[r];
+    }
+    mean = mean / bVec;
+
+    double var = 0.0;
+    for (int r = 0; r < bVec; ++r) {
+        var = var + (load[r] - mean) * (load[r] - mean);
+    }
+    return std::sqrt(var / bVec);
+}
+
+double MasterNode::estimateCost(int bVec, int bDim) const {
+    // Every probed cluster is passed along its row once per dimension slice,
+    // carrying one float per candidate. So the traffic scales with bDim while
+    // the arithmetic does not (paper Section 4.3).
+    double bytes = 0.0;
+    for (int c = 0; c < index_.getNlist(); ++c) {
+        long hits = clusterHits_.empty() ? 1 : clusterHits_[c];
+        bytes = bytes + (double)hits * (double)index_.clusterIds(c).size()
+                      * bDim * sizeof(float);
+    }
+
+    return cfg_.commCost * bytes + cfg_.alpha * imbalanceOf(bVec, bDim);
+}
+
+void MasterNode::choosePlan() {
+    std::cout << "plan search (alpha=" << cfg_.alpha
+              << ", commcost=" << cfg_.commCost << ")" << std::endl;
+
+    int bestVec = 1;
+    int bestDim = numWorkers_;
+    double bestCost = -1.0;
+
+    for (int bDim = 1; bDim <= numWorkers_; ++bDim) {
+        if (numWorkers_ % bDim != 0) {
+            continue;
+        }
+        int bVec = numWorkers_ / bDim;
+        double cost = estimateCost(bVec, bDim);
+
+        std::cout << "  " << bVec << " x " << bDim
+                  << ":  imbalance " << imbalanceOf(bVec, bDim)
+                  << "   cost " << cost << std::endl;
+
+        if (bestCost < 0.0 || cost < bestCost) {
+            bestCost = cost;
+            bestVec = bVec;
+            bestDim = bDim;
+        }
+    }
+
+    std::cout << "chosen grid: " << bestVec << " x " << bestDim << std::endl;
+    cfg_.bVec = bestVec;
+    cfg_.bDim = bestDim;
 }
 
 // The worker with rank w sits at row (w-1)/bDim, column (w-1)%bDim of the
@@ -398,6 +488,14 @@ int MasterNode::run() {
         return 1;
     }
     buildIndex(cfg_.nlist, cfg_.iters);
+
+    // The layout has to be settled before any data moves, so the cost model
+    // runs on a profiling pass first (paper Fig. 3, step 1).
+    if (cfg_.mode == "auto") {
+        warmupPlan(cfg_.warmup, cfg_.nprobe);
+        choosePlan();
+    }
+
     splitGrid(cfg_.bVec, cfg_.bDim);
     distributeData();
 

@@ -48,11 +48,11 @@ public:
     // The master uses this to decide which workers a query has to visit.
     std::vector<int> nearestClusters(const float* query, int nprobe) const;
 
-    int getNlist() {
+    int getNlist() const {
         return nlist_;
     }
 
-    int clusterSize(int c) {
+    int clusterSize(int c) const {
         return (int)invlists_[c].size();
     }
 

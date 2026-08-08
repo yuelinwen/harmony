@@ -91,6 +91,27 @@ public:
     // Which worker reports the result of a cluster that started at startCol.
     int lastRankOf(int row, int startCol) const;
 
+    // ---- cost model, paper Section 4.2.1 ----
+
+    // Runs queries through centroid assignment only, to learn which clusters
+    // are hot before the layout is fixed (the paper's pre-query phase).
+    void warmupPlan(int queries, int nprobe);
+
+    // I(pi): the spread of computation across the vector partitions, worked
+    // out from how often each cluster was probed and how big it is. Nothing
+    // has to be executed -- pi only decides which row owns which cluster.
+    double imbalanceOf(int bVec, int bDim) const;
+
+    // C(pi,Q). The paper notes that computation per machine barely moves
+    // between layouts (Section 4.3), so what actually decides the choice is
+    // communication, which grows with bDim, against imbalance, which grows
+    // with bVec.
+    double estimateCost(int bVec, int bDim) const;
+
+    // Picks the grid with the lowest cost. Only a handful of factorisations
+    // of the worker count are legal, so they are simply enumerated.
+    void choosePlan();
+
 private:
     Dataset base_;    // the vectors being searched
     Dataset query_;   // the vectors to search for
@@ -106,6 +127,7 @@ private:
     int bDim_;                       // columns: dimension slices per row
     SlicePlan plan_;                 // how a row cuts up the dimensions
     std::vector<int> clusterOwner_;  // cluster id -> vector partition (row)
+    std::vector<long> clusterHits_;  // how often each cluster has been probed
 
     // pruning counters (paper Table 3). Counted by position in the chain
     // rather than by worker: rotation makes each worker the first stop for
