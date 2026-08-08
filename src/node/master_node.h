@@ -11,9 +11,22 @@
 #include "../index/dataset.h"
 #include "../index/ivf_index.h"
 
-// MasterNode (id 0): the coordinator.
-// Plans partitions, builds/distributes the index, routes queries, and
-// merges the global Top-K. (Paper Fig.3 left side, §4.2 Query Planner.)
+// MasterNode (rank 0): decides and coordinates, but does almost no distance
+// work -- about 0.2% of it, in picking which clusters a query should visit.
+//
+// Startup, once:
+//   loadData      read the vectors and the groundtruth
+//   buildIndex    one global kmeans over the whole dataset
+//   choosePlan    cost model picks the bVec x bDim grid   (only in "auto" mode)
+//   splitGrid     decide which row owns which cluster, and how a row cuts dims
+//   distributeData  cut the data and send each worker its block
+//
+// Per query:
+//   queryPipeline   centroids -> nprobe clusters -> group by row
+//     vectorPipeline    drive all rows at once, refill each as it reports
+//       dispatchBatch   hand a row's clusters to its workers
+//
+// Paper Fig. 3 left side; Algorithm 1 is spread across the *Pipeline methods.
 
 namespace harmony {
 
@@ -146,29 +159,6 @@ private:
     long scanned_;                      // candidates offered in total
     std::vector<long> scannedRow_;      // per vector partition
     std::vector<long> aliveAfterStage_; // still alive after the s-th slice
-
-    // ---- v1: vector partition, one process, direct method calls ----
-    //
-    // TODO 5. search(query, k)  centroids -> nprobe clusters
-    //                           -> ask the workers owning those clusters
-    //                           -> merge their candidates into one top-K
-    //
-    // members: IvfIndex index_;  std::vector<WorkerNode> workers_;
-    //          std::vector<int> clusterOwner_;   // cluster id -> worker id
-    //
-    // check: top-K here must equal IvfIndex::search() on one machine
-
-    // ---- v2: dimension partition ----
-    // TODO 6. each worker gets only some dimensions, not whole vectors
-    // TODO 7. a query is split by dimension and sent to several workers
-
-    // ---- v3: pruning ----
-    // TODO 8.  prewarm()             fill the heap early to get a first tau^2
-    // TODO 9.  broadcastThreshold()  send tau^2 to workers now and then
-    // TODO 10. workers pass partial distances along a pipeline
-
-    // ---- v4: MPI ----
-    // TODO 11. replace direct calls with messages
 };
 
 }  // namespace harmony

@@ -20,11 +20,19 @@
 //           2. keep the nprobe nearest clusters
 //           3. scan only the vectors in those clusters
 //
-// This is the base that the paper's contributions plug into later:
-//   - vector-based partition  = split the clusters across workers
-//   - dimension-based partition = split each vector's dims across workers
-//   - pruning = replace the full distance in step 3 with a sliced,
-//     early-exit computation
+// The clustering is global: it runs once, on the master, over the whole
+// dataset, and only then is the result cut up for the workers. That is what
+// lets the master send a query to just the few workers that can hold its
+// neighbours, instead of broadcasting it to everyone.
+//
+// The distributed side builds on this index rather than replacing it:
+//   - vector partition     = which worker row owns which of these clusters
+//   - dimension partition  = which columns of each vector a worker keeps
+//   - pruning              = the scan in step 3, spread across a worker chain
+//                            and stopped early
+//
+// search() stays whole and single-machine, and is used as the reference the
+// distributed answer is checked against.
 
 namespace harmony {
 

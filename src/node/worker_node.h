@@ -6,13 +6,22 @@
 #include "node.h"
 #include "../config.h"
 
-// WorkerNode (id >= 1): a compute node.
-// Holds one VxD data block, computes partial distances, and participates
-// in pipeline pruning. (Paper Fig.3 right side, §4.3 Execution Engine.)
+// WorkerNode (rank >= 1): where essentially all the arithmetic happens.
 //
-// The worker owns no plan and makes no decisions. The master cuts the data
-// and the query the same way and sends only the slice, so a worker never even
-// learns which dimensions it is working on -- just how many.
+// It owns no plan and makes no decisions. The master cuts the data and the
+// query the same way and sends only the slice, so a worker never even learns
+// which dimensions it is working on -- just how many. All it does is:
+//
+//   run()         wait for a job, do it, pass the result on, repeat
+//   accumulate()  add my dimensions to the running total, drop what is now
+//                 too far to reach the top-K
+//
+// Workers in the same row form a chain. A cluster enters at some column,
+// goes round the row one worker at a time, and the last one reports back to
+// the master. Which end of a chain this worker is depends on the job: the
+// entry point rotates, so no worker is always the first stop.
+//
+// Paper Fig. 3 right side, Fig. 5b, Algorithm 1 lines 6-12.
 
 namespace harmony {
 

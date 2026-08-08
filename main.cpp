@@ -6,7 +6,11 @@
 #include "src/node/master_node.h"
 #include "src/node/worker_node.h"
 
-// Run with:  mpirun -n 5 ./harmony     (1 master + 4 workers)
+// Build and run (from the project root, so Data/ resolves):
+//   ./build.sh
+//   mpirun -n 5 ./main                 1 master + 4 workers
+//   mpirun -n 5 ./main --mode auto     let the cost model pick the layout
+//   ./main --help-ish                  any bad option prints the full list
 //
 // Every process runs this same main. Rank 0 becomes the master and drives
 // everything; ranks 1..N become workers and sit in a receive loop.

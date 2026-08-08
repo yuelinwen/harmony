@@ -1,12 +1,16 @@
 #ifndef HARMONY_INDEX_DISTANCE_H
 #define HARMONY_INDEX_DISTANCE_H
 
-// Distance functions between vectors.
+// Squared L2 distance, no sqrt: the ranking is the same either way, and
+// skipping the sqrt is faster.
 //
-// We use SQUARED L2 distance (no sqrt). For nearest neighbor search the
-// ordering is the same with or without sqrt, and skipping it is faster.
-// The paper's dimension-level pruning also relies on the squared form:
-// partial sums over dimension groups only grow, never shrink.
+// Pruning depends on the squared form. Because every term is non-negative,
+// a partial sum over some of the dimensions can only grow as more are added,
+// so a running total that has already passed the threshold can never come
+// back under it -- which is what makes it safe to stop early (paper §3.1).
+//
+// This also means the dimensions can be added in any order, which is why a
+// cluster may enter the worker chain at any column.
 
 namespace harmony {
 
@@ -15,18 +19,6 @@ namespace harmony {
 inline float l2DistanceSquared(const float* a, const float* b, int dim) {
     float sum = 0.0f;
     for (int i = 0; i < dim; ++i) {
-        float diff = a[i] - b[i];
-        sum = sum + diff * diff;
-    }
-    return sum;
-}
-
-// Same, but only over dimensions [begin, end).
-// This is the building block for dimension-based partition and pruning:
-// the full distance equals the sum of partial distances over disjoint ranges.
-inline float l2DistanceSquaredRange(const float* a, const float* b, int begin, int end) {
-    float sum = 0.0f;
-    for (int i = begin; i < end; ++i) {
         float diff = a[i] - b[i];
         sum = sum + diff * diff;
     }

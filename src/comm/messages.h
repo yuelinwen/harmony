@@ -1,12 +1,20 @@
 #ifndef HARMONY_COMM_MESSAGES_H
 #define HARMONY_COMM_MESSAGES_H
 
-// MPI message tags and the small protocol between master and workers.
+// What master and workers send each other. MPI moves bytes; the two sides
+// have to agree on what those bytes mean, and this file is that agreement.
+// Both include it, so a tag can never disagree between them -- a mismatch
+// would not fail to compile, it would just hang forever in MPI_Recv.
 //
-// Ranks: 0 is the master, 1..N are the workers. A worker forwards its partial
-// results straight to the next worker and only the last one reports back to
-// the master, so intermediate results never pass through rank 0
-// (paper Fig. 5b).
+// Rank 0 is the master, 1..N are the workers. Partial results go straight
+// from one worker to the next; only the last in a chain reports back, so they
+// never pass through rank 0 (paper Fig. 5b).
+//
+//   startup   master --> worker      the worker's slice of every cluster
+//   query     master --> worker      the worker's slice of the query
+//   job       master --> worker      which cluster to work on, and the threshold
+//   sums      worker --> worker      running totals down the chain
+//             worker --> master      from the last worker in the chain
 
 namespace harmony {
 
