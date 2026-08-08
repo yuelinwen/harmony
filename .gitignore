@@ -1,8 +1,9 @@
 .idea
 .vscode
 main
-data
+/Data
 .claude
+hosts.txt
 
 ### C++ template
 # Prerequisites
