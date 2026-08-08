@@ -28,13 +28,24 @@ struct Config {
     // Cost model (paper Section 4.2.1), used when mode is "auto".
     //   alpha    weight on the imbalance term of C(pi,Q)
     //   commCost cost of one byte between workers, relative to one multiply-
-    //            add. Shared memory is nearly free; a real network is not,
-    //            and this is the number that decides whether splitting by
-    //            dimension is worth its extra hops.
+    //            add. This is the number that decides whether splitting by
+    //            dimension is worth its extra hops, and it is a property of
+    //            the hardware, so it has to be measured.
+    //
+    //            Two ways to get it, which agreed on the test cluster:
+    //              flops/s divided by bytes/s -- 12.7 GFLOP/s over ~109 MB/s
+    //              gives about 116
+    //              sweeping it until the model ranks the three grids the way
+    //              they actually measure -- anything from 10 upwards
+    //
+    //            The default suits that cluster (1 Gb/s links). Shared memory
+    //            is nearer 1, and a 100 Gb/s fabric like the paper's would be
+    //            around 1-10, which is why the paper can afford to split by
+    //            dimension where this cluster cannot.
     //   warmup   queries used to learn which clusters are hot before the plan
     //            is fixed (the paper's pre-query phase, Section 6.2.1)
     double alpha = 0.3;
-    double commCost = 1.0;
+    double commCost = 100.0;
     int warmup = 1000;
 
     int nprobe = 32;    // clusters visited per query
@@ -60,7 +71,7 @@ inline void printUsage(const char* prog) {
         << "  --iters <int>      kmeans rounds           (10)\n"
         << "  --mode <name>      harmony | vector | dimension | auto  (harmony)\n"
         << "  --alpha <float>    imbalance weight in the cost model (0.3)\n"
-        << "  --commcost <float> cost per transferred byte vs one flop (1.0)\n"
+        << "  --commcost <float> cost per transferred byte vs one flop (100)\n"
         << "  --warmup <int>     queries used to learn hot clusters (1000)\n"
         << "  --bvec <int>       vector partitions, overrides --mode\n"
         << "  --bdim <int>       dimension slices, overrides --mode\n"

@@ -1,21 +1,58 @@
 #!/bin/bash
-# Builds ./main with MPI and, if it can be found, OpenMP.
 #
-# Apple's clang does not ship OpenMP, so on macOS the flags have to point at
-# Homebrew's libomp. On Linux -fopenmp is enough.
+# Builds ./main. Run it on whichever machine you are on -- it works out the
+# platform itself.
+#
+#   ./build.sh
+#
+# Two platforms are in play and they need different OpenMP flags:
+#
+#   macOS (the laptop)   Apple's clang has no OpenMP of its own, so the flags
+#                        have to point at Homebrew's libomp. Install it with
+#                        `brew install libomp` if the build says it is missing.
+#
+#   Linux (the VMs)      GCC ships OpenMP, so -fopenmp is all it takes.
+#
+# Everything else is identical on both, and the binary produced on one Linux
+# VM runs on all of them -- same distro, same architecture -- so it is enough
+# to build on the master and scp ./main to the others.
 
 set -e
 
-FLAGS="-std=c++20 -O2 -march=native -Wall -Wextra -I."
+# ---- flags used on both platforms --------------------------------------
+#
+# -fassociative-math is what makes the distance loop fast. Without it the
+# compiler has to keep the additions in source order, so each one waits on the
+# previous and the FMA pipeline sits idle. Allowing it to reassociate splits
+# the sum across several accumulators: 4.8 -> 12.7 GFLOP/s measured on Xeon
+# Sapphire Rapids, 1.65x end to end.
+#
+# The two companion flags are what -fassociative-math requires. Unlike
+# -ffast-math this does not assume the absence of NaN or infinities, and the
+# results do not change -- the acceptance check still reports 0 differing
+# queries.
+#
+# Widening to AVX-512 (-mprefer-vector-width=512) measured 35% *slower* and is
+# deliberately left out.
+
+FLAGS="-std=c++20 -O3 -march=native -Wall -Wextra -I."
+FLAGS="$FLAGS -fassociative-math -fno-signed-zeros -fno-trapping-math"
+
+# ---- OpenMP, which is where the platforms differ -----------------------
 
 if [ "$(uname)" = "Darwin" ] && [ -d "$(brew --prefix libomp 2>/dev/null)" ]; then
+    # macOS: clang needs -Xpreprocessor to accept -fopenmp, and libomp has to
+    # be found and linked by hand.
     OMP_PREFIX=$(brew --prefix libomp)
     FLAGS="$FLAGS -Xpreprocessor -fopenmp -I$OMP_PREFIX/include -L$OMP_PREFIX/lib -lomp"
-    echo "building with OpenMP (libomp at $OMP_PREFIX)"
+    echo "macOS build (libomp at $OMP_PREFIX)"
 else
+    # Linux: GCC handles it on its own.
     FLAGS="$FLAGS -fopenmp"
-    echo "building with OpenMP (-fopenmp)"
+    echo "Linux build (-fopenmp)"
 fi
 
+# mpicxx is a wrapper around the system compiler that adds the MPI include and
+# library paths, so no MPI flags are needed here.
 mpicxx $FLAGS main.cpp src/node/*.cpp src/index/*.cpp -o main
 echo "built ./main"
