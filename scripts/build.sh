@@ -3,7 +3,7 @@
 # Builds ./main. Run it on whichever machine you are on -- it works out the
 # platform itself.
 #
-#   ./build.sh
+#   scripts/build.sh
 #
 # Two platforms are in play and they need different OpenMP flags:
 #
@@ -18,6 +18,9 @@
 # to build on the master and scp ./main to the others.
 
 set -e
+
+# run from the project root whichever directory this was called from
+cd "$(dirname "$0")/.."
 
 # ---- flags used on both platforms --------------------------------------
 #

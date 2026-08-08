@@ -556,8 +556,8 @@ int MasterNode::run() {
     running_ = true;
     std::cout << "master node started" << std::endl;
 
-    if (!loadData(cfg_.basePath, cfg_.queryPath) ||
-        !loadGroundtruth(cfg_.gtPath)) {
+    if (!loadData(cfg_.data + "_base.bin", cfg_.data + "_query.bin") ||
+        !loadGroundtruth(cfg_.data + "_gt.bin")) {
         return 1;
     }
     buildIndex(cfg_.nlist, cfg_.iters);

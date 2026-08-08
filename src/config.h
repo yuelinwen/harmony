@@ -14,9 +14,9 @@
 namespace harmony {
 
 struct Config {
-    std::string basePath = "Data/sift_base.bin";
-    std::string queryPath = "Data/sift_query.bin";
-    std::string gtPath = "Data/sift_gt.bin";   // groundtruth, for recall
+    // One prefix stands for the three files convert_hdf5.py writes:
+    //   <prefix>_base.bin  <prefix>_query.bin  <prefix>_gt.bin
+    std::string data = "Data/sift";
 
     int nlist = 256;    // clusters in the index
     int iters = 10;     // kmeans rounds
@@ -77,25 +77,37 @@ struct Config {
 inline void printUsage(const char* prog) {
     std::cerr
         << "usage: mpirun -n <N+1> " << prog << " [options]\n"
-        << "  --base <path>      base vectors            (Data/sift_base.bin)\n"
-        << "  --query <path>     query vectors           (Data/sift_query.bin)\n"
-        << "  --gt <path>        groundtruth ids         (Data/sift_gt.bin)\n"
-        << "  --nlist <int>      clusters in the index   (256)\n"
-        << "  --iters <int>      kmeans rounds           (10)\n"
-        << "  --mode <name>      harmony | vector | dimension | auto  (harmony)\n"
-        << "  --alpha <float>    imbalance weight in the cost model (0.3)\n"
-        << "  --commcost <float> cost per transferred byte vs one flop (100)\n"
-        << "  --warmup <int>     queries used to learn hot clusters (1000)\n"
+        << "\n"
+        << "data and index\n"
+        << "  --data <prefix>    reads <prefix>_base/_query/_gt.bin (Data/sift)\n"
+        << "  --nlist <int>      clusters in the index              (256)\n"
+        << "  --iters <int>      kmeans rounds                      (10)\n"
+        << "\n"
+        << "how the workers are laid out\n"
+        << "  --mode <name>      vector | dimension | harmony | auto (harmony)\n"
+        << "                       vector    = N x 1, no dimension pipeline\n"
+        << "                       dimension = 1 x N, no vector partitions\n"
+        << "                       harmony   = the most square split of N\n"
+        << "                       auto      = let the cost model decide\n"
         << "  --bvec <int>       vector partitions, overrides --mode\n"
-        << "  --bdim <int>       dimension slices, overrides --mode\n"
-        << "  --nprobe <int>     clusters per query      (32)\n"
-        << "  --k <int>          neighbours returned     (100)\n"
-        << "  --nq <int>         queries to run          (100)\n"
-        << "  --prewarm <int>    heap seed size, 0 = off (500)\n"
-        << "  --pruning <0|1>    dimension-level pruning (1)\n"
-        << "  --threads <int>    OpenMP threads per worker (1)\n"
-        << "  --batch <int>      queries processed together (32)\n"
-        << "  --mkl <0|1>        gemm for the first slice, if built in (1)\n";
+        << "  --bdim <int>       dimension slices,  overrides --mode\n"
+        << "\n"
+        << "the search\n"
+        << "  --nq <int>         queries to run                     (100)\n"
+        << "  --nprobe <int>     clusters visited per query         (32)\n"
+        << "  --k <int>          neighbours returned                (100)\n"
+        << "\n"
+        << "speed\n"
+        << "  --threads <int>    OpenMP threads per worker          (1)\n"
+        << "  --batch <int>      queries processed together         (32)\n"
+        << "  --prewarm <int>    heap seed size, 0 = off            (500)\n"
+        << "  --pruning <0|1>    dimension-level pruning            (1)\n"
+        << "  --mkl <0|1>        gemm for the first slice           (1)\n"
+        << "\n"
+        << "cost model, only read when --mode auto\n"
+        << "  --commcost <float> a transferred byte, in multiply-adds (100)\n"
+        << "  --alpha <float>    weight on the imbalance term        (0.3)\n"
+        << "  --warmup <int>     queries used to find hot clusters   (1000)\n";
 }
 
 // Returns false on an unknown or incomplete option.
@@ -104,12 +116,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
         std::string opt = argv[i];
         bool hasValue = (i + 1 < argc);
 
-        if (opt == "--base" && hasValue) {
-            cfg.basePath = argv[++i];
-        } else if (opt == "--query" && hasValue) {
-            cfg.queryPath = argv[++i];
-        } else if (opt == "--gt" && hasValue) {
-            cfg.gtPath = argv[++i];
+        if (opt == "--data" && hasValue) {
+            cfg.data = argv[++i];
         } else if (opt == "--nlist" && hasValue) {
             cfg.nlist = std::atoi(argv[++i]);
         } else if (opt == "--iters" && hasValue) {
