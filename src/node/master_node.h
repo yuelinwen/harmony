@@ -102,10 +102,21 @@ public:
     // has to be executed -- pi only decides which row owns which cluster.
     double imbalanceOf(int bVec, int bDim) const;
 
-    // C(pi,Q). The paper notes that computation per machine barely moves
-    // between layouts (Section 4.3), so what actually decides the choice is
-    // communication, which grows with bDim, against imbalance, which grows
-    // with bVec.
+    // Share of the distance work that still gets done when the dimensions are
+    // cut into bDim slices. More slices mean more chances to stop early.
+    //
+    // The paper states that computation per machine barely moves between
+    // layouts (Section 4.3) and its cost model has no term for this. Measured
+    // on Sift1M that does not hold once pruning is on -- the work ranges from
+    // 100% at one slice to about 50% at four -- and ignoring it makes the
+    // model prefer exactly the layout that turns out to be slowest. These are
+    // measured numbers, not a derivation: the paper gives no way to predict a
+    // pruning ratio.
+    double pruneFactor(int bDim) const;
+
+    // C(pi,Q): computation, communication, and the imbalance penalty. Cast in
+    // multiply-add equivalents, so commCost is the price of one transferred
+    // byte relative to one multiply-add.
     double estimateCost(int bVec, int bDim) const;
 
     // Picks the grid with the lowest cost. Only a handful of factorisations

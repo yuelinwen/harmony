@@ -130,18 +130,44 @@ double MasterNode::imbalanceOf(int bVec, int bDim) const {
     return std::sqrt(var / bVec);
 }
 
+// Measured on Sift1M, nprobe=32, k=100. Between the tabulated points the
+// value is interpolated; past the last one it is held flat.
+double MasterNode::pruneFactor(int bDim) const {
+    static const int slices[] = {1, 2, 4};
+    static const double work[] = {1.00, 0.62, 0.51};
+    int n = 3;
+
+    if (bDim <= slices[0]) {
+        return work[0];
+    }
+    for (int i = 1; i < n; ++i) {
+        if (bDim <= slices[i]) {
+            double t = (double)(bDim - slices[i - 1]) / (slices[i] - slices[i - 1]);
+            return work[i - 1] + t * (work[i] - work[i - 1]);
+        }
+    }
+    return work[n - 1];
+}
+
 double MasterNode::estimateCost(int bVec, int bDim) const {
-    // Every probed cluster is passed along its row once per dimension slice,
-    // carrying one float per candidate. So the traffic scales with bDim while
-    // the arithmetic does not (paper Section 4.3).
+    double totalWork = 0.0;   // multiply-adds over the whole grid
     double bytes = 0.0;
+
     for (int c = 0; c < index_.getNlist(); ++c) {
         long hits = clusterHits_.empty() ? 1 : clusterHits_[c];
-        bytes = bytes + (double)hits * (double)index_.clusterIds(c).size()
-                      * bDim * sizeof(float);
+        double candidates = (double)hits * (double)index_.clusterIds(c).size();
+
+        totalWork = totalWork + candidates * base_.getDim();
+
+        // A probed cluster is handed along its row once per dimension slice,
+        // carrying one running total per candidate, so traffic scales with bDim.
+        bytes = bytes + candidates * bDim * sizeof(float);
     }
 
-    return cfg_.commCost * bytes + cfg_.alpha * imbalanceOf(bVec, bDim);
+    // Per machine, and reduced by however much pruning the slicing buys.
+    double compute = totalWork * pruneFactor(bDim) / (bVec * bDim);
+
+    return compute + cfg_.commCost * bytes + cfg_.alpha * imbalanceOf(bVec, bDim);
 }
 
 void MasterNode::choosePlan() {
@@ -160,7 +186,8 @@ void MasterNode::choosePlan() {
         double cost = estimateCost(bVec, bDim);
 
         std::cout << "  " << bVec << " x " << bDim
-                  << ":  imbalance " << imbalanceOf(bVec, bDim)
+                  << ":  work " << (100.0 * pruneFactor(bDim)) << "%"
+                  << "   imbalance " << imbalanceOf(bVec, bDim)
                   << "   cost " << cost << std::endl;
 
         if (bestCost < 0.0 || cost < bestCost) {
