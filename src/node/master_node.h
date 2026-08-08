@@ -73,11 +73,22 @@ public:
     // Tells the workers to stop, and collects their pruning counters.
     void shutdown();
 
-    // Algorithm 1, lines 19-23. Picks the nprobe nearest clusters, runs each
-    // one through the dimension pipeline, and merges what survives into one
-    // top-K. The paper's version takes a whole query set; this one takes a
-    // single query, since each query needs its own heap.
-    std::vector<Candidate> queryPipeline(const float* query, int nprobe, int k);
+    // What one query of the current batch needs: its own heap, its own
+    // probed clusters, and the ids prewarm already accounted for.
+    struct QueryState {
+        int id;                       // row in query_
+        std::vector<int> clusters;    // its nprobe nearest
+        int prewarmCluster;
+        int prewarmed;
+    };
+
+    // Algorithm 1, lines 19-23. Takes a batch of queries, as the paper's
+    // QueryBatch does. Queries that probe the same cluster share one visit to
+    // it, which is where the reuse the gemm path needs comes from. Each query
+    // still gets its own heap: the pseudocode keeps one for the whole set
+    // (line 20), which cannot be right, since a top-K is per query.
+    std::vector<std::vector<Candidate>> queryPipeline(int firstQuery, int count,
+                                                      int nprobe, int k);
 
     // Algorithm 1, lines 1-5. Seeds the heap with real distances so there is
     // a threshold to prune against from the very first candidate. Returns how
@@ -85,21 +96,24 @@ public:
     int prewarmHeap(const float* query, int clusterId, int count, TopKHeap& heap);
 
     // Algorithm 1, lines 13-18. Runs the clusters of every vector partition
-    // through the dimension pipeline and pushes the survivors into the heap.
+    // through the dimension pipeline and pushes the survivors into the heaps.
     //
     // The pseudocode calls this once per partition (line 21-23), but Fig. 5a
     // has the partitions running at the same time -- "Stage B does not need to
-    // follow Stage A" -- so all rows are driven together here instead: one
-    // cluster is dispatched into every row before anything is collected.
+    // follow Stage A" -- so all rows are driven together here instead.
     void vectorPipeline(const std::vector<std::vector<int>>& perRow,
-                        int prewarmClusterId, int prewarmed, TopKHeap& heap);
+                        const std::vector<QueryState>& batch,
+                        std::vector<TopKHeap>& heaps);
 
-    // Algorithm 1, lines 6-12, split in two so a row can be started without
-    // waiting on it. Together they are the paper's "foreach d in DSet": the
-    // job goes to every worker in the cluster's row, those workers pass the
-    // running totals down the chain, and only the last one reports back.
-    void dispatchBatch(int row, const std::vector<int>& batch,
-                       int prewarmClusterId, int prewarmed, float threshold);
+    // Algorithm 1, lines 6-12, split so a row can be started without waiting
+    // on it. Together they are the paper's "foreach d in DSet": the job goes
+    // to every worker in the cluster's row, those workers pass the running
+    // totals down the chain, and only the last one reports back.
+    //
+    // `members` are the batch positions that probed this cluster.
+    void dispatchOne(int row, int clusterId, int startCol,
+                     const std::vector<int>& members,
+                     const std::vector<float>& thresholds);
 
     // Which worker reports the result of a cluster that started at startCol.
     int lastRankOf(int row, int startCol) const;

@@ -57,15 +57,16 @@ total to prune against (paper §3.2, Challenge 3).
 
 ## State
 
-Done: Algorithm 1 (all four functions), the `bVec x bDim` grid and all three
-modes, MPI with worker-to-worker forwarding, rotation of chain entry points,
-non-blocking `Isend`/`Irecv`, OpenMP inside workers, command-line options,
-recall measurement, and the cost model with load-aware plan selection.
+Done: Algorithm 1 including its `QueryBatch`, the `bVec x bDim` grid and all
+three modes, MPI with worker-to-worker forwarding, rotation of chain entry
+points, non-blocking `Isend`/`Irecv`, OpenMP inside workers, MKL for the first
+dimension slice, command-line options, recall measurement, and the cost model
+with load-aware plan selection.
 
-That covers Fig. 3 (1-4) and §5.
+That covers Fig. 3 (1-4) and everything §5 describes.
 
-Not done: the skewed workload generator of §6.2.1 (variance=500/1000), which
-is only needed for Fig. 7/8; and calibration on real hardware.
+Not done: the skewed workload generator of §6.2.1 (variance=500/1000), needed
+only for Fig. 7/8.
 
 Every change is checked with `queries differing from single machine: 0/N`,
 which compares the distributed answer against `IvfIndex::search()`. Ties are
@@ -130,23 +131,35 @@ I(pi) as a standard deviation while the text calls it variance.
 **§4.3 communication formula** — `n_probe * B_vec / n_list` yields less than
 one partition for realistic parameters and is not used.
 
-**Intel MKL** — §5 uses it to accelerate distance computation. Compiler flags
-are used instead, which measured better and cost nothing.
+**Intel MKL** — §5 uses it to accelerate distance computation. It is used
+here too, but only for the first dimension slice of a batch, and the reasoning
+is worth recording because the obvious version of it does not work.
 
-On a Xeon Sapphire Rapids the distance loop runs at 4.8 GFLOP/s by default.
-The limit is not SIMD width or memory bandwidth — cache-resident and
-out-of-cache data run at the same speed, and forcing AVX-512 is 35% *slower*.
-It is the accumulator: `sum = sum + d*d` makes every addition wait on the one
-before it. Allowing the compiler to reassociate the sum splits it across
-several accumulators and gives 12.7 GFLOP/s, 1.65x end to end, with the
-acceptance check still at 0 differing queries.
+MKL is fast because it turns many distances into one matrix multiply, which
+needs data to be reused. Reuse comes from batching: measured against the
+scalar loop, gemm runs at 0.64x with one query and 3.16x with thirty-two. So
+it is worthless without batching, which is why batching came first.
 
-MKL would not help here anyway. Its advantage comes from turning many
-distances into one matrix multiply, which needs either data reuse or batching.
-There is no reuse — each base vector is read once per query — and batching
-conflicts with pruning, which exists precisely to avoid computing distances in
-full. The paper acknowledges the same tension in §6.6 when it discusses PDX
+It also cannot be used everywhere. A dense multiply computes every distance in
+full, which is the opposite of what pruning is for. But the *first* slice of a
+chain prunes nothing by construction -- there is no running total yet -- so
+that block has to be computed in full regardless, and it is exactly a dense
+multiply. Later slices stay on the scalar loop, which is what can stop early.
+The paper hints at the same split in §6.6, where PDX is credited with
 "eliminating the SIMD performance bottleneck in dimension-pruning workloads".
+
+`||a-b||^2 = ||a||^2 + ||b||^2 - 2ab` is what makes the multiply possible.
+Vector norms are precomputed when a block arrives. The identity can lose
+precision to cancellation, but on SIFT the values are small integers and the
+results came out bit-identical to the direct form.
+
+Separately, and independent of MKL: the scalar loop itself was 2.6x off its
+own potential. The limit was not SIMD width or memory bandwidth --
+cache-resident and out-of-cache data ran at the same speed, and forcing
+AVX-512 was 35% *slower*. It was the accumulator: `sum = sum + d*d` makes
+every addition wait on the one before. `-fassociative-math` lets the compiler
+split the sum across several accumulators, 4.8 -> 12.7 GFLOP/s, and 1.65x end
+to end. See `build.sh`.
 
 **Appendices A, B, C** — referenced by the text (TopK=100 results, index build
 time, peak memory) but absent from the PDF, so there is nothing to compare
@@ -192,13 +205,33 @@ compared against the paper's numbers directly.
 gives about 116, and sweeping the value until the model's ranking matches the
 measured one gives anything from 10 up. The default is 100.
 
+Batching and MKL, measured across five VMs at 128 queries:
+
+| | QPS | |
+|---|--:|--|
+| `--batch 1 --mkl 0`  | 24.9 | 1.00x |
+| `--batch 32 --mkl 0` | 118.4 | **4.76x** |
+| `--batch 32 --mkl 1` | 124.1 | 4.99x |
+
+Batching is nearly all of it, and not mainly because of data reuse. Every
+cluster visit costs a control message and a round trip; batching lets the
+queries that probe the same cluster share one visit, which cut the number of
+those from about 4000 to about 800. On a 1 Gb/s network round trips matter
+more than bytes.
+
+MKL adds 4.8% on top. It only accelerates the first slice, and on this cluster
+computation is not the limit -- communication is. On the paper's 100 Gb/s
+fabric the same change would count for considerably more.
+
+One deployment note: the binary is built on the master and copied out, which
+assumes every machine has the same runtime. Linking MKL broke that assumption
+the first time -- the workers failed with a missing `libmkl_intel_lp64.so`
+until it was installed on all of them. Check the libraries, not just the
+binary.
+
 ## Remaining work
 
 1. Re-measure `pruneFactor()` per dataset.
 2. The remaining datasets, for Table 3 and Table 4.
 3. The skewed workload generator, for Fig. 7/8.
-4. Batched query processing. Algorithm 1 line 13 takes a `QueryBatch`, and
-   Fig. 5a shows queries moving through the pipeline in batches; queries are
-   processed one at a time here. Batching is also what would make MKL worth
-   having: the first dimension slice prunes nothing, so for a batch it is one
-   dense matrix multiply. This is the largest remaining gap to the paper.
+

@@ -253,11 +253,12 @@ void MasterNode::distributeData() {
     for (int w = 1; w <= numWorkers_; ++w) {
         int row = (w - 1) / bDim_;
         int col = (w - 1) % bDim_;
-        int setup[3];
+        int setup[4];
         setup[0] = plan_.end(col) - plan_.begin(col);
         setup[1] = rowClusters[row];
         setup[2] = bDim_;
-        MPI_Send(setup, 3, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
+        setup[3] = cfg_.batch;
+        MPI_Send(setup, 4, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
     }
 
     for (int c = 0; c < index_.getNlist(); ++c) {
@@ -336,37 +337,26 @@ int MasterNode::prewarmHeap(const float* query, int clusterId, int count, TopKHe
     return n;
 }
 
-// Hands a batch of clusters to a row and returns immediately. The cluster at
-// position p in the batch starts its chain at column p, so every worker is
-// the first stop for one of them -- which matters because the first stop can
-// prune nothing and therefore does the most work (paper Section 4.3, Load
-// Balancing Strategies). Within one cluster the workers still run one after
-// another; running them in parallel would compute every slice in full and
-// save nothing (Section 3.2, Challenge 3).
+// Hands one cluster to every worker in its row and returns immediately.
+// The workers of a row then run one after another, not in parallel -- running
+// them in parallel would compute every slice in full and save nothing (paper
+// Section 3.2, Challenge 3).
 //
-// Each worker's jobs go out in the order it will actually reach them: at
-// step t, the worker in column `col` handles batch[(col - t) mod m]. Sending
-// them in any other order would leave a worker blocked on a cluster that has
-// not arrived while one it could start sits behind it in the queue.
-void MasterNode::dispatchBatch(int row, const std::vector<int>& batch,
-                               int prewarmClusterId, int prewarmed, float threshold) {
-    int m = (int)batch.size();
+// `members` are the positions in the current batch that probed this cluster.
+// Only those queries travel with the job, so a cluster wanted by three of
+// thirty-two queries costs three rows of running totals, not thirty-two.
+void MasterNode::dispatchOne(int row, int clusterId, int startCol,
+                             const std::vector<int>& members,
+                             const std::vector<float>& thresholds) {
+    int n = (int)index_.clusterIds(clusterId).size();
+    int m = (int)members.size();
 
     for (int col = 0; col < bDim_; ++col) {
         int w = row * bDim_ + col + 1;
-
-        for (int t = 0; t < m; ++t) {
-            int p = ((col - t) % m + m) % m;
-            int c = batch[p];
-            int n = (int)index_.clusterIds(c).size();
-            // skip: prewarm already put these in the heap with their real
-            // distances, so running them again would push duplicates
-            int skip = (c == prewarmClusterId) ? prewarmed : 0;
-
-            int job[4] = {c, n, skip, p};
-            MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
-            MPI_Send(&threshold, 1, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
-        }
+        int job[4] = {clusterId, n, startCol, m};
+        MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+        MPI_Send(members.data(), m, MPI_INT, w, TAG_QIDX, MPI_COMM_WORLD);
+        MPI_Send(thresholds.data(), m, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
     }
 }
 
@@ -378,132 +368,188 @@ int MasterNode::lastRankOf(int row, int startCol) const {
 
 // Two levels of overlap, which multiply out to one busy worker per machine:
 //
-//   across rows   -- every row is dispatched before anything is collected,
+//   across rows   -- every row is given work before anything is collected,
 //                    so the rows compute at the same time (paper Fig. 5a)
-//   within a row  -- up to bDim clusters are kept in flight, so while worker
-//                    2 handles one cluster's second slice, worker 1 is
+//   within a row  -- up to bDim clusters are kept in flight, so while one
+//                    worker handles a cluster's second slice, another is
 //                    already on the next cluster's first (paper Fig. 5b)
 //
-// Results come back in dispatch order: MPI keeps messages between a given
-// pair of ranks ordered, and each worker handles its jobs in the order they
-// arrive, so no request tracking is needed to match them up.
+// Rows refill on their own, so a slow row never holds up a fast one, and
+// MPI_Waitany takes whichever comes back first.
 //
-// Survivors go into the heap as soon as their cluster reports, so the
-// threshold keeps tightening. (The paper only updates it after a whole
+// Survivors go into their query's heap as soon as the cluster reports, so
+// thresholds keep tightening. (The paper only updates after a whole
 // partition, Algorithm 1 line 18; updating sooner prunes strictly more.)
 void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
-                                int prewarmClusterId, int prewarmed, TopKHeap& heap) {
-    // One slot per cluster that can be in flight: bDim per row, so every
-    // worker always has something queued.
+                                const std::vector<QueryState>& batch,
+                                std::vector<TopKHeap>& heaps) {
     struct Slot {
         int row;
         int clusterId;
         int n;
+        std::vector<int> members;
         std::vector<float> sums;
     };
     int maxInFlight = bVec_ * bDim_;
     std::vector<Slot> slot(maxInFlight);
     std::vector<MPI_Request> req(maxInFlight, MPI_REQUEST_NULL);
 
-    std::vector<size_t> pos(bVec_, 0);      // per row: clusters finished
+    std::vector<size_t> pos(bVec_, 0);
     std::vector<int> inFlight(bVec_, 0);
-    std::vector<std::vector<int>> batch(bVec_);
-    int free = 0;                           // next slot to hand out
+    std::vector<std::vector<int>> inBatch(bVec_);
+    int free = 0;
+
+    std::vector<int> members;
+    std::vector<float> thresholds;
 
     while (true) {
-        // A row whose batch has come back entirely gets the next one. Rows
-        // refill on their own, so a slow row never holds up a fast one.
         for (int r = 0; r < bVec_; ++r) {
             if (inFlight[r] > 0 || pos[r] >= perRow[r].size()) {
                 continue;
             }
-            batch[r].clear();
+            inBatch[r].clear();
             for (int p = 0; p < bDim_ && pos[r] + p < perRow[r].size(); ++p) {
-                batch[r].push_back(perRow[r][pos[r] + p]);
+                inBatch[r].push_back(perRow[r][pos[r] + p]);
             }
 
-            // an infinite threshold means nothing is ever dropped, which is
-            // the no-pruning arm of the ablation (paper Fig. 10)
-            float threshold = cfg_.pruning ? heap.worst() : PRUNED;
-            dispatchBatch(r, batch[r], prewarmClusterId, prewarmed, threshold);
+            for (int p = 0; p < (int)inBatch[r].size(); ++p) {
+                int c = inBatch[r][p];
 
-            // Post the receives straight away. Results are matched by source
-            // rank, and MPI keeps messages between a pair of ranks in order,
-            // so posting in dispatch order is enough to line them up.
-            for (int p = 0; p < (int)batch[r].size(); ++p) {
+                // which queries of this batch actually want this cluster
+                members.clear();
+                thresholds.clear();
+                for (int q = 0; q < (int)batch.size(); ++q) {
+                    const std::vector<int>& cl = batch[q].clusters;
+                    if (std::find(cl.begin(), cl.end(), c) != cl.end()) {
+                        members.push_back(q);
+                        // an infinite threshold means nothing is dropped, the
+                        // no-pruning arm of the ablation (paper Fig. 10)
+                        thresholds.push_back(cfg_.pruning ? heaps[q].worst() : PRUNED);
+                    }
+                }
+                if (members.empty()) {
+                    continue;
+                }
+
+                dispatchOne(r, c, p, members, thresholds);
+
                 while (req[free] != MPI_REQUEST_NULL) {
                     free = (free + 1) % maxInFlight;
                 }
-                int c = batch[r][p];
                 int n = (int)index_.clusterIds(c).size();
-
                 slot[free].row = r;
                 slot[free].clusterId = c;
                 slot[free].n = n;
-                slot[free].sums.resize(n);
+                slot[free].members = members;
+                slot[free].sums.resize((size_t)members.size() * n);
 
-                MPI_Irecv(slot[free].sums.data(), n, MPI_FLOAT,
-                          lastRankOf(r, p), TAG_SUMS, MPI_COMM_WORLD, &req[free]);
+                MPI_Irecv(slot[free].sums.data(), (int)slot[free].sums.size(),
+                          MPI_FLOAT, lastRankOf(r, p), TAG_SUMS,
+                          MPI_COMM_WORLD, &req[free]);
                 inFlight[r] = inFlight[r] + 1;
+            }
+
+            // a row whose whole batch was skipped still has to move on
+            if (inFlight[r] == 0) {
+                pos[r] = pos[r] + inBatch[r].size();
+                if (pos[r] < perRow[r].size()) {
+                    r = r - 1;   // retry this row with its next batch
+                }
             }
         }
 
         int index = MPI_UNDEFINED;
         MPI_Waitany(maxInFlight, req.data(), &index, MPI_STATUS_IGNORE);
         if (index == MPI_UNDEFINED) {
-            break;   // nothing left in flight and nothing left to send
+            break;
         }
 
-        // whatever survived every slice has a real distance now
         const Slot& s = slot[index];
         const std::vector<int>& ids = index_.clusterIds(s.clusterId);
-        for (int j = 0; j < s.n; ++j) {
-            if (s.sums[j] < PRUNED) {
-                heap.push(ids[j], s.sums[j]);
+
+        for (int j = 0; j < (int)s.members.size(); ++j) {
+            int q = s.members[j];
+            const float* row = &s.sums[(size_t)j * s.n];
+
+            // prewarm already pushed the leading ids of this query's first
+            // cluster with their real distances; pushing them again would
+            // duplicate them in the heap
+            int skip = (s.clusterId == batch[q].prewarmCluster) ? batch[q].prewarmed : 0;
+
+            for (int v = skip; v < s.n; ++v) {
+                if (row[v] < PRUNED) {
+                    heaps[q].push(ids[v], row[v]);
+                }
             }
         }
 
-        scanned_ = scanned_ + (long)s.n;
-        scannedRow_[s.row] = scannedRow_[s.row] + (long)s.n;
+        scanned_ = scanned_ + (long)s.members.size() * s.n;
+        scannedRow_[s.row] = scannedRow_[s.row] + (long)s.members.size() * s.n;
 
         inFlight[s.row] = inFlight[s.row] - 1;
         if (inFlight[s.row] == 0) {
-            pos[s.row] = pos[s.row] + batch[s.row].size();
+            pos[s.row] = pos[s.row] + inBatch[s.row].size();
         }
     }
 }
 
-std::vector<Candidate> MasterNode::queryPipeline(const float* query, int nprobe, int k) {
-    std::vector<int> clusters = index_.nearestClusters(query, nprobe);
+std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, int count,
+                                                              int nprobe, int k) {
+    // Stage 0: work out what each query needs, and prewarm its heap
+    // (Algorithm 1 line 20).
+    std::vector<QueryState> batch(count);
+    std::vector<TopKHeap> heaps(count, TopKHeap(k));
 
-    // hand every worker its slice of the query, cut the same way as the data
+    for (int q = 0; q < count; ++q) {
+        const float* qv = query_.vec(firstQuery + q);
+        batch[q].id = firstQuery + q;
+        batch[q].clusters = index_.nearestClusters(qv, nprobe);
+        batch[q].prewarmCluster = batch[q].clusters[0];
+        batch[q].prewarmed = prewarmHeap(qv, batch[q].clusters[0], cfg_.prewarm, heaps[q]);
+    }
+
+    // Every worker gets the whole batch's slices once; individual jobs then
+    // name the queries they want by position.
     for (int w = 1; w <= numWorkers_; ++w) {
         int job[4] = {JOB_QUERY, 0, 0, 0};
         MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
 
         int col = (w - 1) % bDim_;
         int begin = plan_.begin(col);
-        MPI_Send(query + begin, plan_.end(col) - begin, MPI_FLOAT, w,
+        int myDim = plan_.end(col) - begin;
+
+        std::vector<float> slices((size_t)cfg_.batch * myDim, 0.0f);
+        for (int q = 0; q < count; ++q) {
+            const float* src = query_.vec(batch[q].id) + begin;
+            std::copy(src, src + myDim, &slices[(size_t)q * myDim]);
+        }
+        MPI_Send(slices.data(), (int)slices.size(), MPI_FLOAT, w,
                  TAG_QUERY, MPI_COMM_WORLD);
     }
 
-    // Stage 0: prewarming (Algorithm 1 line 20)
-    TopKHeap heap(k);
-    int prewarmed = prewarmHeap(query, clusters[0], cfg_.prewarm, heap);
-
     // Stage I: vector-level pipeline (Algorithm 1 lines 21-23). Group the
-    // probed clusters by the vector partition that owns them, then run each
-    // partition. (The paper's filterQueries picks the queries that need a
-    // partition; with one query at a time, the same step becomes picking the
-    // clusters of that query that live in the partition.)
+    // probed clusters by the partition that owns them, then run the
+    // partitions. (The paper's filterQueries picks the queries that need a
+    // partition; the same step here collects the clusters of the batch that
+    // live in it.)
     std::vector<std::vector<int>> perRow(bVec_);
-    for (int i = 0; i < (int)clusters.size(); ++i) {
-        perRow[clusterOwner_[clusters[i]]].push_back(clusters[i]);
+    for (int q = 0; q < count; ++q) {
+        for (int i = 0; i < (int)batch[q].clusters.size(); ++i) {
+            int c = batch[q].clusters[i];
+            std::vector<int>& row = perRow[clusterOwner_[c]];
+            if (std::find(row.begin(), row.end(), c) == row.end()) {
+                row.push_back(c);   // one visit per cluster, whoever wanted it
+            }
+        }
     }
 
-    vectorPipeline(perRow, clusters[0], prewarmed, heap);
+    vectorPipeline(perRow, batch, heaps);
 
-    return heap.results();
+    std::vector<std::vector<Candidate>> out(count);
+    for (int q = 0; q < count; ++q) {
+        out[q] = heaps[q].results();
+    }
+    return out;
 }
 
 int MasterNode::run() {
@@ -546,39 +592,44 @@ int MasterNode::run() {
     double seconds = 0.0;
     double recallSum = 0.0;
 
-    for (int q = 0; q < nq; ++q) {
+    for (int start = 0; start < nq; start += cfg_.batch) {
+        int count = (start + cfg_.batch <= nq) ? cfg_.batch : (nq - start);
+
         auto t0 = std::chrono::steady_clock::now();
-        std::vector<Candidate> spread = queryPipeline(query_.vec(q), nprobe, k);
+        std::vector<std::vector<Candidate>> spread = queryPipeline(start, count, nprobe, k);
         auto t1 = std::chrono::steady_clock::now();
         seconds = seconds + std::chrono::duration<double>(t1 - t0).count();
 
-        recallSum = recallSum + recallAt(q, spread, k);
+        for (int j = 0; j < count; ++j) {
+            int q = start + j;
+            recallSum = recallSum + recallAt(q, spread[j], k);
 
-        std::vector<Candidate> single = index_.search(base_, query_.vec(q), nprobe, k);
+            std::vector<Candidate> single = index_.search(base_, query_.vec(q), nprobe, k);
 
-        std::vector<int> a;
-        std::vector<int> b;
-        std::vector<float> da;
-        std::vector<float> db;
-        for (int j = 0; j < k; ++j) {
-            a.push_back(spread[j].id);
-            b.push_back(single[j].id);
-            da.push_back(spread[j].dist);
-            db.push_back(single[j].dist);
-        }
-        std::sort(a.begin(), a.end());
-        std::sort(b.begin(), b.end());
-        std::sort(da.begin(), da.end());
-        std::sort(db.begin(), db.end());
+            std::vector<int> a;
+            std::vector<int> b;
+            std::vector<float> da;
+            std::vector<float> db;
+            for (int i = 0; i < k; ++i) {
+                a.push_back(spread[j][i].id);
+                b.push_back(single[i].id);
+                da.push_back(spread[j][i].dist);
+                db.push_back(single[i].dist);
+            }
+            std::sort(a.begin(), a.end());
+            std::sort(b.begin(), b.end());
+            std::sort(da.begin(), da.end());
+            std::sort(db.begin(), db.end());
 
-        if (a != b) {
-            // Same distances but different members means a tie at rank k was
-            // broken the other way -- both answers are equally correct. Only
-            // a differing distance sequence is an actual wrong result.
-            if (da == db) {
-                ties = ties + 1;
-            } else {
-                differing = differing + 1;
+            if (a != b) {
+                // Same distances but different members means a tie at rank k
+                // was broken the other way -- both answers are equally
+                // correct. Only a differing distance sequence is wrong.
+                if (da == db) {
+                    ties = ties + 1;
+                } else {
+                    differing = differing + 1;
+                }
             }
         }
     }

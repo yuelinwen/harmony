@@ -51,6 +51,19 @@ struct Config {
     int nprobe = 32;    // clusters visited per query
     int k = 100;        // neighbours returned
     int nq = 100;       // queries to run
+
+    // Queries processed together (paper Algorithm 1 line 13, QueryBatch).
+    // Queries that probe the same cluster share one visit to it, so the
+    // vectors are read once and used for all of them. That reuse is also what
+    // makes the gemm path worth taking: measured 0.64x at batch 1 but 3.16x
+    // at batch 32, against the plain loop.
+    int batch = 32;
+
+    // Use MKL for the first dimension slice, where nothing can be pruned yet
+    // and the whole block has to be computed anyway. Later slices stay on the
+    // scalar loop, which is what can stop early. Ignored if MKL is not
+    // compiled in.
+    bool mkl = true;
     int prewarm = 500;  // vectors used to seed the heap; 0 turns it off
     bool pruning = true;
 
@@ -80,7 +93,9 @@ inline void printUsage(const char* prog) {
         << "  --nq <int>         queries to run          (100)\n"
         << "  --prewarm <int>    heap seed size, 0 = off (500)\n"
         << "  --pruning <0|1>    dimension-level pruning (1)\n"
-        << "  --threads <int>    OpenMP threads per worker (1)\n";
+        << "  --threads <int>    OpenMP threads per worker (1)\n"
+        << "  --batch <int>      queries processed together (32)\n"
+        << "  --mkl <0|1>        gemm for the first slice, if built in (1)\n";
 }
 
 // Returns false on an unknown or incomplete option.
@@ -123,6 +138,10 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.commCost = std::atof(argv[++i]);
         } else if (opt == "--warmup" && hasValue) {
             cfg.warmup = std::atoi(argv[++i]);
+        } else if (opt == "--batch" && hasValue) {
+            cfg.batch = std::atoi(argv[++i]);
+        } else if (opt == "--mkl" && hasValue) {
+            cfg.mkl = (std::atoi(argv[++i]) != 0);
         } else {
             std::cerr << "bad option: " << opt << std::endl;
             printUsage(argv[0]);

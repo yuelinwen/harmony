@@ -52,7 +52,33 @@ else
     echo "Linux build (-fopenmp)"
 fi
 
+# ---- MKL, if it is installed -------------------------------------------
+#
+# Used for one thing: the first dimension slice of a batch, where nothing can
+# be pruned yet and the whole block has to be computed regardless. That case
+# is a dense matrix multiply, which is what MKL is good at -- measured 3.16x
+# over the scalar loop at batch 32, but 0.64x at batch 1, so it only pays off
+# because queries are batched.
+#
+# Later slices never take this path: their purpose is to skip most candidates,
+# which a dense multiply cannot do.
+#
+# x86 only, so a macOS/ARM build simply goes without it.
+
+if [ -f /usr/include/mkl/mkl.h ]; then
+    FLAGS="$FLAGS -DHARMONY_USE_MKL -I/usr/include/mkl"
+    LIBS="-lmkl_intel_lp64 -lmkl_sequential -lmkl_core -lpthread -lm"
+    echo "  with MKL (gemm for the first slice)"
+elif [ -n "$MKLROOT" ] && [ -f "$MKLROOT/include/mkl.h" ]; then
+    FLAGS="$FLAGS -DHARMONY_USE_MKL -I$MKLROOT/include -L$MKLROOT/lib/intel64"
+    LIBS="-lmkl_intel_lp64 -lmkl_sequential -lmkl_core -lpthread -lm"
+    echo "  with MKL from \$MKLROOT"
+else
+    LIBS=""
+    echo "  without MKL (scalar loop everywhere)"
+fi
+
 # mpicxx is a wrapper around the system compiler that adds the MPI include and
 # library paths, so no MPI flags are needed here.
-mpicxx $FLAGS main.cpp src/node/*.cpp src/index/*.cpp -o main
+mpicxx $FLAGS main.cpp src/node/*.cpp src/index/*.cpp -o main $LIBS
 echo "built ./main"

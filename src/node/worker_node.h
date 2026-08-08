@@ -1,6 +1,7 @@
 #ifndef HARMONY_NODE_WORKER_NODE_H
 #define HARMONY_NODE_WORKER_NODE_H
 
+#include <algorithm>
 #include <vector>
 
 #include "node.h"
@@ -31,6 +32,7 @@ struct ClusterBlock {
     int clusterId;            // id in the master's global clustering
     std::vector<int> ids;     // global vector ids
     std::vector<float> data;  // ids.size() * myDim, row-major
+    std::vector<float> norm;  // ||v||^2 per vector, for the gemm path
 };
 
 class WorkerNode : public Node {
@@ -41,6 +43,8 @@ public:
         bDim_ = 1;
         myCol_ = 0;
         rowBase_ = id;
+        batch_ = 1;
+        useMkl_ = false;
     }
     ~WorkerNode() override = default;
 
@@ -63,15 +67,19 @@ public:
 
     // Adds this worker's slice of the distance on top of what the previous
     // worker in the pipeline already accumulated, and drops any candidate
-    // whose running total has passed the threshold: partial sums only grow,
-    // so it can never come back and reach the top-K.
+    // whose running total has passed its threshold: partial sums only grow,
+    // so one that has passed can never come back and reach the top-K.
     //
-    // querySlice is the master's cut of the query, myDim floats long. sums
-    // holds one running total per vector in the cluster and is carried from
-    // worker to worker; a pruned entry is marked with PRUNED
+    // Works on m queries at once. queries is m slices of myDim floats each,
+    // thresholds is one per query, and sums is m rows of n running totals,
+    // carried from worker to worker. A pruned entry is marked with PRUNED
     // (paper Algorithm 1, lines 6-12).
-    void accumulate(const float* querySlice, int clusterId, float threshold,
-                    std::vector<float>& sums);
+    //
+    // first says this is the head of the chain, where nothing has been pruned
+    // yet and the whole block has to be computed. That is the case the gemm
+    // path handles; later stages stay on the scalar loop, which can skip.
+    void accumulate(const float* queries, int m, int clusterId,
+                    const float* thresholds, bool first, std::vector<float>& sums);
 
 private:
     // Takes myDim, the cluster count, and then every cluster block.
@@ -82,6 +90,8 @@ private:
     int bDim_;      // how many workers share this row
     int myCol_;     // which of them this one is
     int rowBase_;   // rank of column 0 in this row
+    int batch_;     // queries the master sends slices for
+    bool useMkl_;   // gemm path enabled (and compiled in)
 
     // Survivors counted by position in the chain, not by worker: with
     // rotation a worker is the first stop for some clusters and the last for
