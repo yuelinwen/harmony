@@ -18,6 +18,15 @@ target_include_directories(main PRIVATE ${CMAKE_SOURCE_DIR})
 find_package(MPI REQUIRED)
 target_link_libraries(main PRIVATE MPI::MPI_CXX)
 
+# OpenMP parallelises the distance loop inside each worker (paper Section 5).
+# Optional: without it every worker just runs single-threaded.
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(main PRIVATE OpenMP::OpenMP_CXX)
+else()
+    message(STATUS "OpenMP not found - workers will be single-threaded")
+endif()
+
 # On Windows/MinGW: bundle the C++ runtime into the .exe so it runs standalone
 # (no missing libstdc++-6.dll / libgcc_s / libwinpthread when run outside CLion)
 if(MINGW)

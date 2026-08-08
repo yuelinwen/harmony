@@ -30,6 +30,12 @@ struct Config {
     int nq = 100;       // queries to run
     int prewarm = 500;  // vectors used to seed the heap; 0 turns it off
     bool pruning = true;
+
+    // OpenMP threads inside each worker (paper Section 5). One MPI process
+    // per node with as many threads as it has cores is the layout the paper
+    // runs; the default of 1 suits a laptop, where the processes already
+    // occupy every core.
+    int threads = 1;
 };
 
 inline void printUsage(const char* prog) {
@@ -47,7 +53,8 @@ inline void printUsage(const char* prog) {
         << "  --k <int>          neighbours returned     (100)\n"
         << "  --nq <int>         queries to run          (100)\n"
         << "  --prewarm <int>    heap seed size, 0 = off (500)\n"
-        << "  --pruning <0|1>    dimension-level pruning (1)\n";
+        << "  --pruning <0|1>    dimension-level pruning (1)\n"
+        << "  --threads <int>    OpenMP threads per worker (1)\n";
 }
 
 // Returns false on an unknown or incomplete option.
@@ -82,6 +89,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.prewarm = std::atoi(argv[++i]);
         } else if (opt == "--pruning" && hasValue) {
             cfg.pruning = (std::atoi(argv[++i]) != 0);
+        } else if (opt == "--threads" && hasValue) {
+            cfg.threads = std::atoi(argv[++i]);
         } else {
             std::cerr << "bad option: " << opt << std::endl;
             printUsage(argv[0]);

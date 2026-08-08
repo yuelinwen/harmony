@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
     if (rank == harmony::MASTER_RANK) {
         node = std::make_unique<harmony::MasterNode>(size - 1, cfg);
     } else {
-        node = std::make_unique<harmony::WorkerNode>(rank);
+        node = std::make_unique<harmony::WorkerNode>(rank, cfg);
     }
 
     int ret = node->run();

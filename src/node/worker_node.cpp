@@ -4,6 +4,10 @@
 
 #include <mpi.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "../comm/messages.h"
 #include "../index/distance.h"
 
@@ -37,7 +41,15 @@ namespace harmony {
                 continue;
             }
             const ClusterBlock& block = blocks_[b];
-            for (int v = 0; v < (int)block.ids.size(); ++v) {
+            int n = (int)block.ids.size();
+
+            // The hot loop, and the only place a worker spends real time.
+            // Iterations touch different sums[v] and alive[v], so the threads
+            // never write the same memory and no locking is needed. This is
+            // the node-level parallelism of paper Section 5; across nodes the
+            // work is already split by MPI.
+            #pragma omp parallel for schedule(static)
+            for (int v = 0; v < n; ++v) {
                 if (!alive[v]) {
                     continue;      // an earlier worker already dropped it
                 }
@@ -87,12 +99,22 @@ namespace harmony {
             addCluster(clusterId, ids, data);
         }
 
+        int threads = 1;
+#ifdef _OPENMP
+        threads = omp_get_max_threads();
+#endif
         std::cout << "worker " << id_ << " ready: " << vectorCount()
-                  << " vectors x " << myDim_ << " dims" << std::endl;
+                  << " vectors x " << myDim_ << " dims, "
+                  << threads << " thread(s)" << std::endl;
     }
 
     int WorkerNode::run() {
         running_ = true;
+
+#ifdef _OPENMP
+        omp_set_num_threads(cfg_.threads);
+#endif
+
         receiveSetup();
 
         std::vector<float> querySlice(myDim_);

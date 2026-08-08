@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "node.h"
+#include "../config.h"
 
 // WorkerNode (id >= 1): a compute node.
 // Holds one VxD data block, computes partial distances, and participates
@@ -25,7 +26,8 @@ struct ClusterBlock {
 
 class WorkerNode : public Node {
 public:
-    explicit WorkerNode(int id) : Node(id) {
+    WorkerNode(int id, const Config& cfg) : Node(id) {
+        cfg_ = cfg;
         myDim_ = 0;
         bDim_ = 1;
         myCol_ = 0;
@@ -65,6 +67,7 @@ private:
     // Takes myDim, the cluster count, and then every cluster block.
     void receiveSetup();
 
+    Config cfg_;
     int myDim_;
     int bDim_;      // how many workers share this row
     int myCol_;     // which of them this one is
