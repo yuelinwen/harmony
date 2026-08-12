@@ -7,27 +7,19 @@
 #include "node.h"
 #include "../config.h"
 
-// WorkerNode (rank >= 1): where essentially all the arithmetic happens.
+// WorkerNode (rank >= 1): where essentially all the arithmetic happens. It
+// owns no plan and makes no decisions -- the master sends only the slice, so a
+// worker never learns which dimensions it holds, just how many.
 //
-// It owns no plan and makes no decisions. The master cuts the data and the
-// query the same way and sends only the slice, so a worker never even learns
-// which dimensions it is working on -- just how many. All it does is:
-//
-//   run()         wait for a job, do it, pass the result on, repeat
-//   accumulate()  add my dimensions to the running total, drop what is now
-//                 too far to reach the top-K
-//
-// Workers in the same row form a chain. A cluster enters at some column,
-// goes round the row one worker at a time, and the last one reports back to
-// the master. Which end of a chain this worker is depends on the job: the
-// entry point rotates, so no worker is always the first stop.
+// Workers in the same row form a chain. A cluster enters at some column, goes
+// round the row one worker at a time, and the last reports back to the master.
+// The entry point rotates, so no worker is always the first stop.
 //
 // Paper Fig. 3 right side, Fig. 5b, Algorithm 1 lines 6-12.
 
 namespace harmony {
 
-// One cluster living on this worker: the global ids of its vectors, plus the
-// slice of those vectors the master sent.
+// One cluster living on this worker.
 struct ClusterBlock {
     int clusterId;            // id in the master's global clustering
     std::vector<int> ids;     // global vector ids
@@ -48,36 +40,30 @@ public:
     }
     ~WorkerNode() override = default;
 
-    // Receive loop: take setup from the master, then serve jobs until told
-    // to stop.
+    // Receive loop: take setup from the master, then serve jobs until told to
+    // stop.
     int run() override;
 
     // How many dimensions per vector the master will be sending.
     // Must be called before addCluster.
     void setDimCount(int myDim);
 
-    // Takes one cluster: the global ids, and their vectors already cut down
-    // to this worker's dimensions. Under MPI this is the buffer the master
-    // sent, received as-is.
+    // Takes one cluster: the global ids, and their vectors already cut down to
+    // this worker's dimensions.
     void addCluster(int clusterId, const std::vector<int>& ids,
                     const std::vector<float>& data);
 
     // How many vectors this worker ended up with.
     long vectorCount() const;
 
-    // Adds this worker's slice of the distance on top of what the previous
-    // worker in the pipeline already accumulated, and drops any candidate
-    // whose running total has passed its threshold: partial sums only grow,
-    // so one that has passed can never come back and reach the top-K.
+    // Adds this worker's slice of the distance to what the previous worker
+    // accumulated, and drops any candidate whose total has passed its
+    // threshold -- partial sums only grow, so one that has passed can never
+    // come back (paper Algorithm 1, lines 6-12).
     //
-    // Works on m queries at once. queries is m slices of myDim floats each,
-    // thresholds is one per query, and sums is m rows of n running totals,
-    // carried from worker to worker. A pruned entry is marked with PRUNED
-    // (paper Algorithm 1, lines 6-12).
-    //
-    // first says this is the head of the chain, where nothing has been pruned
-    // yet and the whole block has to be computed. That is the case the gemm
-    // path handles; later stages stay on the scalar loop, which can skip.
+    // Works on m queries at once: `queries` is m slices of myDim floats,
+    // `sums` is m rows of n running totals. `first` means the head of the
+    // chain, where nothing is pruned yet and the gemm path applies.
     void accumulate(const float* queries, int m, int clusterId,
                     const float* thresholds, bool first, std::vector<float>& sums);
 
@@ -93,9 +79,8 @@ private:
     int batch_;     // queries the master sends slices for
     bool useMkl_;   // gemm path enabled (and compiled in)
 
-    // Survivors counted by position in the chain, not by worker: with
-    // rotation a worker is the first stop for some clusters and the last for
-    // others, so a single per-worker total would mix the two.
+    // Survivors by position in the chain, not by worker: rotation makes a
+    // worker the first stop for some clusters and the last for others.
     std::vector<long> aliveAtStage_;
     std::vector<ClusterBlock> blocks_;
 };

@@ -6,33 +6,18 @@
 #include "dataset.h"
 #include "../engine/topk_heap.h"
 
-// IvfIndex: cluster-based index (IVF = InVerted File).
-//
-// Self-contained, no external library. The paper (Section 5) implements
-// Harmony in plain C++20 and uses Faiss only as a comparison baseline in
-// the evaluation, so the index itself is ours.
-//
-// build():  kmeans over the base vectors -> nlist clusters.
-//           centroids_[c]  = the center of cluster c
-//           invlists_[c]   = ids of all base vectors inside cluster c
-//
-// search(): 1. compare the query against the nlist centroids (cheap)
-//           2. keep the nprobe nearest clusters
-//           3. scan only the vectors in those clusters
+// IvfIndex: cluster-based index (IVF = InVerted File). Self-contained, no
+// external library.
 //
 // The clustering is global: it runs once, on the master, over the whole
 // dataset, and only then is the result cut up for the workers. That is what
-// lets the master send a query to just the few workers that can hold its
-// neighbours, instead of broadcasting it to everyone.
+// lets the master send a query to just the few workers that could hold its
+// neighbours instead of broadcasting it.
 //
-// The distributed side builds on this index rather than replacing it:
-//   - vector partition     = which worker row owns which of these clusters
-//   - dimension partition  = which columns of each vector a worker keeps
-//   - pruning              = the scan in step 3, spread across a worker chain
-//                            and stopped early
-//
-// search() stays whole and single-machine, and is used as the reference the
-// distributed answer is checked against.
+// The distributed side builds on this index rather than replacing it -- the
+// vector partition decides which row owns which of these clusters, and
+// search() stays single-machine, as the reference the distributed answer is
+// checked against.
 
 namespace harmony {
 

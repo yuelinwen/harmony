@@ -65,14 +65,12 @@ void WorkerNode::accumulate(const float* queries, int m, int clusterId,
         int n = (int)block.ids.size();
 
 #ifdef HARMONY_USE_MKL
-        // At the head of the chain every candidate has to be computed -- there
-        // is no running total yet to prune against -- so the whole m x n block
-        // can go through one gemm. Expanding ||a-b||^2 into
-        // ||a||^2 + ||b||^2 - 2ab turns it into a matrix multiply, and the
-        // vector norms were precomputed when the block arrived.
+        // At the head of the chain nothing can be pruned yet, so the whole
+        // m x n block has to be computed and can go through one gemm.
+        // Expanding ||a-b||^2 into ||a||^2 + ||b||^2 - 2ab makes it a matrix
+        // multiply; the norms were precomputed when the block arrived.
         //
-        // Later stages do not take this path: their whole point is to skip
-        // most of the candidates, which a dense multiply cannot do.
+        // Later stages skip most candidates, which a dense multiply cannot.
         if (first && useMkl_ && m > 1) {
             std::vector<float> qn(m);
             for (int q = 0; q < m; ++q) {
@@ -194,14 +192,12 @@ int WorkerNode::run() {
     std::vector<float> sums;
 
     // Forwarding has to be non-blocking. Clusters start at different columns,
-    // so two workers can be sending to each other at the same moment; with
-    // blocking sends both would sit in MPI_Send waiting for the other to post
-    // a receive, and the row would deadlock. This is why the paper uses
-    // MPI_Isend / MPI_Irecv (Section 5).
+    // so two workers can be sending to each other at once; with blocking sends
+    // both would wait in MPI_Send for the other to receive, and the row would
+    // deadlock. This is why the paper uses MPI_Isend / MPI_Irecv (§5).
     //
     // An outgoing buffer must stay untouched until its send completes, and
-    // sums is reused by the next job, so sends go out of a small rotating
-    // pool instead.
+    // sums is reused by the next job, so sends go out of a rotating pool.
     int slots = bDim_ + 1;
     std::vector<std::vector<float>> outSums(slots);
     std::vector<MPI_Request> reqSums(slots, MPI_REQUEST_NULL);

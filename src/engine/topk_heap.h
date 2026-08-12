@@ -5,17 +5,10 @@
 #include <queue>
 #include <vector>
 
-// TopKHeap: keeps the K nearest candidates seen so far.
-//
-// Implemented as a max-heap of size K, so the top of the heap is the
-// WORST of the K kept candidates. A new candidate only needs to be
-// compared against that one value:
-//   - heap not full        -> always insert
-//   - dist < worst         -> pop the worst, insert the new one
-//   - otherwise            -> discard
-//
-// worst() is the current admission threshold. In the paper this is the
-// pruning threshold tau^2 (Algorithm 1).
+// TopKHeap: keeps the K nearest candidates seen so far, as a max-heap of size
+// K, so its top is the WORST of the K kept and a new candidate is compared
+// against that one value. worst() is the admission threshold, which is the
+// paper's pruning threshold tau^2 (Algorithm 1).
 
 namespace harmony {
 
@@ -57,9 +50,8 @@ public:
         }
     }
 
-    // Current threshold: the distance of the worst kept candidate.
-    // Before the heap is full every candidate is accepted, so the
-    // threshold is "infinity".
+    // The worst kept candidate's distance, or infinity while the heap is not
+    // full and every candidate is accepted.
     float worst() const {
         if ((int)heap_.size() < k_) {
             return 1e30f;
@@ -67,8 +59,8 @@ public:
         return heap_.top().dist;
     }
 
-    // Returns the kept candidates sorted from nearest to farthest.
-    // Copies the heap, so the object stays usable afterwards.
+    // The kept candidates, nearest first. Copies the heap, so the object stays
+    // usable afterwards.
     std::vector<Candidate> results() const {
         std::vector<Candidate> out;
         std::priority_queue<Candidate, std::vector<Candidate>, CandidateLess> copy = heap_;

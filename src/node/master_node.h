@@ -12,21 +12,8 @@
 #include "../index/ivf_index.h"
 
 // MasterNode (rank 0): decides and coordinates, but does almost no distance
-// work -- about 0.2% of it, in picking which clusters a query should visit.
-//
-// Startup, once:
-//   loadData      read the vectors and the groundtruth
-//   buildIndex    one global kmeans over the whole dataset
-//   choosePlan    cost model picks the bVec x bDim grid   (only in "auto" mode)
-//   splitGrid     decide which row owns which cluster, and how a row cuts dims
-//   distributeData  cut the data and send each worker its block
-//
-// Per query:
-//   queryPipeline   centroids -> nprobe clusters -> group by row
-//     vectorPipeline    drive all rows at once, refill each as it reports
-//       dispatchOne     hand a row's clusters to its workers
-//
-// Paper Fig. 3 left side; Algorithm 1 is spread across the *Pipeline methods.
+// work. Paper Fig. 3 left side; Algorithm 1 is spread across the *Pipeline
+// methods.
 
 namespace harmony {
 
@@ -43,6 +30,8 @@ public:
     }
     ~MasterNode() override = default;
 
+    // Load, build, distribute, then search -- and check the answer against a
+    // single machine and report recall, QPS and the pruning ratios.
     int run() override;
 
     // Reads the base and query vectors. Returns false if either file fails.
@@ -61,10 +50,7 @@ public:
 
     // Lays the workers out as a bVec x bDim grid (paper Fig. 4a). Row r holds
     // the clusters with c % bVec == r; within a row, each worker holds one
-    // slice of the dimensions. bVec * bDim must equal the worker count.
-    //   bVec=1          -> pure dimension partition (Harmony-dimension)
-    //   bDim=1          -> pure vector partition    (Harmony-vector)
-    //   both > 1        -> the hybrid the paper calls Harmony
+    // slice of the dimensions.
     void splitGrid(int bVec, int bDim);
 
     // Cuts every cluster into per-worker slices and sends them out.
@@ -73,8 +59,7 @@ public:
     // Tells the workers to stop, and collects their pruning counters.
     void shutdown();
 
-    // What one query of the current batch needs: its own heap, its own
-    // probed clusters, and the ids prewarm already accounted for.
+    // What one query of the current batch needs.
     struct QueryState {
         int id;                       // row in query_
         std::vector<int> clusters;    // its nprobe nearest
@@ -82,11 +67,9 @@ public:
         int prewarmed;
     };
 
-    // Algorithm 1, lines 19-23. Takes a batch of queries, as the paper's
-    // QueryBatch does. Queries that probe the same cluster share one visit to
-    // it, which is where the reuse the gemm path needs comes from. Each query
-    // still gets its own heap: the pseudocode keeps one for the whole set
-    // (line 20), which cannot be right, since a top-K is per query.
+    // Algorithm 1, lines 19-23. Runs a batch of queries, the paper's
+    // QueryBatch: those probing the same cluster share one visit to it. One
+    // heap per query, unlike line 20 -- see README.
     std::vector<std::vector<Candidate>> queryPipeline(int firstQuery, int count,
                                                       int nprobe, int k);
 
@@ -97,20 +80,14 @@ public:
 
     // Algorithm 1, lines 13-18. Runs the clusters of every vector partition
     // through the dimension pipeline and pushes the survivors into the heaps.
-    //
-    // The pseudocode calls this once per partition (line 21-23), but Fig. 5a
-    // has the partitions running at the same time -- "Stage B does not need to
-    // follow Stage A" -- so all rows are driven together here instead.
+    // All rows are driven at once, as in Fig. 5a.
     void vectorPipeline(const std::vector<std::vector<int>>& perRow,
                         const std::vector<QueryState>& batch,
                         std::vector<TopKHeap>& heaps);
 
-    // Algorithm 1, lines 6-12, split so a row can be started without waiting
-    // on it. Together they are the paper's "foreach d in DSet": the job goes
-    // to every worker in the cluster's row, those workers pass the running
-    // totals down the chain, and only the last one reports back.
-    //
-    // `members` are the batch positions that probed this cluster.
+    // Algorithm 1, lines 6-12. Sends one cluster to every worker in its row
+    // and returns; the workers pass the running totals down the chain and only
+    // the last reports back. `members` are the batch positions that probed it.
     void dispatchOne(int row, int clusterId, int startCol,
                      const std::vector<int>& members,
                      const std::vector<float>& thresholds);
@@ -120,34 +97,25 @@ public:
 
     // ---- cost model, paper Section 4.2.1 ----
 
-    // Runs queries through centroid assignment only, to learn which clusters
-    // are hot before the layout is fixed (the paper's pre-query phase).
+    // Learns which clusters the workload favours, by centroid assignment only,
+    // before the layout is fixed (the paper's pre-query phase).
     void warmupPlan(int queries, int nprobe);
 
-    // I(pi): the spread of computation across the vector partitions, worked
-    // out from how often each cluster was probed and how big it is. Nothing
-    // has to be executed -- pi only decides which row owns which cluster.
+    // I(pi): the spread of computation across the vector partitions, from how
+    // often each cluster was probed and how big it is.
     double imbalanceOf(int bVec, int bDim) const;
 
-    // Share of the distance work that still gets done when the dimensions are
-    // cut into bDim slices. More slices mean more chances to stop early.
-    //
-    // The paper states that computation per machine barely moves between
-    // layouts (Section 4.3) and its cost model has no term for this. Measured
-    // on Sift1M that does not hold once pruning is on -- the work ranges from
-    // 100% at one slice to about 50% at four -- and ignoring it makes the
-    // model prefer exactly the layout that turns out to be slowest. These are
-    // measured numbers, not a derivation: the paper gives no way to predict a
-    // pruning ratio.
+    // Share of the distance work still done when the dimensions are cut into
+    // bDim slices: more slices, more chances to stop early. Measured values,
+    // and a term the paper's model does not have -- see README.
     double pruneFactor(int bDim) const;
 
-    // C(pi,Q): computation, communication, and the imbalance penalty. Cast in
-    // multiply-add equivalents, so commCost is the price of one transferred
-    // byte relative to one multiply-add.
+    // C(pi,Q): computation, communication, and the imbalance penalty, all in
+    // multiply-add equivalents.
     double estimateCost(int bVec, int bDim) const;
 
-    // Picks the grid with the lowest cost. Only a handful of factorisations
-    // of the worker count are legal, so they are simply enumerated.
+    // Picks the grid with the lowest cost, by enumerating the factorisations
+    // of the worker count.
     void choosePlan();
 
 private:
@@ -167,9 +135,8 @@ private:
     std::vector<int> clusterOwner_;  // cluster id -> vector partition (row)
     std::vector<long> clusterHits_;  // how often each cluster has been probed
 
-    // pruning counters (paper Table 3). Counted by position in the chain
-    // rather than by worker: rotation makes each worker the first stop for
-    // some clusters and the last for others.
+    // pruning counters (paper Table 3), by position in the chain rather than
+    // by worker, since rotation moves each worker between the two.
     long scanned_;                      // candidates offered in total
     std::vector<long> scannedRow_;      // per vector partition
     std::vector<long> aliveAfterStage_; // still alive after the s-th slice

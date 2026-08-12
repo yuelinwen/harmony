@@ -311,17 +311,12 @@ void MasterNode::shutdown() {
 }
 
 // Without this the heap starts empty, worst() is infinite, and nothing can be
-// pruned until a whole cluster has been through the pipeline (paper Algorithm
-// 1, lines 1-5).
+// pruned until a whole cluster has been through the pipeline (Algorithm 1,
+// lines 1-5). Samples come from the nearest cluster, not at random, which
+// makes the starting threshold much tighter.
 //
-// The samples come from the nearest cluster rather than at random: vectors in
-// it are far more likely to be real neighbours, which makes the starting
-// threshold much tighter.
-//
-// Distances here are over every dimension. A partial distance is smaller than
-// the real one, and using one as the threshold would drop candidates that
-// belonged in the top-K. Only the master can do this -- a worker holds a
-// fraction of each vector.
+// Only the master can do this: distances here are over every dimension, and a
+// worker holds a fraction of each vector.
 int MasterNode::prewarmHeap(const float* query, int clusterId, int count, TopKHeap& heap) {
     const std::vector<int>& ids = index_.clusterIds(clusterId);
 
@@ -337,14 +332,12 @@ int MasterNode::prewarmHeap(const float* query, int clusterId, int count, TopKHe
     return n;
 }
 
-// Hands one cluster to every worker in its row and returns immediately.
-// The workers of a row then run one after another, not in parallel -- running
-// them in parallel would compute every slice in full and save nothing (paper
-// Section 3.2, Challenge 3).
+// Hands one cluster to every worker in its row and returns immediately. The
+// workers of a row then run one after another, not in parallel: in parallel
+// every slice would be computed in full and nothing saved (paper §3.2).
 //
-// `members` are the positions in the current batch that probed this cluster.
-// Only those queries travel with the job, so a cluster wanted by three of
-// thirty-two queries costs three rows of running totals, not thirty-two.
+// Only the queries in `members` travel with the job, so a cluster wanted by
+// three of thirty-two costs three rows of running totals, not thirty-two.
 void MasterNode::dispatchOne(int row, int clusterId, int startCol,
                              const std::vector<int>& members,
                              const std::vector<float>& thresholds) {
@@ -367,19 +360,14 @@ int MasterNode::lastRankOf(int row, int startCol) const {
 }
 
 // Two levels of overlap, which multiply out to one busy worker per machine:
+// every row is given work before anything is collected (paper Fig. 5a), and
+// each row keeps up to bDim clusters in flight (Fig. 5b). Rows refill on their
+// own and MPI_Waitany takes whichever comes back first, so a slow row never
+// holds up a fast one.
 //
-//   across rows   -- every row is given work before anything is collected,
-//                    so the rows compute at the same time (paper Fig. 5a)
-//   within a row  -- up to bDim clusters are kept in flight, so while one
-//                    worker handles a cluster's second slice, another is
-//                    already on the next cluster's first (paper Fig. 5b)
-//
-// Rows refill on their own, so a slow row never holds up a fast one, and
-// MPI_Waitany takes whichever comes back first.
-//
-// Survivors go into their query's heap as soon as the cluster reports, so
-// thresholds keep tightening. (The paper only updates after a whole
-// partition, Algorithm 1 line 18; updating sooner prunes strictly more.)
+// Survivors enter their query's heap as soon as the cluster reports, so
+// thresholds keep tightening -- sooner than Algorithm 1 line 18, which prunes
+// strictly more and changes nothing else.
 void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
                                 const std::vector<QueryState>& batch,
                                 std::vector<TopKHeap>& heaps) {
@@ -572,12 +560,10 @@ int MasterNode::run() {
     splitGrid(cfg_.bVec, cfg_.bDim);
     distributeData();
 
-    // v1 check: splitting the work over the workers and merging it back
-    // must give exactly what one machine would have returned.
-    //
-    // Compared as sets, not position by position. Squared distances on SIFT
-    // are integers and ties are common near rank k, and which of two equally
-    // distant vectors comes first is not defined either way.
+    // The distributed answer must equal what one machine would have returned.
+    // Compared as sets, not position by position: squared distances on SIFT
+    // are integers, ties near rank k are common, and their order is not
+    // defined either way.
     int k = cfg_.k;
     int nprobe = cfg_.nprobe;
     int nq = cfg_.nq;
