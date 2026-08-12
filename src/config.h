@@ -6,72 +6,37 @@
 #include <string>
 
 // Run-time settings, so an experiment does not need a recompile.
-//
-// The paper exposes NMachine, Pruning_Configuration and Mode on top of the
-// usual Faiss knobs (Section 5). NMachine is not needed here -- the worker
-// count comes from mpirun -n.
+// Measurements behind the defaults are in README.md.
 
 namespace harmony {
 
 struct Config {
-    // One prefix stands for the three files convert_hdf5.py writes:
-    //   <prefix>_base.bin  <prefix>_query.bin  <prefix>_gt.bin
-    std::string data = "Data/sift";
+    // data and index
+    std::string data = "Data/sift";  // prefix of _base.bin, _query.bin, _gt.bin
+    int nlist = 256;                 // clusters kmeans builds
+    int iters = 10;                  // kmeans rounds
 
-    int nlist = 256;    // clusters in the index
-    int iters = 10;     // kmeans rounds
+    // worker layout: a bVec x bDim grid (paper Fig. 4a)
+    std::string mode = "harmony";    // harmony | vector | dimension | auto
+    int bVec = 0;                    // vector partitions, overrides mode
+    int bDim = 0;                    // dimension slices, overrides mode
 
-    std::string mode = "harmony";   // harmony | vector | dimension | auto
-    int bVec = 0;       // set directly to override the mode
-    int bDim = 0;
+    // the search
+    int nprobe = 32;   // clusters visited per query: recall against speed
+    int k = 100;       // neighbours returned
+    int nq = 100;      // queries to run
 
-    // Cost model (paper Section 4.2.1), used when mode is "auto".
-    //   alpha    weight on the imbalance term of C(pi,Q)
-    //   commCost cost of one byte between workers, relative to one multiply-
-    //            add. This is the number that decides whether splitting by
-    //            dimension is worth its extra hops, and it is a property of
-    //            the hardware, so it has to be measured.
-    //
-    //            Two ways to get it, which agreed on the test cluster:
-    //              flops/s divided by bytes/s -- 12.7 GFLOP/s over ~109 MB/s
-    //              gives about 116
-    //              sweeping it until the model ranks the three grids the way
-    //              they actually measure -- anything from 10 upwards
-    //
-    //            The default suits that cluster (1 Gb/s links). Shared memory
-    //            is nearer 1, and a 100 Gb/s fabric like the paper's would be
-    //            around 1-10, which is why the paper can afford to split by
-    //            dimension where this cluster cannot.
-    //   warmup   queries used to learn which clusters are hot before the plan
-    //            is fixed (the paper's pre-query phase, Section 6.2.1)
-    double alpha = 0.3;
-    double commCost = 100.0;
-    int warmup = 1000;
+    // speed
+    int threads = 1;      // OpenMP threads inside each worker (paper §5)
+    int batch = 32;       // queries handled together (Algorithm 1 line 13)
+    int prewarm = 500;    // vectors seeding a query's heap, 0 = off (lines 1-5)
+    bool pruning = true;  // dimension-level early exit (paper Fig. 10)
+    bool mkl = true;      // gemm for the first slice, if MKL was compiled in
 
-    int nprobe = 32;    // clusters visited per query
-    int k = 100;        // neighbours returned
-    int nq = 100;       // queries to run
-
-    // Queries processed together (paper Algorithm 1 line 13, QueryBatch).
-    // Queries that probe the same cluster share one visit to it, so the
-    // vectors are read once and used for all of them. That reuse is also what
-    // makes the gemm path worth taking: measured 0.64x at batch 1 but 3.16x
-    // at batch 32, against the plain loop.
-    int batch = 32;
-
-    // Use MKL for the first dimension slice, where nothing can be pruned yet
-    // and the whole block has to be computed anyway. Later slices stay on the
-    // scalar loop, which is what can stop early. Ignored if MKL is not
-    // compiled in.
-    bool mkl = true;
-    int prewarm = 500;  // vectors used to seed the heap; 0 turns it off
-    bool pruning = true;
-
-    // OpenMP threads inside each worker (paper Section 5). One MPI process
-    // per node with as many threads as it has cores is the layout the paper
-    // runs; the default of 1 suits a laptop, where the processes already
-    // occupy every core.
-    int threads = 1;
+    // cost model, read only when mode is "auto" (paper §4.2.1)
+    double commCost = 100.0;  // a transferred byte, in multiply-adds. Hardware.
+    double alpha = 0.3;       // weight on the imbalance term of C(pi,Q)
+    int warmup = 1000;        // queries profiled to find the hot clusters
 };
 
 inline void printUsage(const char* prog) {
@@ -161,9 +126,6 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
 
 // Turns --mode into a grid, unless --bvec/--bdim were given. bVec * bDim has
 // to come out equal to the worker count.
-//   vector    -> N x 1   (Harmony-vector, no dimension pipeline)
-//   dimension -> 1 x N   (Harmony-dimension, no vector partitions)
-//   harmony   -> the most square split N allows
 inline bool resolveGrid(Config& cfg, int numWorkers) {
     if (cfg.bVec > 0 || cfg.bDim > 0) {
         if (cfg.bVec <= 0) {
