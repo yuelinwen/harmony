@@ -24,7 +24,7 @@
 // Per query:
 //   queryPipeline   centroids -> nprobe clusters -> group by row
 //     vectorPipeline    drive all rows at once, refill each as it reports
-//       dispatchBatch   hand a row's clusters to its workers
+//       dispatchOne     hand a row's clusters to its workers
 //
 // Paper Fig. 3 left side; Algorithm 1 is spread across the *Pipeline methods.
 

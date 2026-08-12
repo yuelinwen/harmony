@@ -11,18 +11,20 @@ mechanisms and the relative behaviour should.
 ## Build and run
 
 ```bash
-./build.sh                                  # handles the macOS/Linux OpenMP split
-mpirun -n 5 ./main                          # 1 master + 4 workers
-mpirun -n 5 ./main --mode auto              # cost model picks the grid
-mpirun -n 5 --hostfile hosts.txt ./main     # across machines
+scripts/data.sh Data/sift-128-euclidean.hdf5   # once per dataset
+scripts/build.sh                               # compile, and copy out on the master
+scripts/run.sh 4                               # 1 master + 4 workers
+scripts/run.sh 4 --mode auto                   # cost model picks the grid
 ```
 
-Any bad option prints the full list. Run from the project root: `Data/` paths
-are relative. Only rank 0 reads the data files; workers receive their blocks
-over MPI.
+`run.sh` spreads one process per machine when `scripts/hosts.txt` is there and
+keeps everything local when it is not, so the same two commands work on a
+laptop and on the cluster. Anything after the worker count goes straight to
+`./main`, and any bad option prints the full list.
 
-Useful for quick iteration: `--nlist 16 --iters 2 --nq 20` builds the index in
-seconds instead of two minutes.
+Only rank 0 reads the data files; workers receive their blocks over MPI.
+`--nlist 16 --iters 2 --nq 20` builds the index in seconds instead of two
+minutes, which is what makes it usable for checking a change.
 
 ## Layout
 
@@ -42,7 +44,7 @@ src/node/             master (plan, distribute, route, merge) and worker
 ```
 queryPipeline     centroids -> nprobe clusters -> group by row
   vectorPipeline    drive all rows at once, refill each row as it reports
-    dispatchBatch     hand a row's clusters to its workers
+    dispatchOne       hand a row's clusters to its workers
       worker chain      each adds its dimensions, drops what passed the threshold
 ```
 
@@ -172,17 +174,23 @@ expands StarLightCurves and HandOutlines without saying how.
 
 ## The test cluster
 
-Ten Ubuntu 25.04 VMs, `yw-vdb-1` through `-10`, 8 cores and 30GB each, Xeon
-Sapphire Rapids. `yw-vdb-1` (192.168.73.200, public 134.87.10.158) is the
-master: it is the only one that reads the data files, since workers receive
-their blocks over MPI. `hosts.txt` lists all ten at `slots=1`.
+Ten Ubuntu 25.04 VMs, 8 cores and 30GB each, Xeon Sapphire Rapids. The first
+is the master: it is the only one that reads the data files, since workers
+receive their blocks over MPI. Their addresses live in `scripts/hosts.txt`,
+one per line, which stays out of the repository.
 
 ```bash
-mpirun -n 5 --hostfile hosts.txt --map-by node ./main --threads 8
+scripts/run.sh 4 --nq 200
 ```
 
-`--map-by node` puts one process per machine rather than packing them onto
-the first; `--threads 8` then fills each machine's cores, which is the layout
+which comes down to
+
+```bash
+mpirun -n 5 --hostfile scripts/hosts.txt -N 1 ./main --threads 8
+```
+
+`-N 1` puts exactly one process per machine rather than packing them onto the
+first; `--threads 8` then fills each machine's cores, which is the layout
 the paper runs.
 
 Inter-VM bandwidth measures about 109 MB/s -- roughly 1 Gb/s, two orders of

@@ -1,9 +1,14 @@
 #!/bin/bash
 #
-# Builds ./main. Run it on whichever machine you are on -- it works out the
-# platform itself.
+# Builds ./main, and copies it to the other machines when run on the cluster
+# master. Works out the platform itself.
 #
 #   scripts/build.sh
+#
+# mpirun needs the executable at the same path on every machine it starts a
+# process on, so the copy has to happen after every build -- which is why it
+# lives here rather than in a script of its own. The data files are not
+# copied: only rank 0 opens a file, and the workers get their blocks over MPI.
 #
 # Two platforms are in play and they need different OpenMP flags:
 #
@@ -85,3 +90,35 @@ fi
 # library paths, so no MPI flags are needed here.
 mpicxx $FLAGS main.cpp src/node/*.cpp src/index/*.cpp -o main $LIBS
 echo "built ./main"
+
+# ---- copy to the workers, if this is the master ------------------------
+#
+# The test is whether one of this machine's own addresses is in hosts.txt.
+# On the laptop none of them are, so the build simply stops here even though
+# the file exists.
+#
+# What does *not* travel with the binary are its shared libraries. Linking
+# something new means installing it on the workers too, or they fail at
+# startup with "cannot open shared object file".
+
+HOSTS=scripts/hosts.txt
+[ -f "$HOSTS" ] || exit 0
+
+MY_IPS=" $(hostname -I 2>/dev/null || true) "
+MASTER=""
+while read -r host _; do
+    [ -z "$host" ] && continue
+    case "$MY_IPS" in *" $host "*) MASTER=$host ;; esac
+done < "$HOSTS"
+
+[ -n "$MASTER" ] || exit 0
+
+# -n on ssh matters: without it ssh swallows stdin, which here is hosts.txt,
+# and the loop stops after the first machine.
+while read -r host _; do
+    [ -z "$host" ] && continue
+    [ "$host" = "$MASTER" ] && continue      # this is where it was built
+    ssh -n -o BatchMode=yes "$host" "mkdir -p ~/harmony"
+    scp -q main "$host:~/harmony/main"
+    echo "  copied to $host"
+done < "$HOSTS"

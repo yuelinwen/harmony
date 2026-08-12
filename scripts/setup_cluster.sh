@@ -15,8 +15,10 @@
 #     starts remote processes over ssh and cannot answer a password prompt
 #   - installs OpenMPI, and MKL if this machine has it, since a binary built
 #     here will expect the same libraries there
-#   - writes hosts.txt with one slot per machine, so mpirun --map-by node
-#     puts a single process on each and OpenMP fills its cores
+#   - writes scripts/hosts.txt, one address per line with this machine first
+#
+# The file holds addresses and nothing else. How many processes go on each
+# machine is decided by run.sh, which passes -N 1.
 
 set -e
 
@@ -50,12 +52,12 @@ for ip in "$@"; do
 done
 
 {
-    echo "$(hostname -I | awk '{print $1}') slots=1"
-    for ip in "$@"; do echo "$ip slots=1"; done
-} > hosts.txt
+    hostname -I | awk '{print $1}'      # this machine, the master, first
+    for ip in "$@"; do echo "$ip"; done
+} > scripts/hosts.txt
 
 echo
-echo "hosts.txt:"
-sed 's/^/  /' hosts.txt
+echo "scripts/hosts.txt:"
+sed 's/^/  /' scripts/hosts.txt
 echo
-echo "next: scripts/build.sh && scripts/deploy.sh && scripts/run.sh $#"
+echo "next: scripts/build.sh && scripts/run.sh $#"
