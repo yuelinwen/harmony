@@ -69,7 +69,7 @@ public:
 
     // Algorithm 1, lines 19-23. Runs a batch of queries, the paper's
     // QueryBatch: those probing the same cluster share one visit to it. One
-    // heap per query, unlike line 20 -- see README.
+    // heap per query, unlike line 20 -- see CLAUDE.md.
     std::vector<std::vector<Candidate>> queryPipeline(int firstQuery, int count,
                                                       int nprobe, int k);
 
@@ -107,7 +107,7 @@ public:
 
     // Share of the distance work still done when the dimensions are cut into
     // bDim slices: more slices, more chances to stop early. Measured values,
-    // and a term the paper's model does not have -- see README.
+    // and a term the paper's model does not have -- see CLAUDE.md.
     double pruneFactor(int bDim) const;
 
     // C(pi,Q): computation, communication, and the imbalance penalty, all in
