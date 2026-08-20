@@ -3,12 +3,12 @@
 # Prepares a fresh set of machines to run as a cluster. Run it once, on the
 # machine that will be the master.
 #
-#   scripts/setup_cluster.sh 192.168.73.188 192.168.73.115 ...
+#   scripts/setup_cluster.sh <worker-ip> <worker-ip> ...
 #
 # It expects to already be able to reach each of them -- either passwordless
 # already, or through a key named on the command line:
 #
-#   KEY=~/.ssh/yuelin.pem scripts/setup_cluster.sh 192.168.73.188 ...
+#   KEY=~/.ssh/key.pem scripts/setup_cluster.sh <worker-ip> ...
 #
 # What it does, per machine:
 #   - adds this machine's public key to authorized_keys, because mpirun

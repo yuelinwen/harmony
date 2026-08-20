@@ -13,19 +13,52 @@ Run them from anywhere; each one finds the project root itself.
 how many processes go on each machine is `run.sh`'s business, not the file's.
 It is gitignored, being particular to one cluster.
 
-## First time on a new cluster
+## On the cluster
+
+Which machine a step runs on is half of it — only the transfer runs on the
+laptop, everything else on the master.
 
 ```bash
-scripts/setup_cluster.sh 192.168.73.188 192.168.73.115 192.168.73.116
+KEY=~/.ssh/key.pem scripts/setup_cluster.sh <worker-ip> <worker-ip> ...
+```
+
+```bash
+scripts/data.sh Data/sift-128-euclidean.hdf5        # once per dataset
+```
+
+```bash
+tar cf - src main.cpp scripts | ssh <master> 'cd ~/harmony && tar xf -'
+```
+
+```bash
 scripts/build.sh
-scripts/run.sh 3
 ```
-
-## Every time after that
 
 ```bash
-scripts/build.sh && scripts/run.sh 4
+scripts/run.sh 4
 ```
+
+The first two are once, both on the master. `setup_cluster.sh` is the only
+command with addresses written out, because it is the one that writes
+`hosts.txt`; everything after it reads the file. It takes the workers only —
+it puts itself first — and `KEY=` is just for the first contact, before its
+own key is installed. Only rank 0 opens a data file, so `Data/` is needed on
+the master alone; the workers get their blocks over MPI.
+
+`<master>` is whatever address the laptop reaches the master at. That is not
+`hosts.txt`'s first line: the file holds the addresses the machines use among
+themselves, which from outside the cluster are not routable.
+
+The last three are the edit-and-check loop. The transfer is the one that runs
+on the laptop, and it is not optional: the master has no copy of an edit until
+it is sent, so skipping it means the next run tests the old code without
+saying so. Check that the files actually landed before building — a copy step
+that silently skips a directory does not fail, it just leaves the old binary
+in place. `build.sh` then scp's the new binary to every worker, because mpirun
+needs it at the same path on all of them.
+
+`run.sh N` runs N workers on N+1 machines, one process per machine, one OpenMP
+thread per core.
 
 ## A new dataset
 
@@ -40,19 +73,48 @@ Euclidean datasets only. An angular one is refused: dimension pruning depends
 on squared L2, where a partial sum can only grow, and an angular file's
 groundtruth is ranked by angle anyway.
 
+Converting needs `h5py` and `numpy` (`pip3 install h5py numpy`), on whichever
+machine does the converting. Nothing else does: the cluster reads the `.bin`
+files.
+
 ## On a laptop
 
-No `hosts.txt` there, so `run.sh` keeps everything local and single-threaded —
-the processes would otherwise fight over the same cores. `build.sh` skips the
-copy step for the same reason.
+Do not use `run.sh` here. It picks its branch by whether `hosts.txt` exists,
+and that file stays behind on a laptop that has ever been pointed at a cluster,
+so it would ssh into addresses this machine cannot reach. Call `mpirun`
+directly: without `--hostfile` every process starts locally, and
+`--oversubscribe` lets all N+1 of them share the one machine.
 
 ```bash
 brew install open-mpi libomp        # once
-scripts/build.sh && scripts/run.sh 4 --nlist 16 --iters 2 --nq 32
 ```
 
-Small `--nlist` and `--iters` build the index in seconds instead of minutes,
-which is what makes it usable for checking a change.
+```bash
+scripts/data.sh Data/sift-128-euclidean.hdf5        # once per dataset
+```
+
+```bash
+scripts/build.sh
+```
+
+```bash
+mpirun -n 5 --oversubscribe ./main --nlist 16 --iters 2 --nprobe 4 --nq 32
+```
+
+The first two are once; the last two are the edit-and-check loop. `data.sh`
+stops early if the `.bin` files are already there, so it is safe to leave in a
+script. `-n 5` is one master and four workers.
+
+Small `--nlist` and `--iters` build the index in half a second instead of half
+a minute, which is what makes it usable for checking a change; `--nprobe` has
+to come down with `--nlist`, or it asks for more clusters than exist and every
+query scans the whole index.
+
+`build.sh` needs no such care — it looks for one of this machine's own
+addresses in `hosts.txt`, finds none, and skips the copy step by itself.
+
+A run is correct when it prints `differing: 0`. QPS is not comparable to the
+cluster: there is no MKL on arm64, and the processes are sharing cores.
 
 ## Options
 
