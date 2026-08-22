@@ -76,6 +76,7 @@ double MasterNode::recallAt(int queryId, const std::vector<Candidate>& got, int 
 }
 
 void MasterNode::buildIndex(int nlist, int iterations) {
+    std::cout << "\n===== 2. index =====" << std::endl;
     std::cout << "building index (nlist=" << nlist << ")" << std::endl;
 
     auto t0 = std::chrono::steady_clock::now();
@@ -171,6 +172,7 @@ double MasterNode::estimateCost(int bVec, int bDim) const {
 }
 
 void MasterNode::choosePlan() {
+    std::cout << "\n===== cost model =====" << std::endl;
     std::cout << "plan search (alpha=" << cfg_.alpha
               << ", commcost=" << cfg_.commCost << ")" << std::endl;
 
@@ -219,6 +221,7 @@ void MasterNode::splitGrid(int bVec, int bDim) {
         clusterOwner_[c] = c % bVec_;
     }
 
+    std::cout << "\n===== 3. layout =====" << std::endl;
     std::cout << "grid: " << bVec_ << " vector partitions x "
               << bDim_ << " dimension slices" << std::endl;
     for (int r = 0; r < bVec_; ++r) {
@@ -244,6 +247,8 @@ void MasterNode::splitGrid(int bVec, int bDim) {
 // The master does the cutting and sends only the slice, so no worker ever
 // holds data it does not own.
 void MasterNode::distributeData() {
+    std::cout << "\n===== 4. distribute =====" << std::endl;
+
     // how many clusters each row will receive
     std::vector<int> rowClusters(bVec_, 0);
     for (int c = 0; c < index_.getNlist(); ++c) {
@@ -542,7 +547,7 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
 
 int MasterNode::run() {
     running_ = true;
-    std::cout << "master node started" << std::endl;
+    std::cout << "===== 1. data =====" << std::endl;
 
     if (!loadData(cfg_.data + "_base.bin", cfg_.data + "_query.bin") ||
         !loadGroundtruth(cfg_.data + "_gt.bin")) {
@@ -620,14 +625,46 @@ int MasterNode::run() {
         }
     }
 
-    std::cout << "queries differing from single machine: "
+    shutdown();   // stop the workers and collect their counters
+
+    std::cout << "\n===== 5. results =====" << std::endl;
+    std::cout << "setup: " << numWorkers_ << " workers, grid "
+              << bVec_ << " x " << bDim_ << ", nlist " << index_.getNlist()
+              << ", nprobe " << nprobe << ", k " << k
+              << ", batch " << cfg_.batch << std::endl;
+
+    // Is the distributed answer the same as one machine's? This is the check
+    // that has to pass; everything below it is a measurement, not a verdict.
+    std::cout << "\ncorrectness" << std::endl;
+    std::cout << "  queries differing from single machine: "
               << differing << "/" << nq
               << "   (ties broken differently: " << ties << ")" << std::endl;
-    std::cout << "recall@" << k << ": " << (recallSum / nq) << std::endl;
-    std::cout << "QPS: " << (nq / seconds)
+    std::cout << "  recall@" << k << ": " << (recallSum / nq)
+              << "   (" << (k * (1.0 - recallSum / nq))
+              << " of " << k << " true neighbours missed per query)" << std::endl;
+
+    std::cout << "\nthroughput" << std::endl;
+    std::cout << "  " << nq << " queries in " << seconds << " s" << std::endl;
+    std::cout << "  QPS: " << (nq / seconds)
               << "   (" << (1000.0 * seconds / nq) << " ms per query)" << std::endl;
 
-    shutdown();   // stop the workers and collect their counters
+    // How much of the base each query actually touched, and how evenly that
+    // work fell across the vector partitions. The spread here is what the
+    // cost model's I(pi) term estimates in advance.
+    double perQuery = (double)scanned_ / nq;
+    std::cout << "\nwork" << std::endl;
+    std::cout << "  candidates scanned: " << scanned_
+              << "   (" << perQuery << " per query, "
+              << (100.0 * perQuery / base_.getN()) << "% of the base)" << std::endl;
+    if (bVec_ > 1) {
+        std::cout << "  per vector partition   (even would be "
+                  << (100.0 / bVec_) << "% each)" << std::endl;
+        for (int r = 0; r < bVec_; ++r) {
+            std::cout << "    partition " << r << ": " << scannedRow_[r]
+                      << " candidates   "
+                      << (100.0 * scannedRow_[r] / scanned_) << "%" << std::endl;
+        }
+    }
 
     // Pruning ratios in the shape of the paper's Table 3: the share of
     // candidates that never had to reach the s-th slice of the chain. Slice 1
@@ -639,7 +676,7 @@ int MasterNode::run() {
         long processed = (s == 0) ? scanned_ : aliveAfterStage_[s - 1];
         std::cout << "  slice " << (s + 1) << ": skipped "
                   << (100.0 * (1.0 - (double)processed / (double)scanned_))
-                  << "%" << std::endl;
+                  << "%   (" << processed << " candidates reached it)" << std::endl;
         done = done + processed;
     }
     std::cout << "distance work vs no pruning: "
