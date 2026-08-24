@@ -263,6 +263,7 @@ void MasterNode::distributeData() {
         setup[1] = rowClusters[row];
         setup[2] = bDim_;
         setup[3] = cfg_.batch;
+        // MPI: blocking is fine for startup -- the order is fixed and nobody waits
         MPI_Send(setup, 4, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
     }
 
@@ -351,6 +352,8 @@ void MasterNode::dispatchOne(int row, int clusterId, int startCol,
 
     for (int col = 0; col < bDim_; ++col) {
         int w = row * bDim_ + col + 1;
+        // MPI: three small messages per worker -- the job, who wants it, and
+        // their thresholds
         int job[4] = {clusterId, n, startCol, m};
         MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
         MPI_Send(members.data(), m, MPI_INT, w, TAG_QIDX, MPI_COMM_WORLD);
@@ -436,6 +439,8 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
                 slot[free].members = members;
                 slot[free].sums.resize((size_t)members.size() * n);
 
+                // MPI: non-blocking, so the next cluster can be dispatched
+                // without waiting for this one. lastRankOf is who ends the chain.
                 MPI_Irecv(slot[free].sums.data(), (int)slot[free].sums.size(),
                           MPI_FLOAT, lastRankOf(r, p), TAG_SUMS,
                           MPI_COMM_WORLD, &req[free]);
@@ -451,6 +456,8 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
             }
         }
 
+        // MPI: block until any one cluster reports, whichever it is. This is
+        // what lets a slow row not hold up a fast one.
         int index = MPI_UNDEFINED;
         MPI_Waitany(maxInFlight, req.data(), &index, MPI_STATUS_IGNORE);
         if (index == MPI_UNDEFINED) {

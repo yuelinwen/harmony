@@ -72,18 +72,21 @@ void WorkerNode::accumulate(const float* queries, int m, int clusterId,
         //
         // Later stages skip most candidates, which a dense multiply cannot.
         if (first && useMkl_ && m > 1) {
+            // MKL: ||q||^2 for each query in the batch
             std::vector<float> qn(m);
             for (int q = 0; q < m; ++q) {
                 const float* qv = &queries[(size_t)q * myDim_];
                 qn[q] = cblas_sdot(myDim_, qv, 1, qv, 1);
             }
 
+            // MKL: one matrix multiply produces all m x n dot products
             std::vector<float> dot((size_t)m * n);
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         m, n, myDim_, 1.0f,
                         queries, myDim_, block.data.data(), myDim_,
                         0.0f, dot.data(), n);
 
+            // OpenMP: turn the dot products into distances, one thread per query
             #pragma omp parallel for schedule(static)
             for (int q = 0; q < m; ++q) {
                 float t = thresholds[q];
@@ -104,6 +107,7 @@ void WorkerNode::accumulate(const float* queries, int m, int clusterId,
         // touch different sums entries, so the threads never write the same
         // memory and no locking is needed (paper Section 5, node-level
         // parallelism; across nodes the work is already split by MPI).
+        // OpenMP: one thread per query, no locking needed (see above)
         #pragma omp parallel for schedule(static)
         for (int q = 0; q < m; ++q) {
             const float* qv = &queries[(size_t)q * myDim_];
@@ -180,7 +184,7 @@ int WorkerNode::run() {
     useMkl_ = cfg_.mkl;
 
 #ifdef _OPENMP
-    omp_set_num_threads(cfg_.threads);
+    omp_set_num_threads(cfg_.threads);   // OpenMP: --threads takes effect here
 #endif
 
     receiveSetup();
@@ -204,6 +208,8 @@ int WorkerNode::run() {
     int slot = 0;
 
     while (true) {
+        // MPI: blocks here until the master has something to do. A worker
+        // spends most of its idle time in this call.
         int job[4];
         MPI_Recv(job, 4, MPI_INT, MASTER_RANK, TAG_JOB,
                  MPI_COMM_WORLD, MPI_STATUS_IGNORE);

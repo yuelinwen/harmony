@@ -16,12 +16,12 @@
 // everything; ranks 1..N become workers and sit in a receive loop.
 
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+    MPI_Init(&argc, &argv);   // MPI: every process starts here, mpirun made them
 
     int rank = 0;
     int size = 0;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);   // which process am I -> master or worker
+    MPI_Comm_size(MPI_COMM_WORLD, &size);   // how many of us -> workers is size - 1
 
     // every rank sees the same argv, so they all parse it rather than having
     // the master broadcast the settings
