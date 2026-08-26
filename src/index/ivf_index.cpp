@@ -90,6 +90,9 @@ void IvfIndex::build(const Dataset& base, int nlist, int iterations) {
     }
 }
 
+// Which cluster does this vector belong to: compare against all nlist
+// centroids and keep the nearest. Called only from build(), once per vector
+// per kmeans round, which is where nearly all of the build time goes.
 int IvfIndex::nearestCentroid(const float* v) {
     int best = 0;
     float bestDist = l2DistanceSquared(v, &centroids_[0], dim_);
@@ -103,6 +106,13 @@ int IvfIndex::nearestCentroid(const float* v) {
     return best;
 }
 
+// The nprobe clusters a query should visit, nearest centroid first. This is
+// the only part of the index the distributed search calls: the master runs it
+// per query, then hands the cluster ids to the workers that own them.
+//
+// Cheap -- nlist distance computations, against the millions the workers then
+// do. A TopKHeap is reused here to keep the nprobe smallest, holding cluster
+// ids rather than vector ids.
 std::vector<int> IvfIndex::nearestClusters(const float* query, int nprobe) const {
     TopKHeap clusterHeap(nprobe);
     for (int c = 0; c < nlist_; ++c) {
@@ -118,6 +128,10 @@ std::vector<int> IvfIndex::nearestClusters(const float* query, int nprobe) const
     return out;
 }
 
+// A whole search on one machine: pick the clusters, scan every vector in
+// them, keep the k nearest. No pruning and no partitioning, which is what
+// makes it the reference -- the distributed answer has to match this exactly.
+// Not part of the system itself; run() calls it only to check the result.
 std::vector<Candidate> IvfIndex::search(const Dataset& base, const float* query,
                                         int nprobe, int k) {
     // 1. rank the centroids, keep the nprobe nearest clusters
