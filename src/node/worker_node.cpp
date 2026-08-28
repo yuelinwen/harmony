@@ -57,75 +57,86 @@ void WorkerNode::accumulate(const float* queries, int m, int clusterId,
 #ifndef HARMONY_USE_MKL
     (void)first;   // only the gemm path cares which end of the chain this is
 #endif
+    // A worker is only ever sent clusters its row owns, so not finding one
+    // means the grid and the dispatch disagree. Left unnoticed it would return
+    // whatever the previous worker accumulated -- a plausible-looking but
+    // wrong answer -- so it stops the whole job instead.
+    const ClusterBlock* found = nullptr;
     for (int b = 0; b < (int)blocks_.size(); ++b) {
-        if (blocks_[b].clusterId != clusterId) {
-            continue;
+        if (blocks_[b].clusterId == clusterId) {
+            found = &blocks_[b];
+            break;
         }
-        const ClusterBlock& block = blocks_[b];
-        int n = (int)block.ids.size();
+    }
+    if (found == nullptr) {
+        std::cerr << "worker " << id_ << ": cluster " << clusterId
+                  << " was never sent here" << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    const ClusterBlock& block = *found;
+    int n = (int)block.ids.size();
 
 #ifdef HARMONY_USE_MKL
-        // At the head of the chain nothing can be pruned yet, so the whole
-        // m x n block has to be computed and can go through one gemm.
-        // Expanding ||a-b||^2 into ||a||^2 + ||b||^2 - 2ab makes it a matrix
-        // multiply; the norms were precomputed when the block arrived.
-        //
-        // Later stages skip most candidates, which a dense multiply cannot.
-        if (first && useMkl_ && m > 1) {
-            // MKL: ||q||^2 for each query in the batch
-            std::vector<float> qn(m);
-            for (int q = 0; q < m; ++q) {
-                const float* qv = &queries[(size_t)q * myDim_];
-                qn[q] = cblas_sdot(myDim_, qv, 1, qv, 1);
-            }
-
-            // MKL: one matrix multiply produces all m x n dot products
-            std::vector<float> dot((size_t)m * n);
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        m, n, myDim_, 1.0f,
-                        queries, myDim_, block.data.data(), myDim_,
-                        0.0f, dot.data(), n);
-
-            // OpenMP: turn the dot products into distances, one thread per query
-            #pragma omp parallel for schedule(static)
-            for (int q = 0; q < m; ++q) {
-                float t = thresholds[q];
-                float* row = &sums[(size_t)q * n];
-                const float* d = &dot[(size_t)q * n];
-                for (int v = 0; v < n; ++v) {
-                    row[v] = qn[q] + block.norm[v] - 2.0f * d[v];
-                    if (row[v] > t) {
-                        row[v] = PRUNED;
-                    }
-                }
-            }
-            return;
-        }
-#endif
-
-        // The scalar path, and the only one that can stop early. Iterations
-        // touch different sums entries, so the threads never write the same
-        // memory and no locking is needed (paper Section 5, node-level
-        // parallelism; across nodes the work is already split by MPI).
-        // OpenMP: one thread per query, no locking needed (see above)
-        #pragma omp parallel for schedule(static)
+    // At the head of the chain nothing can be pruned yet, so the whole
+    // m x n block has to be computed and can go through one gemm.
+    // Expanding ||a-b||^2 into ||a||^2 + ||b||^2 - 2ab makes it a matrix
+    // multiply; the norms were precomputed when the block arrived.
+    //
+    // Later stages skip most candidates, which a dense multiply cannot.
+    if (first && useMkl_ && m > 1) {
+        // MKL: ||q||^2 for each query in the batch
+        std::vector<float> qn(m);
         for (int q = 0; q < m; ++q) {
             const float* qv = &queries[(size_t)q * myDim_];
+            qn[q] = cblas_sdot(myDim_, qv, 1, qv, 1);
+        }
+
+        // MKL: one matrix multiply produces all m x n dot products
+        std::vector<float> dot((size_t)m * n);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    m, n, myDim_, 1.0f,
+                    queries, myDim_, block.data.data(), myDim_,
+                    0.0f, dot.data(), n);
+
+        // OpenMP: turn the dot products into distances, one thread per query
+        #pragma omp parallel for schedule(static)
+        for (int q = 0; q < m; ++q) {
             float t = thresholds[q];
             float* row = &sums[(size_t)q * n];
-
+            const float* d = &dot[(size_t)q * n];
             for (int v = 0; v < n; ++v) {
-                if (row[v] >= PRUNED) {
-                    continue;      // an earlier worker already dropped it
-                }
-                row[v] = row[v] + l2DistanceSquared(qv, &block.data[(size_t)v * myDim_],
-                                                    myDim_);
+                row[v] = qn[q] + block.norm[v] - 2.0f * d[v];
                 if (row[v] > t) {
-                    row[v] = PRUNED;   // cannot reach the top-K, stop here
+                    row[v] = PRUNED;
                 }
             }
         }
         return;
+    }
+#endif
+
+    // The scalar path, and the only one that can stop early. Iterations
+    // touch different sums entries, so the threads never write the same
+    // memory and no locking is needed (paper Section 5, node-level
+    // parallelism; across nodes the work is already split by MPI).
+    // OpenMP: one thread per query, no locking needed (see above)
+    #pragma omp parallel for schedule(static)
+    for (int q = 0; q < m; ++q) {
+        const float* qv = &queries[(size_t)q * myDim_];
+        float t = thresholds[q];
+        float* row = &sums[(size_t)q * n];
+
+        for (int v = 0; v < n; ++v) {
+            if (row[v] >= PRUNED) {
+                continue;      // an earlier worker already dropped it
+            }
+            row[v] = row[v] + l2DistanceSquared(qv, &block.data[(size_t)v * myDim_],
+                                                myDim_);
+            if (row[v] > t) {
+                row[v] = PRUNED;   // cannot reach the top-K, stop here
+            }
+        }
     }
 }
 

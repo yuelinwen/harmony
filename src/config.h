@@ -32,6 +32,7 @@ struct Config {
     int prewarm = 500;    // vectors seeding a query's heap, 0 = off (lines 1-5)
     bool pruning = true;  // dimension-level early exit (paper Fig. 10)
     bool mkl = true;      // gemm for the first slice, if MKL was compiled in
+    bool check = true;    // re-run each query on one machine and compare
 
     // cost model, read only when mode is "auto" (paper §4.2.1)
     double commCost = 100.0;  // a transferred byte, in multiply-adds. Hardware.
@@ -68,6 +69,8 @@ inline void printUsage(const char* prog) {
         << "  --prewarm <int>    heap seed size, 0 = off            (500)\n"
         << "  --pruning <0|1>    dimension-level pruning            (1)\n"
         << "  --mkl <0|1>        gemm for the first slice           (1)\n"
+        << "  --check <0|1>      verify against a single machine    (1)\n"
+        << "                     costs more than the search it checks\n"
         << "\n"
         << "cost model, only read when --mode auto\n"
         << "  --commcost <float> a transferred byte, in multiply-adds (100)\n"
@@ -115,6 +118,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.batch = std::atoi(argv[++i]);
         } else if (opt == "--mkl" && hasValue) {
             cfg.mkl = (std::atoi(argv[++i]) != 0);
+        } else if (opt == "--check" && hasValue) {
+            cfg.check = (std::atoi(argv[++i]) != 0);
         } else {
             std::cerr << "bad option: " << opt << std::endl;
             printUsage(argv[0]);
@@ -127,6 +132,14 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
 // Turns --mode into a grid, unless --bvec/--bdim were given. bVec * bDim has
 // to come out equal to the worker count.
 inline bool resolveGrid(Config& cfg, int numWorkers) {
+    // -n 1 留不下 worker，下面每种布局都会除以零。放在这里是因为
+    // master 和 worker 都要经过这个函数。
+    if (numWorkers < 1) {
+        std::cerr << "no workers: -n is workers plus one, so it needs to be "
+                  << "at least 2\n" << std::endl;
+        return false;
+    }
+
     if (cfg.bVec > 0 || cfg.bDim > 0) {
         if (cfg.bVec <= 0) {
             cfg.bVec = (cfg.bDim > 0) ? numWorkers / cfg.bDim : 0;

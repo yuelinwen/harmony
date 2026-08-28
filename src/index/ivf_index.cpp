@@ -40,6 +40,12 @@ void IvfIndex::build(const Dataset& base, int nlist, int iterations) {
     for (int it = 0; it < iterations; ++it) {
 
         // --- 2a. assign step: each vector -> nearest centroid ---
+        //
+        // Nearly all of the build time goes here: n * nlist distance
+        // computations per round. Each vector writes only its own owner[i]
+        // and reads nothing that changes, so the rounds parallelise as they
+        // are.
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < n; ++i) {
             owner[i] = nearestCentroid(base.vec(i));
         }
@@ -82,18 +88,27 @@ void IvfIndex::build(const Dataset& base, int nlist, int iterations) {
     }
 
     // --- 3. final assign -> inverted lists ---
+    //
+    // Two passes: the distances in parallel, then the lists filled in order.
+    // Appending inside the parallel loop would have several threads pushing
+    // onto the same list, and would leave the ids in a different order on
+    // every run.
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; ++i) {
+        owner[i] = nearestCentroid(base.vec(i));
+    }
+
     invlists_.clear();
     invlists_.resize(nlist_);
     for (int i = 0; i < n; ++i) {
-        int c = nearestCentroid(base.vec(i));
-        invlists_[c].push_back(i);
+        invlists_[owner[i]].push_back(i);
     }
 }
 
 // Which cluster does this vector belong to: compare against all nlist
 // centroids and keep the nearest. Called only from build(), once per vector
 // per kmeans round, which is where nearly all of the build time goes.
-int IvfIndex::nearestCentroid(const float* v) {
+int IvfIndex::nearestCentroid(const float* v) const {
     int best = 0;
     float bestDist = l2DistanceSquared(v, &centroids_[0], dim_);
     for (int c = 1; c < nlist_; ++c) {

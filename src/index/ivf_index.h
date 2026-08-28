@@ -61,7 +61,8 @@ private:
     std::vector<std::vector<int>> invlists_;   // invlists_[c] = ids in cluster c
 
     // Returns the id of the centroid nearest to vector v.
-    int nearestCentroid(const float* v);
+    // const because build() calls it from a parallel loop: it must only read.
+    int nearestCentroid(const float* v) const;
 };
 
 }  // namespace harmony

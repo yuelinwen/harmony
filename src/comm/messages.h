@@ -29,6 +29,12 @@ const int TAG_STATS     = 10;  // long[bDim]: survivors per chain position
 // A pruned candidate is marked by setting its running sum to this, rather
 // than carrying a separate alive flag: it is larger than any real squared
 // distance and any threshold, so downstream workers skip it on their own.
+//
+// Two assumptions ride on the value, and both hold for every dataset here:
+//   - a real squared distance never reaches it, or a live candidate would be
+//     read as pruned. Sift1M distances run to about 1e5.
+//   - it is above TopKHeap::worst()'s not-yet-full sentinel (1e30), so a
+//     threshold from an empty heap prunes nothing rather than everything.
 const float PRUNED = 1e38f;
 
 // TAG_JOB carries int[4] = {what, n, startCol, m}. `what` >= 0 is a cluster

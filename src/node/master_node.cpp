@@ -386,7 +386,10 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
         std::vector<int> members;
         std::vector<float> sums;
     };
-    int maxInFlight = bVec_ * bDim_;
+    // One slot per worker is exactly enough -- a row only takes a new batch
+    // once its previous one has all come back. The spare is so the search for
+    // a free slot below cannot spin forever if that accounting ever changes.
+    int maxInFlight = bVec_ * bDim_ + 1;
     std::vector<Slot> slot(maxInFlight);
     std::vector<MPI_Request> req(maxInFlight, MPI_REQUEST_NULL);
 
@@ -400,10 +403,10 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
 
     while (true) {
         for (int r = 0; r < bVec_; ++r) {
-            if (inFlight[r] > 0 || pos[r] >= perRow[r].size()) {
-                continue;
-            }
-            inBatch[r].clear();
+            // Keep taking batches from this row until one of them actually
+            // sends something out, or the row runs out of clusters.
+            while (inFlight[r] == 0 && pos[r] < perRow[r].size()) {
+                inBatch[r].clear();
             for (int p = 0; p < bDim_ && pos[r] + p < perRow[r].size(); ++p) {
                 inBatch[r].push_back(perRow[r][pos[r] + p]);
             }
@@ -450,9 +453,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
             // a row whose whole batch was skipped still has to move on
             if (inFlight[r] == 0) {
                 pos[r] = pos[r] + inBatch[r].size();
-                if (pos[r] < perRow[r].size()) {
-                    r = r - 1;   // retry this row with its next batch
-                }
+            }
             }
         }
 
@@ -579,6 +580,11 @@ int MasterNode::run() {
     int k = cfg_.k;
     int nprobe = cfg_.nprobe;
     int nq = cfg_.nq;
+    if (nq > query_.getN()) {
+        std::cout << "only " << query_.getN() << " queries in the file, running those"
+                  << std::endl;
+        nq = query_.getN();
+    }
     int differing = 0;
     int ties = 0;
 
@@ -602,6 +608,11 @@ int MasterNode::run() {
             int q = start + j;
             recallSum = recallSum + recallAt(q, spread[j], k);
 
+            // 这个参考对照比它检查的搜索还贵（单机、不剪枝），在计时区间之外，
+            // 但跑上千条查询时它就是大部分墙钟时间，所以可以关掉。
+            if (!cfg_.check) {
+                continue;
+            }
             std::vector<Candidate> single = index_.search(base_, query_.vec(q), nprobe, k);
 
             std::vector<int> a;
