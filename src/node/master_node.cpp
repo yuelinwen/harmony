@@ -382,9 +382,10 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
     struct Slot {
         int row;
         int clusterId;
-        int n;
+        int n;       // vectors in the cluster
+        int kSend;   // how many of them the chain tail reports per query
         std::vector<int> members;
-        std::vector<float> sums;
+        std::vector<Candidate> top;   // members.size() rows of kSend
     };
     // One slot per worker is exactly enough -- a row only takes a new batch
     // once its previous one has all come back. The spare is so the search for
@@ -436,16 +437,21 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
                     free = (free + 1) % maxInFlight;
                 }
                 int n = (int)index_.clusterIds(c).size();
+                int kSend = (cfg_.k < n) ? cfg_.k : n;
                 slot[free].row = r;
                 slot[free].clusterId = c;
                 slot[free].n = n;
+                slot[free].kSend = kSend;
                 slot[free].members = members;
-                slot[free].sums.resize((size_t)members.size() * n);
+                slot[free].top.resize((size_t)members.size() * kSend);
 
                 // MPI: non-blocking, so the next cluster can be dispatched
-                // without waiting for this one. lastRankOf is who ends the chain.
-                MPI_Irecv(slot[free].sums.data(), (int)slot[free].sums.size(),
-                          MPI_FLOAT, lastRankOf(r, p), TAG_SUMS,
+                // without waiting for this one. lastRankOf is who ends the
+                // chain; it sends back the k nearest per query rather than
+                // every running total, which is m*k instead of m*n floats.
+                MPI_Irecv(slot[free].top.data(),
+                          (int)(slot[free].top.size() * sizeof(Candidate)),
+                          MPI_BYTE, lastRankOf(r, p), TAG_TOPK,
                           MPI_COMM_WORLD, &req[free]);
                 inFlight[r] = inFlight[r] + 1;
             }
@@ -470,17 +476,28 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
 
         for (int j = 0; j < (int)s.members.size(); ++j) {
             int q = s.members[j];
-            const float* row = &s.sums[(size_t)j * s.n];
+            const Candidate* top = &s.top[(size_t)j * s.kSend];
 
             // prewarm already pushed the leading ids of this query's first
             // cluster with their real distances; pushing them again would
-            // duplicate them in the heap
+            // duplicate them in the heap. The tail reports positions within
+            // the cluster, so the same test still applies.
+            //
+            // Dropping one here can leave fewer than kSend from this cluster,
+            // which is still the right answer: anything the tail left out has
+            // kSend better candidates ahead of it, and those are either in
+            // this list or were pushed by prewarm.
             int skip = (s.clusterId == batch[q].prewarmCluster) ? batch[q].prewarmed : 0;
 
-            for (int v = skip; v < s.n; ++v) {
-                if (row[v] < PRUNED) {
-                    heaps[q].push(ids[v], row[v]);
+            for (int t = 0; t < s.kSend; ++t) {
+                if (top[t].dist >= PRUNED) {
+                    break;   // the tail pads its unused slots, nearest first
                 }
+                int v = top[t].id;
+                if (v < skip || v >= s.n) {
+                    continue;
+                }
+                heaps[q].push(ids[v], top[t].dist);
             }
         }
 

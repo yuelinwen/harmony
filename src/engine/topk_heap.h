@@ -18,6 +18,11 @@ struct Candidate {
     float dist;
 };
 
+// A Candidate travels between machines as raw bytes (TAG_TOPK), which needs
+// it to be exactly these two 4-byte fields with no padding. Every rank is the
+// same build on the same architecture, so that is all this has to hold.
+static_assert(sizeof(Candidate) == 8, "Candidate must pack into 8 bytes");
+
 // Comparison for the priority_queue: largest dist ends up on top.
 struct CandidateLess {
     bool operator()(const Candidate& a, const Candidate& b) const {

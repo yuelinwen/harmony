@@ -25,6 +25,19 @@ const int TAG_QIDX      = 9;   // int[m]: which queries of the batch take part
 const int TAG_THRESHOLD = 7;   // float[m]: tau^2 for each of them
 const int TAG_SUMS      = 8;   // float[m * n]: running partial distances
 const int TAG_STATS     = 10;  // long[bDim]: survivors per chain position
+const int TAG_TOPK      = 11;  // Candidate[m * kSend]: the chain tail's answer
+
+// TAG_SUMS carries running totals from one worker to the next, one float per
+// candidate, because the next worker needs every candidate's total to add to.
+// The last worker in the chain is the only one that ever sees a full distance,
+// so it does not forward totals at all: it keeps the k nearest per query and
+// sends those as TAG_TOPK (paper §4.3, only the last reports back). k is
+// around 100 against a cluster's few thousand vectors, which is why this is
+// the hop worth shrinking.
+//
+// The ids in TAG_TOPK are positions within the cluster, not global vector
+// ids -- the master maps them back, and that lets it apply the same prewarm
+// de-duplication it did when it received raw totals.
 
 // A pruned candidate is marked by setting its running sum to this, rather
 // than carrying a separate alive flag: it is larger than any real squared

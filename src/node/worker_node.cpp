@@ -214,7 +214,8 @@ int WorkerNode::run() {
     // An outgoing buffer must stay untouched until its send completes, and
     // sums is reused by the next job, so sends go out of a rotating pool.
     int slots = bDim_ + 1;
-    std::vector<std::vector<float>> outSums(slots);
+    std::vector<std::vector<float>> outSums(slots);       // mid-chain: totals
+    std::vector<std::vector<Candidate>> outTop(slots);    // chain tail: top-k
     std::vector<MPI_Request> reqSums(slots, MPI_REQUEST_NULL);
     int slot = 0;
 
@@ -286,9 +287,50 @@ int WorkerNode::run() {
         // reclaim this slot before overwriting it
         MPI_Wait(&reqSums[slot], MPI_STATUS_IGNORE);
 
-        outSums[slot] = sums;
-        MPI_Isend(outSums[slot].data(), (int)total, MPI_FLOAT, nextRank, TAG_SUMS,
-                  MPI_COMM_WORLD, &reqSums[slot]);
+        if (isLast) {
+            // End of the chain. This is the only worker that ever sees these
+            // candidates' full distances, so it can pick the k nearest itself
+            // and send just those, instead of handing every running total back
+            // for the master to sift (paper §4.3). k is around a hundred
+            // against a cluster's few thousand vectors.
+            //
+            // The ids kept are positions in the cluster, which is what lets
+            // the master map them back and still drop the ones prewarm
+            // already pushed.
+            int kSend = (k_ < n) ? k_ : n;
+            Candidate pad;
+            pad.id = -1;
+            pad.dist = PRUNED;          // a query with fewer than kSend
+            outTop[slot].assign((size_t)m * kSend, pad);   // survivors pads
+
+            // OpenMP: one thread per query, each writing its own row
+            #pragma omp parallel for schedule(static)
+            for (int q = 0; q < m; ++q) {
+                TopKHeap heap(kSend);
+                const float* row = &sums[(size_t)q * n];
+                for (int v = 0; v < n; ++v) {
+                    if (row[v] < PRUNED) {
+                        heap.push(v, row[v]);
+                    }
+                }
+
+                std::vector<Candidate> best = heap.results();   // nearest first
+                Candidate* out = &outTop[slot][(size_t)q * kSend];
+                for (int j = 0; j < (int)best.size(); ++j) {
+                    out[j] = best[j];
+                }
+            }
+
+            // MPI: as bytes, since a Candidate is an int beside a float and
+            // every rank is the same build (see topk_heap.h).
+            MPI_Isend(outTop[slot].data(),
+                      (int)((size_t)m * kSend * sizeof(Candidate)), MPI_BYTE,
+                      MASTER_RANK, TAG_TOPK, MPI_COMM_WORLD, &reqSums[slot]);
+        } else {
+            outSums[slot] = sums;
+            MPI_Isend(outSums[slot].data(), (int)total, MPI_FLOAT, nextRank, TAG_SUMS,
+                      MPI_COMM_WORLD, &reqSums[slot]);
+        }
         slot = (slot + 1) % slots;
     }
 

@@ -6,6 +6,7 @@
 
 #include "node.h"
 #include "../config.h"
+#include "../engine/topk_heap.h"
 
 // WorkerNode (rank >= 1): where essentially all the arithmetic happens. It
 // owns no plan and makes no decisions -- the master sends only the slice, so a
@@ -36,6 +37,7 @@ public:
         myCol_ = 0;
         rowBase_ = id;
         batch_ = 1;
+        k_ = cfg.k;
         useMkl_ = false;
     }
     ~WorkerNode() override = default;
@@ -77,6 +79,7 @@ private:
     int myCol_;     // which of them this one is
     int rowBase_;   // rank of column 0 in this row
     int batch_;     // queries the master sends slices for
+    int k_;         // neighbours to keep when this worker ends a chain
     bool useMkl_;   // gemm path enabled (and compiled in)
 
     // Survivors by position in the chain, not by worker: rotation makes a
