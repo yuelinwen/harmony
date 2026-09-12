@@ -17,9 +17,10 @@ struct Config {
     int iters = 10;                  // kmeans rounds
 
     // worker layout: a bVec x bDim grid (paper Fig. 4a)
-    std::string mode = "harmony";    // harmony | vector | dimension | auto
+    std::string mode = "harmony";    // harmony | vector | dimension (paper §5)
     int bVec = 0;                    // vector partitions, overrides mode
     int bDim = 0;                    // dimension slices, overrides mode
+    bool costModel = false;          // set by resolveGrid, not by a flag
 
     // the search
     int nprobe = 32;   // clusters visited per query: recall against speed
@@ -34,7 +35,7 @@ struct Config {
     bool mkl = true;      // gemm for the first slice, if MKL was compiled in
     bool check = true;    // re-run each query on one machine and compare
 
-    // cost model, read only when mode is "auto" (paper §4.2.1)
+    // cost model, read only when mode is "harmony" (paper §4.2.1)
     double commCost = 100.0;  // a transferred byte, in multiply-adds. Hardware.
     double alpha = 0.3;       // weight on the imbalance term of C(pi,Q)
     int warmup = 1000;        // queries profiled to find the hot clusters
@@ -50,11 +51,10 @@ inline void printUsage(const char* prog) {
         << "  --iters <int>      kmeans rounds                      (10)\n"
         << "\n"
         << "how the workers are laid out\n"
-        << "  --mode <name>      vector | dimension | harmony | auto (harmony)\n"
+        << "  --mode <name>      harmony | vector | dimension       (harmony)\n"
+        << "                       harmony   = the cost model picks the grid\n"
         << "                       vector    = N x 1, no dimension pipeline\n"
         << "                       dimension = 1 x N, no vector partitions\n"
-        << "                       harmony   = the most square split of N\n"
-        << "                       auto      = let the cost model decide\n"
         << "  --bvec <int>       vector partitions, overrides --mode\n"
         << "  --bdim <int>       dimension slices,  overrides --mode\n"
         << "\n"
@@ -153,17 +153,13 @@ inline bool resolveGrid(Config& cfg, int numWorkers) {
     } else if (cfg.mode == "dimension") {
         cfg.bVec = 1;
         cfg.bDim = numWorkers;
-    } else if (cfg.mode == "auto") {
-        cfg.bVec = 1;          // provisional; choosePlan() replaces it
+    } else if (cfg.mode == "harmony" || cfg.mode == "auto") {   // "auto": old name
+        // The paper's Harmony is the cost-model-driven mode (§5). Start where
+        // §4.2.1 says to -- every machine holding d/N dimensions, so
+        // bVec = 1 -- and let choosePlan() raise bVec from there.
+        cfg.bVec = 1;
         cfg.bDim = numWorkers;
-    } else if (cfg.mode == "harmony") {
-        cfg.bDim = 1;
-        for (int d = 1; d * d <= numWorkers; ++d) {
-            if (numWorkers % d == 0) {
-                cfg.bDim = d;
-            }
-        }
-        cfg.bVec = numWorkers / cfg.bDim;
+        cfg.costModel = true;
     } else {
         std::cerr << "unknown mode: " << cfg.mode << std::endl;
         return false;

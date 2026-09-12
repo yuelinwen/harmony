@@ -582,7 +582,7 @@ int MasterNode::run() {
 
     // The layout has to be settled before any data moves, so the cost model
     // runs on a profiling pass first (paper Fig. 3, step 1).
-    if (cfg_.mode == "auto") {
+    if (cfg_.costModel) {
         warmupPlan(cfg_.warmup, cfg_.nprobe);
         choosePlan();
     }
