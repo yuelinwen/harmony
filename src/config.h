@@ -14,7 +14,8 @@ struct Config {
     // data and index
     std::string data = "Data/sift";  // prefix of _base.bin, _query.bin, _gt.bin
     int nlist = 256;                 // clusters kmeans builds
-    int iters = 10;                  // kmeans rounds
+    int iters = 25;                  // kmeans rounds
+    int trainPoints = 256;           // kmeans training points per centroid, 0 = all
 
     // worker layout: a bVec x bDim grid (paper Fig. 4a)
     std::string mode = "harmony";    // harmony | vector | dimension (paper §5)
@@ -49,7 +50,9 @@ inline void printUsage(const char* prog) {
         << "data and index\n"
         << "  --data <prefix>    reads <prefix>_base/_query/_gt.bin (Data/sift)\n"
         << "  --nlist <int>      clusters in the index              (256)\n"
-        << "  --iters <int>      kmeans rounds                      (10)\n"
+        << "  --iters <int>      kmeans rounds                      (25)\n"
+        << "  --trainpoints <int>  kmeans training points per centroid (256)\n"
+        << "                     0 uses every base vector, which is much slower\n"
         << "\n"
         << "how the workers are laid out\n"
         << "  --mode <name>      harmony | vector | dimension       (harmony)\n"
@@ -93,6 +96,11 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.nlist = std::atoi(argv[++i]);
         } else if (opt == "--iters" && hasValue) {
             cfg.iters = std::atoi(argv[++i]);
+        } else if (opt == "--trainpoints" && hasValue) {
+            cfg.trainPoints = std::atoi(argv[++i]);
+            if (cfg.trainPoints < 0) {
+                cfg.trainPoints = 0;
+            }
         } else if (opt == "--mode" && hasValue) {
             cfg.mode = argv[++i];
         } else if (opt == "--bvec" && hasValue) {

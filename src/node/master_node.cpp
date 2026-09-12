@@ -82,7 +82,7 @@ void MasterNode::buildIndex(int nlist, int iterations) {
     std::cout << "building index (nlist=" << nlist << ")" << std::endl;
 
     auto t0 = std::chrono::steady_clock::now();
-    index_.build(base_, nlist, iterations);
+    index_.build(base_, nlist, iterations, cfg_.trainPoints);
     auto t1 = std::chrono::steady_clock::now();
 
     std::cout << "build time: "

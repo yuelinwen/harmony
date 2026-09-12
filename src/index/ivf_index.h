@@ -30,7 +30,8 @@ public:
 
     // Clusters the base vectors into nlist groups.
     // iterations = number of kmeans rounds (10 is usually enough).
-    void build(const Dataset& base, int nlist, int iterations);
+    void build(const Dataset& base, int nlist, int iterations,
+               int perCentroid);
 
     // Returns the k nearest neighbors of one query vector, scanning only
     // the nprobe nearest clusters.

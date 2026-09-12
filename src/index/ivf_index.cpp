@@ -10,11 +10,18 @@ namespace harmony {
 // build: plain kmeans, then fill the inverted lists.
 //
 //   1. pick nlist random base vectors as the initial centroids
-//   2. repeat `iterations` times:
+//   2. repeat `iterations` times, over a sample of the data:
 //        assign: every vector joins its nearest centroid
 //        update: every centroid moves to the mean of its members
-//   3. final assign -> invlists_
-void IvfIndex::build(const Dataset& base, int nlist, int iterations) {
+//   3. final assign, over all of it -> invlists_
+//
+// perCentroid caps the training sample at nlist * perCentroid vectors, 0 for
+// no cap. Step 2 only has to locate the centroids, and a sample locates them
+// about as well as the whole set does -- this is faiss's
+// max_points_per_centroid, which the authors' code keeps at 256. Step 3 is
+// not sampled: every vector has to end up in a list.
+void IvfIndex::build(const Dataset& base, int nlist, int iterations,
+                     int perCentroid) {
     nlist_ = nlist;
     dim_ = base.getDim();
     int n = base.getN();
@@ -30,8 +37,29 @@ void IvfIndex::build(const Dataset& base, int nlist, int iterations) {
         }
     }
 
-    // assignment of every base vector, reused across iterations
-    std::vector<int> owner(n);
+    // Which vectors the rounds below train on: all of them, or a sample.
+    // Drawn by shuffling once and taking a prefix, so a vector cannot be
+    // picked twice, and off the same seed so a run is reproducible.
+    std::vector<int> train(n);
+    for (int i = 0; i < n; ++i) {
+        train[i] = i;
+    }
+    long cap = (long)nlist_ * perCentroid;
+    if (perCentroid > 0 && cap < n) {
+        for (int i = n - 1; i > 0; --i) {
+            int j = std::rand() % (i + 1);
+            int t = train[i];
+            train[i] = train[j];
+            train[j] = t;
+        }
+        train.resize((size_t)cap);
+        std::cout << "kmeans trains on " << train.size() << " of " << n
+                  << " vectors" << std::endl;
+    }
+    int nt = (int)train.size();
+
+    // assignment of every training vector, reused across iterations
+    std::vector<int> owner(nt);
 
     // scratch space for recomputing centroids
     std::vector<double> sum((size_t)nlist_ * dim_);   // double: avoids float rounding
@@ -46,8 +74,8 @@ void IvfIndex::build(const Dataset& base, int nlist, int iterations) {
         // and reads nothing that changes, so the rounds parallelise as they
         // are.
         #pragma omp parallel for schedule(static)
-        for (int i = 0; i < n; ++i) {
-            owner[i] = nearestCentroid(base.vec(i));
+        for (int i = 0; i < nt; ++i) {
+            owner[i] = nearestCentroid(base.vec(train[i]));
         }
 
         // --- 2b. update step: centroid = mean of its members ---
@@ -58,9 +86,9 @@ void IvfIndex::build(const Dataset& base, int nlist, int iterations) {
             count[c] = 0;
         }
 
-        for (int i = 0; i < n; ++i) {
+        for (int i = 0; i < nt; ++i) {
             int c = owner[i];
-            const float* v = base.vec(i);
+            const float* v = base.vec(train[i]);
             for (int j = 0; j < dim_; ++j) {
                 sum[(size_t)c * dim_ + j] += v[j];
             }
@@ -93,6 +121,8 @@ void IvfIndex::build(const Dataset& base, int nlist, int iterations) {
     // Appending inside the parallel loop would have several threads pushing
     // onto the same list, and would leave the ids in a different order on
     // every run.
+    // Every vector, not the sample: the lists have to hold the whole dataset.
+    owner.assign(n, 0);
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < n; ++i) {
         owner[i] = nearestCentroid(base.vec(i));
