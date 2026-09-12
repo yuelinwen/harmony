@@ -157,6 +157,16 @@ void WorkerNode::receiveSetup() {
     rowBase_ = id_ - myCol_;
     aliveAtStage_.assign(bDim_, 0);
 
+    // The chain table, built by the master and handed over row by row. A
+    // worker never builds it itself: only the master can change it, which is
+    // what any load-aware reordering would need.
+    std::vector<int> table(3 * bDim_);
+    MPI_Recv(table.data(), 3 * bDim_, MPI_INT, MASTER_RANK, TAG_ORDER,
+             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    nextOf_.assign(table.begin(), table.begin() + bDim_);
+    prevOf_.assign(table.begin() + bDim_, table.begin() + 2 * bDim_);
+    stageOf_.assign(table.begin() + 2 * bDim_, table.end());
+
     for (int c = 0; c < nClusters; ++c) {
         int header[2];
         MPI_Recv(header, 2, MPI_INT, MASTER_RANK, TAG_CLUSTER,
@@ -272,17 +282,19 @@ int WorkerNode::run() {
 
         int clusterId = job[0];
         int n = job[1];
-        int startCol = job[2];
+        int item = job[2];
         int m = job[3];
 
-        // This cluster's chain runs startCol, startCol+1, ... around the row.
-        // Where this worker sits in that chain decides everything.
-        int stage = (myCol_ - startCol + bDim_) % bDim_;   // 0 = first stop
-        bool isFirst = (stage == 0);
-        bool isLast = (myCol_ == (startCol + bDim_ - 1) % bDim_);
-        int prevRank = rowBase_ + (myCol_ - 1 + bDim_) % bDim_;
-        int nextRank = isLast ? MASTER_RANK
-                              : rowBase_ + (myCol_ + 1) % bDim_;
+        // Everything about this worker's part in the chain comes out of the
+        // table: which item it is decides where the chain starts, and the
+        // table says who is on either side.
+        int prevCol = prevOf_[item];
+        int nextCol = nextOf_[item];
+        int stage = stageOf_[item];        // 0 = first stop
+        bool isFirst = (prevCol < 0);
+        bool isLast = (nextCol < 0);
+        int prevRank = isFirst ? MASTER_RANK : rowBase_ + prevCol;
+        int nextRank = isLast ? MASTER_RANK : rowBase_ + nextCol;
 
         qidx.resize(m);
         MPI_Recv(qidx.data(), m, MPI_INT, MASTER_RANK, TAG_QIDX,

@@ -6,6 +6,7 @@
 
 #include "node.h"
 #include "../config.h"
+#include "../engine/search_order.h"
 #include "../engine/stopwatch.h"
 #include "../engine/topk_heap.h"
 
@@ -84,6 +85,14 @@ private:
     int myDim_;
     int bDim_;      // how many workers share this row
     int myCol_;     // which of them this one is
+
+    // This worker's rows of the chain table (engine/search_order.h), given by
+    // the master at setup: for each item, who it takes the partial sums from,
+    // who it passes them to (-1 for the ends of the chain), and how far along
+    // the chain it sits.
+    std::vector<int> nextOf_;
+    std::vector<int> prevOf_;
+    std::vector<int> stageOf_;
     int rowBase_;   // rank of column 0 in this row
     int batch_;     // queries the master sends slices for
     int k_;         // neighbours to keep when this worker ends a chain

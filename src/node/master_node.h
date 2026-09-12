@@ -7,6 +7,7 @@
 #include "node.h"
 #include "../config.h"
 #include "../comm/messages.h"
+#include "../engine/search_order.h"
 #include "../engine/slice_plan.h"
 #include "../index/dataset.h"
 #include "../index/ivf_index.h"
@@ -98,12 +99,12 @@ public:
     // Algorithm 1, lines 6-12. Sends one cluster to every worker in its row
     // and returns; the workers pass the running totals down the chain and only
     // the last reports back. `members` are the batch positions that probed it.
-    void dispatchOne(int row, int clusterId, int startCol,
+    void dispatchOne(int row, int clusterId, int item,
                      const std::vector<int>& members,
                      const std::vector<float>& thresholds);
 
-    // Which worker reports the result of a cluster that started at startCol.
-    int lastRankOf(int row, int startCol) const;
+    // Which worker ends this item's chain, and so reports its result.
+    int lastRankOf(int row, int item) const;
 
     // ---- cost model, paper Section 4.2.1 ----
 
@@ -150,6 +151,13 @@ private:
     long scanned_;                      // candidates offered in total
     std::vector<long> scannedRow_;      // per vector partition
     std::vector<long> aliveAfterStage_;  // still alive after the s-th slice
+
+    // Who passes what to whom, at both levels (engine/search_order.h).
+    // chainOrder_ runs a cluster across the columns of a row, groupOrder_ runs
+    // a query group across the vector partitions. Both are built in
+    // splitGrid(); chainOrder_ is also shipped to the workers.
+    SearchOrder chainOrder_;
+    SearchOrder groupOrder_;
 
     // [total, idle, recv, compute, send, jobs] per worker, filled by shutdown()
     std::vector<std::vector<double>> workerTimes_;

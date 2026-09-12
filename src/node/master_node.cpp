@@ -216,6 +216,8 @@ void MasterNode::splitGrid(int bVec, int bDim) {
     bVec_ = bVec;
     bDim_ = bDim;
     plan_ = SlicePlan{base_.getDim(), bDim};
+    chainOrder_ = SearchOrder(bDim_, bDim_, true);
+    groupOrder_ = SearchOrder(bVec_, bVec_, true);
 
     int nlist = index_.getNlist();
     clusterOwner_.resize(nlist);
@@ -267,6 +269,26 @@ void MasterNode::distributeData() {
         setup[3] = cfg_.batch;
         // MPI: blocking is fine for startup -- the order is fixed and nobody waits
         MPI_Send(setup, 4, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
+
+        // This column's rows of the chain table: next, prev, stage.
+        std::vector<int> table;
+        table.insert(table.end(), chainOrder_.nextRow(col).begin(),
+                     chainOrder_.nextRow(col).end());
+        table.insert(table.end(), chainOrder_.prevRow(col).begin(),
+                     chainOrder_.prevRow(col).end());
+        for (int item = 0; item < bDim_; ++item) {
+            const std::vector<int>& chain = chainOrder_.chain(item);
+            int stage = 0;
+            for (int p = 0; p < (int)chain.size(); ++p) {
+                if (chain[p] == col) {
+                    stage = p;
+                    break;
+                }
+            }
+            table.push_back(stage);
+        }
+        MPI_Send(table.data(), (int)table.size(), MPI_INT, w, TAG_ORDER,
+                 MPI_COMM_WORLD);
     }
 
     for (int c = 0; c < index_.getNlist(); ++c) {
@@ -391,7 +413,7 @@ int MasterNode::prewarmHeap(const float* query, int clusterId, int count, TopKHe
 //
 // Only the queries in `members` travel with the job, so a cluster wanted by
 // three of thirty-two costs three rows of running totals, not thirty-two.
-void MasterNode::dispatchOne(int row, int clusterId, int startCol,
+void MasterNode::dispatchOne(int row, int clusterId, int item,
                              const std::vector<int>& members,
                              const std::vector<float>& thresholds) {
     int n = (int)index_.clusterIds(clusterId).size();
@@ -401,17 +423,17 @@ void MasterNode::dispatchOne(int row, int clusterId, int startCol,
         int w = row * bDim_ + col + 1;
         // MPI: three small messages per worker -- the job, who wants it, and
         // their thresholds
-        int job[4] = {clusterId, n, startCol, m};
+        int job[4] = {clusterId, n, item, m};
         MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
         MPI_Send(members.data(), m, MPI_INT, w, TAG_QIDX, MPI_COMM_WORLD);
         MPI_Send(thresholds.data(), m, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
     }
 }
 
-int MasterNode::lastRankOf(int row, int startCol) const {
-    // the chain ends one step before it began, going round the row
-    int lastCol = (startCol + bDim_ - 1) % bDim_;
-    return row * bDim_ + lastCol + 1;
+int MasterNode::lastRankOf(int row, int item) const {
+    // whoever the table puts at the end of this item's chain
+    const std::vector<int>& chain = chainOrder_.chain(item);
+    return row * bDim_ + chain[chain.size() - 1] + 1;
 }
 
 // Three levels of overlap, which multiply out to one busy worker per machine:
@@ -459,7 +481,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<std::vector<int>>>
             // Keep taking chunks until one of them actually sends something
             // out, or the group has been through every partition.
             while (inFlight[g] == 0 && stage[g] < bVec_) {
-                int r = (g + stage[g]) % bVec_;
+                int r = groupOrder_.chain(g)[stage[g]];
                 const std::vector<int>& list = work[g][r];
 
                 // done with this partition: its distances are in the heaps, so

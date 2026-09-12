@@ -17,6 +17,9 @@ const int TAG_SETUP   = 1;   // int[3]: myDim, nClusters (this row), bDim
 const int TAG_CLUSTER = 2;   // int[2]: clusterId, nIds
 const int TAG_IDS     = 3;   // int[nIds]
 const int TAG_DATA    = 4;   // float[nIds * myDim]
+const int TAG_ORDER   = 13;  // int[3 * bDim]: this worker's rows of the
+                             // chain table -- next, prev, stage -- one entry
+                             // per item. See engine/search_order.h.
 
 // per batch of queries
 const int TAG_JOB       = 5;   // int[4], see below
@@ -51,13 +54,14 @@ const int TAG_TIMES     = 12;  // double[6]: where a worker's wall time went
 //     threshold from an empty heap prunes nothing rather than everything.
 const float PRUNED = 1e38f;
 
-// TAG_JOB carries int[4] = {what, n, startCol, m}. `what` >= 0 is a cluster
-// id, n is how many vectors it holds, and m is how many queries of the batch
-// probed it -- usually only part of the batch, so TAG_QIDX names which.
+// TAG_JOB carries int[4] = {what, n, item, m}. `what` >= 0 is a cluster id, n
+// is how many vectors it holds, and m is how many queries of the batch probed
+// it -- usually only part of the batch, so TAG_QIDX names which.
 //
-// startCol is where this cluster's chain begins in the row. Clusters start at
-// different columns so no worker is always the first stop, which is the one
-// that can prune nothing (paper §4.3).
+// `item` is this cluster's position in the chunk its row is working on, and
+// picks a row out of the chain table the worker was given at setup. Different
+// items run the row in different orders, so no worker is always the first
+// stop, which is the one that can prune nothing (paper §4.3).
 const int JOB_QUERY    = -1;   // the batch's query slices follow
 const int JOB_SHUTDOWN = -2;   // stop, report stats, exit
 // Zero the pruning counters. With --loop the query set is run several times;
