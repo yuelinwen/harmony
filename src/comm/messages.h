@@ -26,6 +26,7 @@ const int TAG_THRESHOLD = 7;   // float[m]: tau^2 for each of them
 const int TAG_SUMS      = 8;   // float[m * n]: running partial distances
 const int TAG_STATS     = 10;  // long[bDim]: survivors per chain position
 const int TAG_TOPK      = 11;  // Candidate[m * kSend]: the chain tail's answer
+const int TAG_TIMES     = 12;  // double[6]: where a worker's wall time went
 
 // TAG_SUMS carries running totals from one worker to the next, one float per
 // candidate, because the next worker needs every candidate's total to add to.
@@ -59,6 +60,10 @@ const float PRUNED = 1e38f;
 // that can prune nothing (paper §4.3).
 const int JOB_QUERY    = -1;   // the batch's query slices follow
 const int JOB_SHUTDOWN = -2;   // stop, report stats, exit
+// Zero the pruning counters. With --loop the query set is run several times;
+// only the last pass is counted, so the earlier ones have to be forgotten or
+// the survivor counts would not match the candidates the master saw.
+const int JOB_RESET    = -3;
 
 }  // namespace harmony
 

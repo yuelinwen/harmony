@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
+#include <string>
 
 #include <mpi.h>
 
@@ -307,12 +309,57 @@ void MasterNode::shutdown() {
 
     // every worker reports its counts per chain position; sum them up
     std::vector<long> perWorker(bDim_);
+    workerTimes_.assign(numWorkers_, std::vector<double>(6, 0.0));
     for (int w = 1; w <= numWorkers_; ++w) {
         MPI_Recv(perWorker.data(), bDim_, MPI_LONG, w, TAG_STATS,
                  MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         for (int s = 0; s < bDim_; ++s) {
             aliveAfterStage_[s] = aliveAfterStage_[s] + perWorker[s];
         }
+        MPI_Recv(workerTimes_[w - 1].data(), 6, MPI_DOUBLE, w, TAG_TIMES,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+}
+
+// One row per worker: how much of its run went to computing, and how much to
+// waiting for somebody else. A worker that is mostly idle is being starved by
+// the master; mostly in recv means its upstream is the slow one (paper
+// Fig. 9).
+void MasterNode::printWorkerTimes() const {
+    if (workerTimes_.empty()) {
+        return;
+    }
+
+    std::cout << "\n===== where each worker's time went =====" << std::endl;
+    if (cfg_.check) {
+        std::cout << "  (--check is on: idle also covers the reference pass"
+                  << " the master runs between batches)" << std::endl;
+    }
+    std::cout << "  worker   grid    jobs     total    compute      idle"
+              << "      recv      send" << std::endl;
+
+    for (int w = 1; w <= numWorkers_; ++w) {
+        const std::vector<double>& t = workerTimes_[w - 1];
+        double total = t[0];
+        if (total <= 0.0) {
+            total = 1e-9;
+        }
+
+        std::string grid = std::to_string((w - 1) / bDim_) + "x"
+                         + std::to_string((w - 1) % bDim_);
+        std::cout << "  " << std::setw(6) << w
+                  << std::setw(7) << grid
+                  << std::setw(8) << (long)t[5]
+                  << std::setw(9) << std::fixed << std::setprecision(2)
+                  << t[0] << "s";
+
+        // compute, idle, recv, send -- t[3], t[1], t[2], t[4]
+        int order[4] = {3, 1, 2, 4};
+        for (int i = 0; i < 4; ++i) {
+            std::cout << std::setw(8) << std::setprecision(1)
+                      << (100.0 * t[order[i]] / total) << "%";
+        }
+        std::cout << std::endl;
     }
 }
 
@@ -367,19 +414,22 @@ int MasterNode::lastRankOf(int row, int startCol) const {
     return row * bDim_ + lastCol + 1;
 }
 
-// Two levels of overlap, which multiply out to one busy worker per machine:
-// every row is given work before anything is collected (paper Fig. 5a), and
-// each row keeps up to bDim clusters in flight (Fig. 5b). Rows refill on their
-// own and MPI_Waitany takes whichever comes back first, so a slow row never
-// holds up a fast one.
+// Three levels of overlap, which multiply out to one busy worker per machine:
+// every query group is given work before anything is collected, each group
+// holds one vector partition at a time (Fig. 5a), and within that partition up
+// to bDim clusters are in flight (Fig. 5b). Groups refill on their own and
+// MPI_Waitany takes whichever comes back first, so a slow group never holds up
+// a fast one.
 //
 // Survivors enter their query's heap as soon as the cluster reports, so
 // thresholds keep tightening -- sooner than Algorithm 1 line 18, which prunes
 // strictly more and changes nothing else.
-void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
+void MasterNode::vectorPipeline(const std::vector<std::vector<std::vector<int>>>& work,
+                                const std::vector<std::vector<int>>& groupMembers,
                                 const std::vector<QueryState>& batch,
                                 std::vector<TopKHeap>& heaps) {
     struct Slot {
+        int group;
         int row;
         int clusterId;
         int n;       // vectors in the cluster
@@ -387,79 +437,92 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
         std::vector<int> members;
         std::vector<Candidate> top;   // members.size() rows of kSend
     };
-    // One slot per worker is exactly enough -- a row only takes a new batch
-    // once its previous one has all come back. The spare is so the search for
-    // a free slot below cannot spin forever if that accounting ever changes.
+    // One slot per worker is exactly enough -- a group only takes a new chunk
+    // once its previous one has all come back, and at any stage the groups
+    // hold one row each. The spare is so the search for a free slot below
+    // cannot spin forever if that accounting ever changes.
     int maxInFlight = bVec_ * bDim_ + 1;
     std::vector<Slot> slot(maxInFlight);
     std::vector<MPI_Request> req(maxInFlight, MPI_REQUEST_NULL);
 
-    std::vector<size_t> pos(bVec_, 0);
+    std::vector<int> stage(bVec_, 0);         // which partition group g is on
+    std::vector<size_t> pos(bVec_, 0);        // how far into that partition
     std::vector<int> inFlight(bVec_, 0);
-    std::vector<std::vector<int>> inBatch(bVec_);
+    std::vector<int> chunkSize(bVec_, 0);
     int free = 0;
 
     std::vector<int> members;
     std::vector<float> thresholds;
 
     while (true) {
-        for (int r = 0; r < bVec_; ++r) {
-            // Keep taking batches from this row until one of them actually
-            // sends something out, or the row runs out of clusters.
-            while (inFlight[r] == 0 && pos[r] < perRow[r].size()) {
-                inBatch[r].clear();
-            for (int p = 0; p < bDim_ && pos[r] + p < perRow[r].size(); ++p) {
-                inBatch[r].push_back(perRow[r][pos[r] + p]);
-            }
+        for (int g = 0; g < bVec_; ++g) {
+            // Keep taking chunks until one of them actually sends something
+            // out, or the group has been through every partition.
+            while (inFlight[g] == 0 && stage[g] < bVec_) {
+                int r = (g + stage[g]) % bVec_;
+                const std::vector<int>& list = work[g][r];
 
-            for (int p = 0; p < (int)inBatch[r].size(); ++p) {
-                int c = inBatch[r][p];
-
-                // which queries of this batch actually want this cluster
-                members.clear();
-                thresholds.clear();
-                for (int q = 0; q < (int)batch.size(); ++q) {
-                    const std::vector<int>& cl = batch[q].clusters;
-                    if (std::find(cl.begin(), cl.end(), c) != cl.end()) {
-                        members.push_back(q);
-                        // an infinite threshold means nothing is dropped, the
-                        // no-pruning arm of the ablation (paper Fig. 10)
-                        thresholds.push_back(cfg_.pruning ? heaps[q].worst() : PRUNED);
-                    }
-                }
-                if (members.empty()) {
+                // done with this partition: its distances are in the heaps, so
+                // the next stage starts from a tighter threshold
+                if (pos[g] >= list.size()) {
+                    stage[g] = stage[g] + 1;
+                    pos[g] = 0;
                     continue;
                 }
 
-                dispatchOne(r, c, p, members, thresholds);
+                chunkSize[g] = 0;
+                for (int p = 0; p < bDim_ && pos[g] + p < list.size(); ++p) {
+                    int c = list[pos[g] + p];
+                    chunkSize[g] = chunkSize[g] + 1;
 
-                while (req[free] != MPI_REQUEST_NULL) {
-                    free = (free + 1) % maxInFlight;
+                    // which queries of this group actually want this cluster
+                    members.clear();
+                    thresholds.clear();
+                    for (int j = 0; j < (int)groupMembers[g].size(); ++j) {
+                        int q = groupMembers[g][j];
+                        const std::vector<int>& cl = batch[q].clusters;
+                        if (std::find(cl.begin(), cl.end(), c) != cl.end()) {
+                            members.push_back(q);
+                            // an infinite threshold means nothing is dropped,
+                            // the no-pruning arm of the ablation (Fig. 10)
+                            thresholds.push_back(cfg_.pruning ? heaps[q].worst()
+                                                              : PRUNED);
+                        }
+                    }
+                    if (members.empty()) {
+                        continue;
+                    }
+
+                    dispatchOne(r, c, p, members, thresholds);
+
+                    while (req[free] != MPI_REQUEST_NULL) {
+                        free = (free + 1) % maxInFlight;
+                    }
+                    int n = (int)index_.clusterIds(c).size();
+                    int kSend = (cfg_.k < n) ? cfg_.k : n;
+                    slot[free].group = g;
+                    slot[free].row = r;
+                    slot[free].clusterId = c;
+                    slot[free].n = n;
+                    slot[free].kSend = kSend;
+                    slot[free].members = members;
+                    slot[free].top.resize((size_t)members.size() * kSend);
+
+                    // MPI: non-blocking, so the next cluster can be dispatched
+                    // without waiting for this one. lastRankOf is who ends the
+                    // chain; it sends back the k nearest per query rather than
+                    // every running total, m*k instead of m*n floats.
+                    MPI_Irecv(slot[free].top.data(),
+                              (int)(slot[free].top.size() * sizeof(Candidate)),
+                              MPI_BYTE, lastRankOf(r, p), TAG_TOPK,
+                              MPI_COMM_WORLD, &req[free]);
+                    inFlight[g] = inFlight[g] + 1;
                 }
-                int n = (int)index_.clusterIds(c).size();
-                int kSend = (cfg_.k < n) ? cfg_.k : n;
-                slot[free].row = r;
-                slot[free].clusterId = c;
-                slot[free].n = n;
-                slot[free].kSend = kSend;
-                slot[free].members = members;
-                slot[free].top.resize((size_t)members.size() * kSend);
 
-                // MPI: non-blocking, so the next cluster can be dispatched
-                // without waiting for this one. lastRankOf is who ends the
-                // chain; it sends back the k nearest per query rather than
-                // every running total, which is m*k instead of m*n floats.
-                MPI_Irecv(slot[free].top.data(),
-                          (int)(slot[free].top.size() * sizeof(Candidate)),
-                          MPI_BYTE, lastRankOf(r, p), TAG_TOPK,
-                          MPI_COMM_WORLD, &req[free]);
-                inFlight[r] = inFlight[r] + 1;
-            }
-
-            // a row whose whole batch was skipped still has to move on
-            if (inFlight[r] == 0) {
-                pos[r] = pos[r] + inBatch[r].size();
-            }
+                // a chunk nobody in this group wanted still has to be stepped over
+                if (inFlight[g] == 0) {
+                    pos[g] = pos[g] + chunkSize[g];
+                }
             }
         }
 
@@ -504,9 +567,10 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& perRow,
         scanned_ = scanned_ + (long)s.members.size() * s.n;
         scannedRow_[s.row] = scannedRow_[s.row] + (long)s.members.size() * s.n;
 
-        inFlight[s.row] = inFlight[s.row] - 1;
-        if (inFlight[s.row] == 0) {
-            pos[s.row] = pos[s.row] + inBatch[s.row].size();
+        int g = s.group;
+        inFlight[g] = inFlight[g] - 1;
+        if (inFlight[g] == 0) {
+            pos[g] = pos[g] + chunkSize[g];
         }
     }
 }
@@ -545,23 +609,37 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
                  TAG_QUERY, MPI_COMM_WORLD);
     }
 
-    // Stage I: vector-level pipeline (Algorithm 1 lines 21-23). Group the
-    // probed clusters by the partition that owns them, then run the
-    // partitions. (The paper's filterQueries picks the queries that need a
-    // partition; the same step here collects the clusters of the batch that
-    // live in it.)
-    std::vector<std::vector<int>> perRow(bVec_);
+    // Stage I: vector-level pipeline (Algorithm 1 lines 21-23).
+    //
+    // Fig. 5a splits the batch into as many query groups as there are vector
+    // partitions and walks each group through the partitions one at a time, so
+    // a group's later partitions prune against what its earlier ones found.
+    // The split is contiguous; queries within a batch are interchangeable.
+    std::vector<std::vector<int>> groupMembers(bVec_);
     for (int q = 0; q < count; ++q) {
-        for (int i = 0; i < (int)batch[q].clusters.size(); ++i) {
-            int c = batch[q].clusters[i];
-            std::vector<int>& row = perRow[clusterOwner_[c]];
-            if (std::find(row.begin(), row.end(), c) == row.end()) {
-                row.push_back(c);   // one visit per cluster, whoever wanted it
+        groupMembers[(int)((long)q * bVec_ / count)].push_back(q);
+    }
+
+    // work[g][r]: the clusters of partition r that group g probes. A cluster
+    // wanted by two groups is visited once per group -- the same candidates
+    // against fewer queries each time, so the distance work is unchanged.
+    // Within one visit the queries still share it, which is the QueryBatch.
+    std::vector<std::vector<std::vector<int>>> work(
+        bVec_, std::vector<std::vector<int>>(bVec_));
+    for (int g = 0; g < bVec_; ++g) {
+        for (int j = 0; j < (int)groupMembers[g].size(); ++j) {
+            const QueryState& qs = batch[groupMembers[g][j]];
+            for (int i = 0; i < (int)qs.clusters.size(); ++i) {
+                int c = qs.clusters[i];
+                std::vector<int>& row = work[g][clusterOwner_[c]];
+                if (std::find(row.begin(), row.end(), c) == row.end()) {
+                    row.push_back(c);
+                }
             }
         }
     }
 
-    vectorPipeline(perRow, batch, heaps);
+    vectorPipeline(work, groupMembers, batch, heaps);
 
     std::vector<std::vector<Candidate>> out(count);
     for (int q = 0; q < count; ++q) {
@@ -605,13 +683,40 @@ int MasterNode::run() {
     int differing = 0;
     int ties = 0;
 
-    scanned_ = 0;
-    scannedRow_.assign(bVec_, 0);
-
     // Only the distributed search is timed. index_.search() below is the
     // single-machine reference used to check the answer, not part of the work.
     double seconds = 0.0;
     double recallSum = 0.0;
+
+    // The query set can be run several times and the time averaged, which is
+    // what a throughput number needs -- one pass on a cold cache is not
+    // representative. Above one pass the first is a warm-up and is not timed.
+    // Only the last pass is checked and counted, so the counters below mean
+    // the same whatever --loop is.
+    int passes = (cfg_.loop > 1) ? (cfg_.loop + 1) : 1;
+    if (passes > 1) {
+        std::cout << "\ntiming over " << cfg_.loop
+                  << " passes, after one untimed warm-up" << std::endl;
+    }
+
+    for (int pass = 0; pass < passes; ++pass) {
+    bool warmup = (passes > 1 && pass == 0);
+    bool last = (pass == passes - 1);
+
+    scanned_ = 0;
+    scannedRow_.assign(bVec_, 0);
+    recallSum = 0.0;
+    differing = 0;
+    ties = 0;
+
+    // the workers keep their own counters, so they have to forget the earlier
+    // passes too
+    if (last && passes > 1) {
+        for (int w = 1; w <= numWorkers_; ++w) {
+            int job[4] = {JOB_RESET, 0, 0, 0};
+            MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+        }
+    }
 
     for (int start = 0; start < nq; start += cfg_.batch) {
         int count = (start + cfg_.batch <= nq) ? cfg_.batch : (nq - start);
@@ -619,7 +724,13 @@ int MasterNode::run() {
         auto t0 = std::chrono::steady_clock::now();
         std::vector<std::vector<Candidate>> spread = queryPipeline(start, count, nprobe, k);
         auto t1 = std::chrono::steady_clock::now();
-        seconds = seconds + std::chrono::duration<double>(t1 - t0).count();
+        if (!warmup) {
+            seconds = seconds + std::chrono::duration<double>(t1 - t0).count();
+        }
+
+        if (!last) {
+            continue;   // intermediate passes are only there to be timed
+        }
 
         for (int j = 0; j < count; ++j) {
             int q = start + j;
@@ -658,6 +769,11 @@ int MasterNode::run() {
                 }
             }
         }
+    }
+    }
+
+    if (cfg_.loop > 1) {
+        seconds = seconds / cfg_.loop;
     }
 
     shutdown();   // stop the workers and collect their counters
@@ -716,6 +832,8 @@ int MasterNode::run() {
     }
     std::cout << "distance work vs no pruning: "
               << (100.0 * done / (double)(scanned_ * bDim_)) << "%" << std::endl;
+
+    printWorkerTimes();
 
     return 0;
 }

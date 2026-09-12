@@ -34,6 +34,7 @@ struct Config {
     bool pruning = true;  // dimension-level early exit (paper Fig. 10)
     bool mkl = true;      // gemm for the first slice, if MKL was compiled in
     bool check = true;    // re-run each query on one machine and compare
+    int loop = 1;         // timed passes over the query set, averaged
 
     // cost model, read only when mode is "harmony" (paper §4.2.1)
     double commCost = 100.0;  // a transferred byte, in multiply-adds. Hardware.
@@ -71,8 +72,10 @@ inline void printUsage(const char* prog) {
         << "  --mkl <0|1>        gemm for the first slice           (1)\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
         << "                     costs more than the search it checks\n"
+        << "  --loop <int>       timed passes, averaged               (1)\n"
+        << "                     above 1 adds an untimed warm-up pass\n"
         << "\n"
-        << "cost model, only read when --mode auto\n"
+        << "cost model, only read when --mode harmony\n"
         << "  --commcost <float> a transferred byte, in multiply-adds (100)\n"
         << "  --alpha <float>    weight on the imbalance term        (0.3)\n"
         << "  --warmup <int>     queries used to find hot clusters   (1000)\n";
@@ -118,6 +121,11 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.batch = std::atoi(argv[++i]);
         } else if (opt == "--mkl" && hasValue) {
             cfg.mkl = (std::atoi(argv[++i]) != 0);
+        } else if (opt == "--loop" && hasValue) {
+            cfg.loop = std::atoi(argv[++i]);
+            if (cfg.loop < 1) {
+                cfg.loop = 1;
+            }
         } else if (opt == "--check" && hasValue) {
             cfg.check = (std::atoi(argv[++i]) != 0);
         } else {

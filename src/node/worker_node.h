@@ -6,6 +6,7 @@
 
 #include "node.h"
 #include "../config.h"
+#include "../engine/stopwatch.h"
 #include "../engine/topk_heap.h"
 
 // WorkerNode (rank >= 1): where essentially all the arithmetic happens. It
@@ -39,6 +40,12 @@ public:
         batch_ = 1;
         k_ = cfg.k;
         useMkl_ = false;
+        total_ = 0.0;
+        idle_ = 0.0;
+        recv_ = 0.0;
+        compute_ = 0.0;
+        send_ = 0.0;
+        jobs_ = 0;
     }
     ~WorkerNode() override = default;
 
@@ -81,6 +88,16 @@ private:
     int batch_;     // queries the master sends slices for
     int k_;         // neighbours to keep when this worker ends a chain
     bool useMkl_;   // gemm path enabled (and compiled in)
+
+    // Where the run went, in seconds. Reported at shutdown and printed by the
+    // master as one row per worker (paper Fig. 9). The four add up to a little
+    // less than total_; the remainder is bookkeeping between them.
+    double total_;     // first job to shutdown
+    double idle_;      // blocked waiting for the master to hand over a job
+    double recv_;      // blocked receiving partial sums from upstream
+    double compute_;   // accumulate(), plus the top-k pick at a chain tail
+    double send_;      // blocked reclaiming a send slot
+    long jobs_;        // clusters served
 
     // Survivors by position in the chain, not by worker: rotation makes a
     // worker the first stop for some clusters and the last for others.

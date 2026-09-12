@@ -59,6 +59,9 @@ public:
     // Tells the workers to stop, and collects their pruning counters.
     void shutdown();
 
+    // Prints the per-worker time breakdown gathered by shutdown().
+    void printWorkerTimes() const;
+
     // What one query of the current batch needs.
     struct QueryState {
         int id;                       // row in query_
@@ -80,8 +83,15 @@ public:
 
     // Algorithm 1, lines 13-18. Runs the clusters of every vector partition
     // through the dimension pipeline and pushes the survivors into the heaps.
-    // All rows are driven at once, as in Fig. 5a.
-    void vectorPipeline(const std::vector<std::vector<int>>& perRow,
+    //
+    // work[g][r] holds the clusters of vector partition r that query group g
+    // probes. Group g visits the partitions in the order r = (g + stage) %
+    // bVec, one stage at a time, so by the time it reaches its second
+    // partition its heaps already carry the first one's distances (Fig. 5a).
+    // Groups advance independently -- at any stage the mapping group -> row is
+    // a permutation, so every row stays busy.
+    void vectorPipeline(const std::vector<std::vector<std::vector<int>>>& work,
+                        const std::vector<std::vector<int>>& groupMembers,
                         const std::vector<QueryState>& batch,
                         std::vector<TopKHeap>& heaps);
 
@@ -139,7 +149,10 @@ private:
     // by worker, since rotation moves each worker between the two.
     long scanned_;                      // candidates offered in total
     std::vector<long> scannedRow_;      // per vector partition
-    std::vector<long> aliveAfterStage_; // still alive after the s-th slice
+    std::vector<long> aliveAfterStage_;  // still alive after the s-th slice
+
+    // [total, idle, recv, compute, send, jobs] per worker, filled by shutdown()
+    std::vector<std::vector<double>> workerTimes_;
 };
 
 }  // namespace harmony

@@ -13,6 +13,7 @@
 #endif
 
 #include "../comm/messages.h"
+#include "../engine/stopwatch.h"
 #include "../index/distance.h"
 
 namespace harmony {
@@ -219,23 +220,53 @@ int WorkerNode::run() {
     std::vector<MPI_Request> reqSums(slots, MPI_REQUEST_NULL);
     int slot = 0;
 
+    // The clock starts at the first job, not at setup: loading the index is
+    // measured separately and would otherwise swamp everything.
+    Stopwatch run;
+    Stopwatch phase;
+    bool started = false;
+
     while (true) {
         // MPI: blocks here until the master has something to do. A worker
         // spends most of its idle time in this call.
+        phase.reset();
         int job[4];
         MPI_Recv(job, 4, MPI_INT, MASTER_RANK, TAG_JOB,
                  MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        double waited = phase.seconds();
+        if (!started) {
+            run.reset();      // the wait for the very first job is setup, not idle
+            started = true;
+            waited = 0.0;
+        }
 
+        // total_ stops at the last real job rather than at the shutdown
+        // message: with --check the master runs its single-machine reference
+        // afterwards, and counting that wait would read as idle workers.
         if (job[0] == JOB_SHUTDOWN) {
             MPI_Send(aliveAtStage_.data(), bDim_, MPI_LONG, MASTER_RANK,
                      TAG_STATS, MPI_COMM_WORLD);
+
+            double times[6] = {total_, idle_, recv_, compute_, send_,
+                               (double)jobs_};
+            MPI_Send(times, 6, MPI_DOUBLE, MASTER_RANK, TAG_TIMES,
+                     MPI_COMM_WORLD);
             break;
+        }
+
+        idle_ = idle_ + waited;
+
+        if (job[0] == JOB_RESET) {
+            aliveAtStage_.assign(bDim_, 0);
+            total_ = run.seconds();
+            continue;
         }
 
         if (job[0] == JOB_QUERY) {
             queries.resize((size_t)batch_ * myDim_);
             MPI_Recv(queries.data(), (int)queries.size(), MPI_FLOAT,
                      MASTER_RANK, TAG_QUERY, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            total_ = run.seconds();
             continue;
         }
 
@@ -271,12 +302,17 @@ int WorkerNode::run() {
         if (isFirst) {
             sums.assign(total, 0.0f);
         } else {
+            phase.reset();
             sums.resize(total);
             MPI_Recv(sums.data(), (int)total, MPI_FLOAT, prevRank, TAG_SUMS,
                      MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            recv_ = recv_ + phase.seconds();
         }
 
+        phase.reset();
         accumulate(picked.data(), m, clusterId, thresholds.data(), isFirst, sums);
+        compute_ = compute_ + phase.seconds();
+        jobs_ = jobs_ + 1;
 
         for (size_t j = 0; j < total; ++j) {
             if (sums[j] < PRUNED) {
@@ -285,7 +321,9 @@ int WorkerNode::run() {
         }
 
         // reclaim this slot before overwriting it
+        phase.reset();
         MPI_Wait(&reqSums[slot], MPI_STATUS_IGNORE);
+        send_ = send_ + phase.seconds();
 
         if (isLast) {
             // End of the chain. This is the only worker that ever sees these
@@ -297,6 +335,7 @@ int WorkerNode::run() {
             // The ids kept are positions in the cluster, which is what lets
             // the master map them back and still drop the ones prewarm
             // already pushed.
+            Stopwatch pick;
             int kSend = (k_ < n) ? k_ : n;
             Candidate pad;
             pad.id = -1;
@@ -321,6 +360,8 @@ int WorkerNode::run() {
                 }
             }
 
+            compute_ = compute_ + pick.seconds();
+
             // MPI: as bytes, since a Candidate is an int beside a float and
             // every rank is the same build (see topk_heap.h).
             MPI_Isend(outTop[slot].data(),
@@ -331,6 +372,7 @@ int WorkerNode::run() {
             MPI_Isend(outSums[slot].data(), (int)total, MPI_FLOAT, nextRank, TAG_SUMS,
                       MPI_COMM_WORLD, &reqSums[slot]);
         }
+        total_ = run.seconds();
         slot = (slot + 1) % slots;
     }
 
