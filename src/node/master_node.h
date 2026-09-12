@@ -67,8 +67,12 @@ public:
     struct QueryState {
         int id;                       // row in query_
         std::vector<int> clusters;    // its nprobe nearest
-        int prewarmCluster;
-        int prewarmed;
+
+        // Which clusters the heap was seeded from, and how many leading
+        // vectors of each went in. The pipeline needs both to avoid pushing
+        // those same vectors a second time when the cluster reports.
+        std::vector<int> prewarmCluster;
+        std::vector<int> prewarmed;
     };
 
     // Algorithm 1, lines 19-23. Runs a batch of queries, the paper's
@@ -80,7 +84,7 @@ public:
     // Algorithm 1, lines 1-5. Seeds the heap with real distances so there is
     // a threshold to prune against from the very first candidate. Returns how
     // many it computed.
-    int prewarmHeap(const float* query, int clusterId, int count, TopKHeap& heap);
+    void prewarmHeap(const float* query, QueryState& state, TopKHeap& heap);
 
     // Algorithm 1, lines 13-18. Runs the clusters of every vector partition
     // through the dimension pipeline and pushes the survivors into the heaps.

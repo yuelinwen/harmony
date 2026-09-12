@@ -31,7 +31,16 @@ struct Config {
     // speed
     int threads = 1;      // OpenMP threads inside each worker (paper §5)
     int batch = 32;       // queries handled together (Algorithm 1 line 13)
-    int prewarm = 500;    // vectors seeding a query's heap, 0 = off (lines 1-5)
+    // Heap seeding, Algorithm 1 lines 1-5. prewarmLists clusters of the query's
+    // nprobe, prewarm vectors out of each. 0 either way turns it off.
+    //
+    // One cluster, not the ten the authors' code seeds from: measured on
+    // sift1M, spreading the same budget over more clusters leaves a looser
+    // threshold and prunes less, at every budget tried. The nearest cluster is
+    // where the nearest vectors are. Since pruning is lossless, a looser
+    // threshold costs speed and never recall.
+    int prewarm = 500;
+    int prewarmLists = 1;
     bool pruning = true;  // dimension-level early exit (paper Fig. 10)
     bool mkl = true;      // gemm for the first slice, if MKL was compiled in
     bool check = true;    // re-run each query on one machine and compare
@@ -70,7 +79,9 @@ inline void printUsage(const char* prog) {
         << "speed\n"
         << "  --threads <int>    OpenMP threads per worker          (1)\n"
         << "  --batch <int>      queries processed together         (32)\n"
-        << "  --prewarm <int>    heap seed size, 0 = off            (500)\n"
+        << "  --prewarm <int>    heap seed vectors per cluster      (500)\n"
+        << "  --prewarmlists <int>  clusters seeded per query         (1)\n"
+        << "                     either set to 0 turns seeding off\n"
         << "  --pruning <0|1>    dimension-level pruning            (1)\n"
         << "  --mkl <0|1>        gemm for the first slice           (1)\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
@@ -115,6 +126,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.nq = std::atoi(argv[++i]);
         } else if (opt == "--prewarm" && hasValue) {
             cfg.prewarm = std::atoi(argv[++i]);
+        } else if (opt == "--prewarmlists" && hasValue) {
+            cfg.prewarmLists = std::atoi(argv[++i]);
         } else if (opt == "--pruning" && hasValue) {
             cfg.pruning = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--threads" && hasValue) {

@@ -392,19 +392,38 @@ void MasterNode::printWorkerTimes() const {
 //
 // Only the master can do this: distances here are over every dimension, and a
 // worker holds a fraction of each vector.
-int MasterNode::prewarmHeap(const float* query, int clusterId, int count, TopKHeap& heap) {
-    const std::vector<int>& ids = index_.clusterIds(clusterId);
+void MasterNode::prewarmHeap(const float* query, QueryState& state, TopKHeap& heap) {
+    state.prewarmCluster.clear();
+    state.prewarmed.clear();
 
-    int n = (int)ids.size();
-    if (count < n) {
-        n = count;
+    // Spread over the nearest few clusters rather than taking everything from
+    // the first one, as the authors' code does. One cluster can miss: the
+    // nearest centroid is not always where the nearest vectors are, and a seed
+    // drawn only from there gives a loose threshold exactly when it matters.
+    int lists = cfg_.prewarmLists;
+    if (lists > (int)state.clusters.size()) {
+        lists = (int)state.clusters.size();
     }
 
-    for (int i = 0; i < n; ++i) {
-        heap.push(ids[i], l2DistanceSquared(query, base_.vec(ids[i]), base_.getDim()));
-    }
+    for (int i = 0; i < lists; ++i) {
+        int clusterId = state.clusters[i];
+        const std::vector<int>& ids = index_.clusterIds(clusterId);
 
-    return n;
+        int n = (int)ids.size();
+        if (cfg_.prewarm < n) {
+            n = cfg_.prewarm;
+        }
+        if (n <= 0) {
+            continue;
+        }
+
+        for (int j = 0; j < n; ++j) {
+            heap.push(ids[j], l2DistanceSquared(query, base_.vec(ids[j]),
+                                                base_.getDim()));
+        }
+        state.prewarmCluster.push_back(clusterId);
+        state.prewarmed.push_back(n);
+    }
 }
 
 // Hands one cluster to every worker in its row and returns immediately. The
@@ -572,7 +591,13 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<std::vector<int>>>
             // which is still the right answer: anything the tail left out has
             // kSend better candidates ahead of it, and those are either in
             // this list or were pushed by prewarm.
-            int skip = (s.clusterId == batch[q].prewarmCluster) ? batch[q].prewarmed : 0;
+            int skip = 0;
+            for (int i = 0; i < (int)batch[q].prewarmCluster.size(); ++i) {
+                if (batch[q].prewarmCluster[i] == s.clusterId) {
+                    skip = batch[q].prewarmed[i];
+                    break;
+                }
+            }
 
             for (int t = 0; t < s.kSend; ++t) {
                 if (top[t].dist >= PRUNED) {
@@ -608,8 +633,7 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
         const float* qv = query_.vec(firstQuery + q);
         batch[q].id = firstQuery + q;
         batch[q].clusters = index_.nearestClusters(qv, nprobe);
-        batch[q].prewarmCluster = batch[q].clusters[0];
-        batch[q].prewarmed = prewarmHeap(qv, batch[q].clusters[0], cfg_.prewarm, heaps[q]);
+        prewarmHeap(qv, batch[q], heaps[q]);
     }
 
     // Every worker gets the whole batch's slices once; individual jobs then
