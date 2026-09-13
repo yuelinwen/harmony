@@ -60,8 +60,19 @@ public:
     // Cuts every cluster into per-worker slices and sends them out.
     void distributeData();
 
-    // Tells the workers to stop, and collects their pruning counters.
+    // Zeroes the counters, here and on every worker.
+    void resetCounters();
+
+    // Collects the pruning counters and timings without stopping anybody.
+    void collectStats();
+
+    // Tells the workers to stop.
     void shutdown();
+
+    // Appends one row describing this run to cfg_.csv, writing the header
+    // first if the file is new. Nothing happens when --csv was not given.
+    void writeCsv(int nprobe, int nq, double recall, double seconds,
+                  int differing, int ties) const;
 
     // Prints the per-worker time breakdown gathered by shutdown().
     void printWorkerTimes() const;

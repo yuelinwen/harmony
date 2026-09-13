@@ -254,23 +254,38 @@ int WorkerNode::run() {
         // message: with --check the master runs its single-machine reference
         // afterwards, and counting that wait would read as idle workers.
         if (job[0] == JOB_SHUTDOWN) {
+            break;   // the counters were already collected by JOB_STATS
+        }
+
+        // The wait for either of the two bookkeeping messages is not idle
+        // time: the master is checking answers or printing, not withholding
+        // work, and counting it would read as starved workers.
+        if (job[0] == JOB_STATS) {
             MPI_Send(aliveAtStage_.data(), bDim_, MPI_LONG, MASTER_RANK,
                      TAG_STATS, MPI_COMM_WORLD);
-
             double times[6] = {total_, idle_, recv_, compute_, send_,
                                (double)jobs_};
             MPI_Send(times, 6, MPI_DOUBLE, MASTER_RANK, TAG_TIMES,
                      MPI_COMM_WORLD);
-            break;
+            continue;
+        }
+
+        // Start of a counted stretch: forget everything before it. Sent before
+        // the pass that gets reported, so an earlier --loop pass or an earlier
+        // --nprobes value does not leak into these numbers.
+        if (job[0] == JOB_RESET) {
+            aliveAtStage_.assign(bDim_, 0);
+            idle_ = 0.0;
+            recv_ = 0.0;
+            compute_ = 0.0;
+            send_ = 0.0;
+            jobs_ = 0;
+            total_ = 0.0;
+            run.reset();
+            continue;
         }
 
         idle_ = idle_ + waited;
-
-        if (job[0] == JOB_RESET) {
-            aliveAtStage_.assign(bDim_, 0);
-            total_ = run.seconds();
-            continue;
-        }
 
         if (job[0] == JOB_QUERY) {
             queries.resize((size_t)batch_ * myDim_);

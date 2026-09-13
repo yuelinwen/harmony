@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <vector>
 
 // Run-time settings, so an experiment does not need a recompile.
 // Measurements behind the defaults are in README.md.
@@ -25,7 +26,12 @@ struct Config {
     bool costModel = false;          // set by resolveGrid, not by a flag
 
     // the search
-    int nprobe = 32;   // clusters visited per query: recall against speed
+    // Clusters visited per query: recall against speed. --nprobes takes
+    // several and runs them one after another, sharing one index and one
+    // distribution -- nprobe only decides which clusters the master dispatches,
+    // so nothing a worker holds depends on it.
+    int nprobe = 32;
+    std::vector<int> nprobes;
     int k = 100;       // neighbours returned
     int nq = 100;      // queries to run
 
@@ -46,6 +52,7 @@ struct Config {
     bool mkl = true;      // gemm for the first slice, if MKL was compiled in
     bool check = true;    // re-run each query on one machine and compare
     int loop = 1;         // timed passes over the query set, averaged
+    std::string csv;      // append one row per run here, "" = off
 
     // cost model, read only when mode is "harmony" (paper §4.2.1)
     double commCost = 100.0;  // a transferred byte, in multiply-adds. Hardware.
@@ -77,6 +84,7 @@ inline void printUsage(const char* prog) {
         << "the search\n"
         << "  --nq <int>         queries to run                     (100)\n"
         << "  --nprobe <int>     clusters visited per query         (32)\n"
+        << "  --nprobes <int>... several of them, run one after another\n"
         << "  --k <int>          neighbours returned                (100)\n"
         << "\n"
         << "speed\n"
@@ -91,6 +99,7 @@ inline void printUsage(const char* prog) {
         << "                     costs more than the search it checks\n"
         << "  --loop <int>       timed passes, averaged               (1)\n"
         << "                     above 1 adds an untimed warm-up pass\n"
+        << "  --csv <path>       append one row per run to this file\n"
         << "\n"
         << "cost model, only read when --mode harmony\n"
         << "  --commcost <float> a transferred byte, in multiply-adds (100)\n"
@@ -125,6 +134,13 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.bDim = std::atoi(argv[++i]);
         } else if (opt == "--nprobe" && hasValue) {
             cfg.nprobe = std::atoi(argv[++i]);
+        } else if (opt == "--nprobes" && hasValue) {
+            // eats values until the next option
+            while (i + 1 < argc && argv[i + 1][0] != '-') {
+                cfg.nprobes.push_back(std::atoi(argv[++i]));
+            }
+        } else if (opt == "--csv" && hasValue) {
+            cfg.csv = argv[++i];
         } else if (opt == "--k" && hasValue) {
             cfg.k = std::atoi(argv[++i]);
         } else if (opt == "--nq" && hasValue) {

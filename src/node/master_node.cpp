@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
+#include <ios>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
@@ -348,11 +349,25 @@ void MasterNode::distributeData() {
               << std::endl;
 }
 
-void MasterNode::shutdown() {
+// Zeroes every worker's counters. Sent just before the stretch that gets
+// reported, so an untimed --loop pass or a previous --nprobes value cannot
+// leak into it.
+void MasterNode::resetCounters() {
+    scanned_ = 0;
+    scannedRow_.assign(bVec_, 0);
+    for (int w = 1; w <= numWorkers_; ++w) {
+        int job[4] = {JOB_RESET, 0, 0, 0};
+        MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+    }
+}
+
+// Asks every worker for its counters without ending it, which is what running
+// several nprobe values against one distribution needs.
+void MasterNode::collectStats() {
     aliveAfterStage_.assign(bDim_, 0);
 
     for (int w = 1; w <= numWorkers_; ++w) {
-        int job[4] = {JOB_SHUTDOWN, 0, 0, 0};
+        int job[4] = {JOB_STATS, 0, 0, 0};
         MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
     }
 
@@ -367,6 +382,13 @@ void MasterNode::shutdown() {
         }
         MPI_Recv(workerTimes_[w - 1].data(), 6, MPI_DOUBLE, w, TAG_TIMES,
                  MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+}
+
+void MasterNode::shutdown() {
+    for (int w = 1; w <= numWorkers_; ++w) {
+        int job[4] = {JOB_SHUTDOWN, 0, 0, 0};
+        MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
     }
 }
 
@@ -386,6 +408,11 @@ void MasterNode::printWorkerTimes() const {
     }
     std::cout << "  worker   grid    jobs     total    compute      idle"
               << "      recv      send" << std::endl;
+
+    // setprecision and fixed stay on the stream, and with --nprobes there is
+    // another run's output after this table.
+    std::ios_base::fmtflags flags = std::cout.flags();
+    std::streamsize digits = std::cout.precision();
 
     for (int w = 1; w <= numWorkers_; ++w) {
         const std::vector<double>& t = workerTimes_[w - 1];
@@ -410,6 +437,9 @@ void MasterNode::printWorkerTimes() const {
         }
         std::cout << std::endl;
     }
+
+    std::cout.flags(flags);
+    std::cout.precision(digits);
 }
 
 // Without this the heap starts empty, worst() is infinite, and nothing can be
@@ -746,13 +776,30 @@ int MasterNode::run() {
     // are integers, ties near rank k are common, and their order is not
     // defined either way.
     int k = cfg_.k;
-    int nprobe = cfg_.nprobe;
     int nq = cfg_.nq;
     if (nq > query_.getN()) {
         std::cout << "only " << query_.getN() << " queries in the file, running those"
                   << std::endl;
         nq = query_.getN();
     }
+
+    // --nprobes runs several values one after another. They share the index
+    // and the distribution: nprobe only decides which clusters the master
+    // dispatches, and nothing a worker holds depends on it. The grid was
+    // already fixed above, by --mode or the cost model.
+    std::vector<int> sweep = cfg_.nprobes;
+    if (sweep.empty()) {
+        sweep.push_back(cfg_.nprobe);
+    }
+
+    for (size_t ni = 0; ni < sweep.size(); ++ni) {
+    int nprobe = sweep[ni];
+    if (sweep.size() > 1) {
+        std::cout << "\n########## nprobe " << nprobe << "  ("
+                  << (ni + 1) << " of " << sweep.size() << ") ##########"
+                  << std::endl;
+    }
+
     int differing = 0;
     int ties = 0;
 
@@ -776,20 +823,13 @@ int MasterNode::run() {
     bool warmup = (passes > 1 && pass == 0);
     bool last = (pass == passes - 1);
 
-    scanned_ = 0;
-    scannedRow_.assign(bVec_, 0);
     recallSum = 0.0;
     differing = 0;
     ties = 0;
 
-    // the workers keep their own counters, so they have to forget the earlier
-    // passes too
-    if (last && passes > 1) {
-        for (int w = 1; w <= numWorkers_; ++w) {
-            int job[4] = {JOB_RESET, 0, 0, 0};
-            MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
-        }
-    }
+    // Every pass, not just the counted one: the counters are sized here as
+    // well as zeroed, and the warm-up pass reads them too.
+    resetCounters();
 
     for (int start = 0; start < nq; start += cfg_.batch) {
         int count = (start + cfg_.batch <= nq) ? cfg_.batch : (nq - start);
@@ -849,7 +889,7 @@ int MasterNode::run() {
         seconds = seconds / cfg_.loop;
     }
 
-    shutdown();   // stop the workers and collect their counters
+    collectStats();   // the workers keep running, the next nprobe needs them
 
     std::cout << "\n===== 5. results =====" << std::endl;
     std::cout << "setup: " << numWorkers_ << " workers, grid "
@@ -907,8 +947,62 @@ int MasterNode::run() {
               << (100.0 * done / (double)(scanned_ * bDim_)) << "%" << std::endl;
 
     printWorkerTimes();
+    writeCsv(nprobe, nq, recallSum / nq, seconds, differing, ties);
+    }   // end of the nprobe sweep
 
+    shutdown();
     return 0;
+}
+
+// One row per run, appended, header written when the file is new. Everything
+// that was varied over a set of runs has to be in the row, or the rows cannot
+// be told apart later.
+void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
+                          int differing, int ties) const {
+    if (cfg_.csv.empty()) {
+        return;
+    }
+
+    bool isNew = true;
+    std::FILE* probe = std::fopen(cfg_.csv.c_str(), "rb");
+    if (probe != nullptr) {
+        std::fseek(probe, 0, SEEK_END);
+        isNew = (std::ftell(probe) == 0);
+        std::fclose(probe);
+    }
+
+    std::FILE* f = std::fopen(cfg_.csv.c_str(), "ab");
+    if (f == nullptr) {
+        std::cout << "could not write " << cfg_.csv << std::endl;
+        return;
+    }
+
+    if (isNew) {
+        std::fprintf(f, "data,nlist,iters,trainpoints,workers,bvec,bdim,mode,"
+                        "batch,threads,prewarm,prewarmlists,pruning,mkl,loop,"
+                        "nprobe,k,nq,recall,qps,ms_per_query,differing,ties,"
+                        "scanned,work_pct\n");
+    }
+
+    long done = 0;
+    for (int s = 0; s < bDim_; ++s) {
+        done = done + ((s == 0) ? scanned_ : aliveAfterStage_[s - 1]);
+    }
+    double work = (scanned_ > 0)
+                ? (100.0 * done / (double)(scanned_ * bDim_)) : 0.0;
+
+    std::fprintf(f,
+        "%s,%d,%d,%d,%d,%d,%d,%s,%d,%d,%d,%d,%d,%d,%d,"
+        "%d,%d,%d,%.6f,%.3f,%.4f,%d,%d,%ld,%.4f\n",
+        cfg_.data.c_str(), cfg_.nlist, cfg_.iters, cfg_.trainPoints,
+        numWorkers_, bVec_, bDim_, cfg_.mode.c_str(),
+        cfg_.batch, cfg_.threads, cfg_.prewarm, cfg_.prewarmLists,
+        cfg_.pruning ? 1 : 0, cfg_.mkl ? 1 : 0, cfg_.loop,
+        nprobe, cfg_.k, nq, recall, nq / seconds, 1000.0 * seconds / nq,
+        differing, ties, scanned_, work);
+
+    std::fclose(f);
+    std::cout << "appended to " << cfg_.csv << std::endl;
 }
 
 }  // namespace harmony

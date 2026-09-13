@@ -63,11 +63,15 @@ const float PRUNED = 1e38f;
 // items run the row in different orders, so no worker is always the first
 // stop, which is the one that can prune nothing (paper §4.3).
 const int JOB_QUERY    = -1;   // the batch's query slices follow
-const int JOB_SHUTDOWN = -2;   // stop, report stats, exit
+const int JOB_SHUTDOWN = -2;   // stop and exit
 // Zero the pruning counters. With --loop the query set is run several times;
 // only the last pass is counted, so the earlier ones have to be forgotten or
 // the survivor counts would not match the candidates the master saw.
 const int JOB_RESET    = -3;
+// Report the counters so far and keep going, which shutdown cannot do because
+// it ends the process. --nprobes runs several searches against one
+// distribution and each needs its own numbers.
+const int JOB_STATS    = -4;
 
 }  // namespace harmony
 
