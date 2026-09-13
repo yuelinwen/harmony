@@ -77,16 +77,43 @@ double MasterNode::recallAt(int queryId, const std::vector<Candidate>& got, int 
     return (double)hits / (double)want;
 }
 
+// The file an index with these settings would be written to. Everything that
+// changes the clustering is in the name, so two runs that differ in any of it
+// cannot pick up each other's file. What the data itself is gets checked
+// inside load(), against the base's own n and dim.
+std::string MasterNode::indexPath(int nlist, int iterations) const {
+    return cfg_.data + "_nlist" + std::to_string(nlist)
+         + "_iters" + std::to_string(iterations)
+         + "_tp" + std::to_string(cfg_.trainPoints) + ".idx";
+}
+
 void MasterNode::buildIndex(int nlist, int iterations) {
     std::cout << "\n===== 2. index =====" << std::endl;
-    std::cout << "building index (nlist=" << nlist << ")" << std::endl;
 
+    std::string path = indexPath(nlist, iterations);
     auto t0 = std::chrono::steady_clock::now();
+
+    if (cfg_.cache && index_.load(path, base_.getN(), base_.getDim())) {
+        auto t1 = std::chrono::steady_clock::now();
+        std::cout << "loaded index from " << path << " ("
+                  << std::chrono::duration<double>(t1 - t0).count() << " s)"
+                  << std::endl;
+        return;
+    }
+
+    std::cout << "building index (nlist=" << nlist << ")" << std::endl;
     index_.build(base_, nlist, iterations, cfg_.trainPoints);
     auto t1 = std::chrono::steady_clock::now();
-
     std::cout << "build time: "
               << std::chrono::duration<double>(t1 - t0).count() << " s" << std::endl;
+
+    if (cfg_.cache) {
+        if (index_.save(path)) {
+            std::cout << "saved index to " << path << std::endl;
+        } else {
+            std::cout << "could not write " << path << ", carrying on" << std::endl;
+        }
+    }
 }
 
 // Centroid assignment only -- no worker is involved and nothing is searched,

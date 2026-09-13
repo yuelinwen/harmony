@@ -16,6 +16,7 @@ struct Config {
     int nlist = 256;                 // clusters kmeans builds
     int iters = 25;                  // kmeans rounds
     int trainPoints = 256;           // kmeans training points per centroid, 0 = all
+    bool cache = false;              // reuse a saved index, and save one if absent
 
     // worker layout: a bVec x bDim grid (paper Fig. 4a)
     std::string mode = "harmony";    // harmony | vector | dimension (paper §5)
@@ -62,6 +63,8 @@ inline void printUsage(const char* prog) {
         << "  --iters <int>      kmeans rounds                      (25)\n"
         << "  --trainpoints <int>  kmeans training points per centroid (256)\n"
         << "                     0 uses every base vector, which is much slower\n"
+        << "  --cache <0|1>      reuse the index file beside the data       (0)\n"
+        << "                     writes it on the first run with these settings\n"
         << "\n"
         << "how the workers are laid out\n"
         << "  --mode <name>      harmony | vector | dimension       (harmony)\n"
@@ -107,6 +110,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.nlist = std::atoi(argv[++i]);
         } else if (opt == "--iters" && hasValue) {
             cfg.iters = std::atoi(argv[++i]);
+        } else if (opt == "--cache" && hasValue) {
+            cfg.cache = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--trainpoints" && hasValue) {
             cfg.trainPoints = std::atoi(argv[++i]);
             if (cfg.trainPoints < 0) {

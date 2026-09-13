@@ -1,6 +1,7 @@
 #ifndef HARMONY_INDEX_IVF_INDEX_H
 #define HARMONY_INDEX_IVF_INDEX_H
 
+#include <string>
 #include <vector>
 
 #include "dataset.h"
@@ -33,6 +34,17 @@ public:
     void build(const Dataset& base, int nlist, int iterations,
                int perCentroid);
 
+    // Writes the clustering to a file, and reads one back. A run with the
+    // same data and the same parameters produces the same index, so it is
+    // worth keeping: kmeans is the slowest part of startup, and reusing one
+    // file also means two runs being compared share a clustering exactly.
+    //
+    // save returns false if the file cannot be written; load returns false if
+    // it is missing, truncated, or was built for a different dataset, and
+    // leaves the index untouched so the caller can just build instead.
+    bool save(const std::string& path) const;
+    bool load(const std::string& path, int expectN, int expectDim);
+
     // Returns the k nearest neighbors of one query vector, scanning only
     // the nprobe nearest clusters.
     std::vector<Candidate> search(const Dataset& base, const float* query,
@@ -58,6 +70,7 @@ public:
 private:
     int nlist_;                                // number of clusters
     int dim_;                                  // vector dimension
+    int builtFrom_ = 0;                        // base vectors it was built on
     std::vector<float> centroids_;             // nlist * dim, row-major
     std::vector<std::vector<int>> invlists_;   // invlists_[c] = ids in cluster c
 

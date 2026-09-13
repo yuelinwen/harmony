@@ -1,5 +1,6 @@
 #include "ivf_index.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 
@@ -25,6 +26,7 @@ void IvfIndex::build(const Dataset& base, int nlist, int iterations,
     nlist_ = nlist;
     dim_ = base.getDim();
     int n = base.getN();
+    builtFrom_ = n;
 
     // --- 1. init: copy nlist random vectors as starting centroids ---
     std::srand(42);   // fixed seed -> same clustering every run (reproducible)
@@ -194,6 +196,91 @@ std::vector<Candidate> IvfIndex::search(const Dataset& base, const float* query,
         }
     }
     return heap.results();
+}
+
+// On-disk layout, little-endian, the same shape as the .bin data files:
+//   int32 magic, int32 nlist, int32 dim, int32 n
+//   float32 centroids[nlist * dim]
+//   then per cluster: int32 size, int32 ids[size]
+//
+// No version field. The magic doubles as one: change the layout and change
+// the magic, and an old file is rejected rather than misread.
+static const int kIndexMagic = 0x48494658;   // "HIFX"
+
+bool IvfIndex::save(const std::string& path) const {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        return false;
+    }
+
+    int header[4] = {kIndexMagic, nlist_, dim_, builtFrom_};
+    bool ok = std::fwrite(header, sizeof(int), 4, f) == 4;
+    if (ok) {
+        ok = std::fwrite(centroids_.data(), sizeof(float), centroids_.size(), f)
+             == centroids_.size();
+    }
+    for (int c = 0; ok && c < nlist_; ++c) {
+        int size = (int)invlists_[c].size();
+        ok = std::fwrite(&size, sizeof(int), 1, f) == 1;
+        if (ok && size > 0) {
+            ok = std::fwrite(invlists_[c].data(), sizeof(int), size, f)
+                 == (size_t)size;
+        }
+    }
+
+    std::fclose(f);
+    if (!ok) {
+        std::remove(path.c_str());   // a half-written index is worse than none
+    }
+    return ok;
+}
+
+bool IvfIndex::load(const std::string& path, int expectN, int expectDim) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return false;
+    }
+
+    int header[4];
+    if (std::fread(header, sizeof(int), 4, f) != 4 ||
+        header[0] != kIndexMagic || header[2] != expectDim ||
+        header[3] != expectN) {
+        std::fclose(f);
+        return false;
+    }
+
+    int nlist = header[1];
+    std::vector<float> centroids((size_t)nlist * header[2]);
+    bool ok = std::fread(centroids.data(), sizeof(float), centroids.size(), f)
+              == centroids.size();
+
+    std::vector<std::vector<int>> lists(nlist);
+    long total = 0;
+    for (int c = 0; ok && c < nlist; ++c) {
+        int size = 0;
+        ok = std::fread(&size, sizeof(int), 1, f) == 1 && size >= 0;
+        if (ok && size > 0) {
+            lists[c].resize(size);
+            ok = std::fread(lists[c].data(), sizeof(int), size, f)
+                 == (size_t)size;
+        }
+        total = total + size;
+    }
+    std::fclose(f);
+
+    // Every base vector belongs to exactly one cluster, so the lists have to
+    // account for all of them. A file that passes the header check but not
+    // this one was truncated.
+    if (!ok || total != expectN) {
+        return false;
+    }
+
+    nlist_ = nlist;
+    dim_ = header[2];
+    builtFrom_ = expectN;
+    centroids_.swap(centroids);
+    invlists_.swap(lists);
+    return true;
 }
 
 }  // namespace harmony

@@ -49,6 +49,9 @@ public:
     // whole dataset, before anything is handed to the workers.
     void buildIndex(int nlist, int iterations);
 
+    // Where a cached index with these settings lives.
+    std::string indexPath(int nlist, int iterations) const;
+
     // Lays the workers out as a bVec x bDim grid (paper Fig. 4a). Row r holds
     // the clusters with c % bVec == r; within a row, each worker holds one
     // slice of the dimensions.
