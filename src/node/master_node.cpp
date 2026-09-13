@@ -533,12 +533,19 @@ int MasterNode::lastRankOf(int row, int item) const {
     return row * bDim_ + chain[chain.size() - 1] + 1;
 }
 
-// Three levels of overlap, which multiply out to one busy worker per machine:
-// every query group is given work before anything is collected, each group
-// holds one vector partition at a time (Fig. 5a), and within that partition up
-// to bDim clusters are in flight (Fig. 5b). Groups refill on their own and
-// MPI_Waitany takes whichever comes back first, so a slow group never holds up
-// a fast one.
+// Three levels of overlap: every query group is given work before anything is
+// collected, each group holds one vector partition at a time (Fig. 5a), and
+// within that partition several clusters are in flight at once (Fig. 5b).
+// Groups refill on their own and MPI_Waitany takes whichever comes back first,
+// so a slow group never holds up a fast one.
+//
+// How many a partition may hold is --depth, and it is what decides whether a
+// worker can hide the wait for one cluster's upstream behind another cluster's
+// arithmetic. With one each, it cannot: measured compute was 6.8% of a
+// worker's time in dimension mode, the rest of it blocked. The sample has the
+// same overlap structurally -- every query block of a group has its receive
+// posted before any of them is computed -- which is what Fig. 5b draws as
+// stages X, Y and Z running at once.
 //
 // Survivors enter their query's heap as soon as the cluster reports, so
 // thresholds keep tightening -- sooner than Algorithm 1 line 18, which prunes
@@ -556,18 +563,16 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<std::vector<int>>>
         std::vector<int> members;
         std::vector<Candidate> top;   // members.size() rows of kSend
     };
-    // One slot per worker is exactly enough -- a group only takes a new chunk
-    // once its previous one has all come back, and at any stage the groups
-    // hold one row each. The spare is so the search for a free slot below
-    // cannot spin forever if that accounting ever changes.
-    int maxInFlight = bVec_ * bDim_ + 1;
+    // Enough slots for every group to be at its limit at once, plus a spare
+    // so the search for a free one below cannot spin forever.
+    int perGroupLimit = bDim_ * cfg_.depth;
+    int maxInFlight = bVec_ * perGroupLimit + 1;
     std::vector<Slot> slot(maxInFlight);
     std::vector<MPI_Request> req(maxInFlight, MPI_REQUEST_NULL);
 
     std::vector<int> stage(bVec_, 0);         // which partition group g is on
     std::vector<size_t> pos(bVec_, 0);        // how far into that partition
     std::vector<int> inFlight(bVec_, 0);
-    std::vector<int> chunkSize(bVec_, 0);
     int free = 0;
 
     std::vector<int> members;
@@ -575,24 +580,37 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<std::vector<int>>>
 
     while (true) {
         for (int g = 0; g < bVec_; ++g) {
-            // Keep taking chunks until one of them actually sends something
-            // out, or the group has been through every partition.
-            while (inFlight[g] == 0 && stage[g] < bVec_) {
+            // Top this group back up to its limit, or step it on to the next
+            // partition once the one it is on is finished with.
+            while (stage[g] < bVec_) {
                 int r = groupOrder_.chain(g)[stage[g]];
                 const std::vector<int>& list = work[g][r];
 
-                // done with this partition: its distances are in the heaps, so
-                // the next stage starts from a tighter threshold
                 if (pos[g] >= list.size()) {
+                    // Every cluster of this partition is out. Only when they
+                    // have all come back are their distances in the heaps, and
+                    // only then does the next partition start from a tighter
+                    // threshold, which is the whole point of Fig. 5a. So this
+                    // is the one place a group does have to drain.
+                    if (inFlight[g] > 0) {
+                        break;
+                    }
                     stage[g] = stage[g] + 1;
                     pos[g] = 0;
                     continue;
                 }
 
-                chunkSize[g] = 0;
-                for (int p = 0; p < bDim_ && pos[g] + p < list.size(); ++p) {
-                    int c = list[pos[g] + p];
-                    chunkSize[g] = chunkSize[g] + 1;
+                if (inFlight[g] >= perGroupLimit) {
+                    break;   // enough out already
+                }
+
+                {
+                    int c = list[pos[g]];
+                    // Clusters enter the row at successive columns, so no
+                    // worker is always the first stop -- the one that can
+                    // prune nothing (paper §4.3).
+                    int p = (int)(pos[g] % bDim_);
+                    pos[g] = pos[g] + 1;
 
                     // which queries of this group actually want this cluster
                     members.clear();
@@ -609,7 +627,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<std::vector<int>>>
                         }
                     }
                     if (members.empty()) {
-                        continue;
+                        continue;   // pos has already stepped past it
                     }
 
                     // The slot is picked first because its number is what
@@ -639,11 +657,6 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<std::vector<int>>>
                               MPI_BYTE, lastRankOf(r, p), tagTopk(free),
                               MPI_COMM_WORLD, &req[free]);
                     inFlight[g] = inFlight[g] + 1;
-                }
-
-                // a chunk nobody in this group wanted still has to be stepped over
-                if (inFlight[g] == 0) {
-                    pos[g] = pos[g] + chunkSize[g];
                 }
             }
         }
@@ -695,11 +708,10 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<std::vector<int>>>
         scanned_ = scanned_ + (long)s.members.size() * s.n;
         scannedRow_[s.row] = scannedRow_[s.row] + (long)s.members.size() * s.n;
 
-        int g = s.group;
-        inFlight[g] = inFlight[g] - 1;
-        if (inFlight[g] == 0) {
-            pos[g] = pos[g] + chunkSize[g];
-        }
+        // pos already stepped past this cluster when it went out; the count
+        // coming down is what lets the group take another, or move on to the
+        // next partition once it reaches zero.
+        inFlight[s.group] = inFlight[s.group] - 1;
     }
 }
 

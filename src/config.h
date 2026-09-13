@@ -53,6 +53,14 @@ struct Config {
     // Wait for each forward to land before starting the next cluster, which
     // is the blocking arm of the paper's Fig. 2(b) comparison.
     bool blockSend = false;
+    // Clusters a vector partition may have out at once, in multiples of bDim.
+    // At 1 a worker has nothing to do while it waits for one cluster's
+    // upstream; deeper, it computes another meanwhile. The sample gets the
+    // same overlap from putting every query block of a group in flight before
+    // computing any of them, and its examples use four to eight. Deeper also
+    // costs memory -- a worker holds m*n running totals per open cluster --
+    // and reads thresholds a little earlier, so it prunes slightly less.
+    int depth = 4;
     bool check = true;    // re-run each query on one machine and compare
     int loop = 1;         // timed passes over the query set, averaged
     std::string csv;      // append one row per run here, "" = off
@@ -99,6 +107,8 @@ inline void printUsage(const char* prog) {
         << "  --pruning <0|1>    dimension-level pruning            (1)\n"
         << "  --mkl <0|1>        gemm for the first slice           (1)\n"
         << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
+        << "  --depth <int>      clusters in flight per partition      (4)\n"
+        << "                     in multiples of the dimension slices\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
         << "                     costs more than the search it checks\n"
         << "  --loop <int>       timed passes, averaged               (1)\n"
@@ -165,6 +175,11 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.warmup = std::atoi(argv[++i]);
         } else if (opt == "--batch" && hasValue) {
             cfg.batch = std::atoi(argv[++i]);
+        } else if (opt == "--depth" && hasValue) {
+            cfg.depth = std::atoi(argv[++i]);
+            if (cfg.depth < 1) {
+                cfg.depth = 1;
+            }
         } else if (opt == "--blocksend" && hasValue) {
             cfg.blockSend = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--mkl" && hasValue) {
