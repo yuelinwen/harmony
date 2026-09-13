@@ -117,7 +117,7 @@ public:
     // Algorithm 1, lines 6-12. Sends one cluster to every worker in its row
     // and returns; the workers pass the running totals down the chain and only
     // the last reports back. `members` are the batch positions that probed it.
-    void dispatchOne(int row, int clusterId, int item,
+    void dispatchOne(int row, int clusterId, int item, int slot,
                      const std::vector<int>& members,
                      const std::vector<float>& thresholds);
 

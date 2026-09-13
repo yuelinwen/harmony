@@ -212,138 +212,223 @@ int WorkerNode::run() {
     receiveSetup();
 
     std::vector<float> queries;          // batch_ slices of myDim_ floats
-    std::vector<int> qidx;               // which of them this job wants
-    std::vector<float> picked;           // those slices, packed together
-    std::vector<float> thresholds;
-    std::vector<float> sums;
+    std::vector<float> picked;           // the slices one job wants, packed
 
     // Forwarding has to be non-blocking. Clusters start at different columns,
     // so two workers can be sending to each other at once; with blocking sends
     // both would wait in MPI_Send for the other to receive, and the row would
     // deadlock. This is why the paper uses MPI_Isend / MPI_Irecv (§5).
     //
-    // An outgoing buffer must stay untouched until its send completes, and
-    // sums is reused by the next job, so sends go out of a rotating pool.
-    int slots = bDim_ + 1;
+    // An outgoing buffer must stay untouched until its send completes, so
+    // sends go out of a rotating pool.
+    int slots = 2 * bDim_ + 2;
     std::vector<std::vector<float>> outSums(slots);       // mid-chain: totals
     std::vector<std::vector<Candidate>> outTop(slots);    // chain tail: top-k
     std::vector<MPI_Request> reqSums(slots, MPI_REQUEST_NULL);
     int slot = 0;
+
+    // A cluster this worker has been handed but not finished. Several stay
+    // open at once on purpose: one still waiting on its upstream must not hold
+    // up another whose turn has already come. Taking them strictly in the
+    // order the master sent them was costing 34% of a worker's time in
+    // harmony mode and 70% in dimension mode, all of it blocked in one
+    // MPI_Recv with other work sitting right there. The sample avoids the
+    // same trap by testing every pending block instead of taking them in
+    // order; the tags in messages.h are what make that safe.
+    struct Pending {
+        int clusterId;
+        int n;
+        int m;
+        int stage;
+        int slotTag;             // names this cluster's chain tags
+        bool isFirst;
+        bool isLast;
+        int prevRank;
+        int nextRank;
+        std::vector<int> qidx;
+        std::vector<float> thresholds;
+        std::vector<float> sums;
+    };
+    std::vector<Pending> pend;
+    std::vector<MPI_Request> pendReq;   // upstream receive; NULL for a head
 
     // The clock starts at the first job, not at setup: loading the index is
     // measured separately and would otherwise swamp everything.
     Stopwatch run;
     Stopwatch phase;
     bool started = false;
+    bool done = false;
 
-    while (true) {
-        // MPI: blocks here until the master has something to do. A worker
-        // spends most of its idle time in this call.
-        phase.reset();
-        int job[4];
-        MPI_Recv(job, 4, MPI_INT, MASTER_RANK, TAG_JOB,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        double waited = phase.seconds();
-        if (!started) {
-            run.reset();      // the wait for the very first job is setup, not idle
-            started = true;
-            waited = 0.0;
+    while (!done) {
+        // ---- 1. take every job already waiting, and block only when there
+        //         is nothing open to work on ----
+        while (true) {
+            int waiting = 1;
+            if (!pend.empty()) {
+                // MPI: peek rather than block -- there is real work in hand
+                MPI_Iprobe(MASTER_RANK, TAG_JOB, MPI_COMM_WORLD, &waiting,
+                           MPI_STATUS_IGNORE);
+                if (!waiting) {
+                    break;
+                }
+            }
+
+            phase.reset();
+            int job[5];
+            MPI_Recv(job, 5, MPI_INT, MASTER_RANK, TAG_JOB,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            // only a wait with nothing else to do is idleness
+            double waited = pend.empty() ? phase.seconds() : 0.0;
+            if (!started) {
+                run.reset();   // the wait for the very first job is setup
+                started = true;
+                waited = 0.0;
+            }
+
+            // total_ stops at the last real job rather than at the shutdown
+            // message: with --check the master runs its single-machine
+            // reference afterwards, and counting that wait would read as idle
+            // workers. The master sends the bookkeeping jobs only once every
+            // cluster has reported, so nothing is open when they arrive.
+            if (job[0] == JOB_SHUTDOWN) {
+                done = true;
+                break;
+            }
+
+            // The wait for either bookkeeping message is not idle time: the
+            // master is checking answers or printing, not withholding work.
+            if (job[0] == JOB_STATS) {
+                MPI_Send(aliveAtStage_.data(), bDim_, MPI_LONG, MASTER_RANK,
+                         TAG_STATS, MPI_COMM_WORLD);
+                double times[6] = {total_, idle_, recv_, compute_, send_,
+                                   (double)jobs_};
+                MPI_Send(times, 6, MPI_DOUBLE, MASTER_RANK, TAG_TIMES,
+                         MPI_COMM_WORLD);
+                continue;
+            }
+
+            // Start of a counted stretch: forget everything before it. Sent
+            // before the pass that gets reported, so an earlier --loop pass or
+            // an earlier --nprobes value does not leak into these numbers.
+            if (job[0] == JOB_RESET) {
+                aliveAtStage_.assign(bDim_, 0);
+                idle_ = 0.0;
+                recv_ = 0.0;
+                compute_ = 0.0;
+                send_ = 0.0;
+                jobs_ = 0;
+                total_ = 0.0;
+                run.reset();
+                continue;
+            }
+
+            idle_ = idle_ + waited;
+
+            if (job[0] == JOB_QUERY) {
+                queries.resize((size_t)batch_ * myDim_);
+                MPI_Recv(queries.data(), (int)queries.size(), MPI_FLOAT,
+                         MASTER_RANK, TAG_QUERY, MPI_COMM_WORLD,
+                         MPI_STATUS_IGNORE);
+                total_ = run.seconds();
+                continue;
+            }
+
+            // ---- a cluster: open it and post its upstream receive ----
+            Pending p;
+            p.clusterId = job[0];
+            p.n = job[1];
+            int item = job[2];
+            p.m = job[3];
+            p.slotTag = job[4];
+
+            // Everything about this worker's part in the chain comes out of
+            // the table: which item it is decides where the chain starts, and
+            // the table says who is on either side.
+            int prevCol = prevOf_[item];
+            int nextCol = nextOf_[item];
+            p.stage = stageOf_[item];        // 0 = first stop
+            p.isFirst = (prevCol < 0);
+            p.isLast = (nextCol < 0);
+            p.prevRank = p.isFirst ? MASTER_RANK : rowBase_ + prevCol;
+            p.nextRank = p.isLast ? MASTER_RANK : rowBase_ + nextCol;
+
+            p.qidx.resize(p.m);
+            MPI_Recv(p.qidx.data(), p.m, MPI_INT, MASTER_RANK, TAG_QIDX,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            p.thresholds.resize(p.m);
+            MPI_Recv(p.thresholds.data(), p.m, MPI_FLOAT, MASTER_RANK,
+                     TAG_THRESHOLD, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            size_t total = (size_t)p.m * (size_t)p.n;
+            MPI_Request up = MPI_REQUEST_NULL;
+            if (p.isFirst) {
+                p.sums.assign(total, 0.0f);   // nothing upstream to wait for
+            } else {
+                p.sums.resize(total);
+                // MPI: posted now, collected later -- the point of the whole
+                // arrangement is that this wait overlaps other clusters.
+                MPI_Irecv(p.sums.data(), (int)total, MPI_FLOAT, p.prevRank,
+                          tagSums(p.slotTag), MPI_COMM_WORLD, &up);
+            }
+            pend.push_back(std::move(p));
+            pendReq.push_back(up);
         }
 
-        // total_ stops at the last real job rather than at the shutdown
-        // message: with --check the master runs its single-machine reference
-        // afterwards, and counting that wait would read as idle workers.
-        if (job[0] == JOB_SHUTDOWN) {
-            break;   // the counters were already collected by JOB_STATS
+        if (done) {
+            break;
         }
-
-        // The wait for either of the two bookkeeping messages is not idle
-        // time: the master is checking answers or printing, not withholding
-        // work, and counting it would read as starved workers.
-        if (job[0] == JOB_STATS) {
-            MPI_Send(aliveAtStage_.data(), bDim_, MPI_LONG, MASTER_RANK,
-                     TAG_STATS, MPI_COMM_WORLD);
-            double times[6] = {total_, idle_, recv_, compute_, send_,
-                               (double)jobs_};
-            MPI_Send(times, 6, MPI_DOUBLE, MASTER_RANK, TAG_TIMES,
-                     MPI_COMM_WORLD);
+        if (pend.empty()) {
             continue;
         }
 
-        // Start of a counted stretch: forget everything before it. Sent before
-        // the pass that gets reported, so an earlier --loop pass or an earlier
-        // --nprobes value does not leak into these numbers.
-        if (job[0] == JOB_RESET) {
-            aliveAtStage_.assign(bDim_, 0);
-            idle_ = 0.0;
-            recv_ = 0.0;
-            compute_ = 0.0;
-            send_ = 0.0;
-            jobs_ = 0;
-            total_ = 0.0;
-            run.reset();
-            continue;
+        // ---- 2. work on whichever open cluster can be worked on ----
+        int pick = -1;
+        for (size_t i = 0; i < pendReq.size(); ++i) {
+            if (pendReq[i] == MPI_REQUEST_NULL) {
+                pick = (int)i;   // a chain head, nothing to wait for
+                break;
+            }
+        }
+        if (pick < 0) {
+            // MPI: has anyone's upstream landed while we were busy?
+            int flag = 0;
+            int idx = MPI_UNDEFINED;
+            MPI_Testany((int)pendReq.size(), pendReq.data(), &idx, &flag,
+                        MPI_STATUS_IGNORE);
+            if (flag && idx != MPI_UNDEFINED) {
+                pick = idx;
+            }
+        }
+        if (pick < 0) {
+            // Nothing ready and nothing else to do. Block, rather than spin
+            // the way the sample does with MPI_Test and usleep(100).
+            phase.reset();
+            int idx = MPI_UNDEFINED;
+            MPI_Waitany((int)pendReq.size(), pendReq.data(), &idx,
+                        MPI_STATUS_IGNORE);
+            recv_ = recv_ + phase.seconds();
+            pick = idx;
         }
 
-        idle_ = idle_ + waited;
-
-        if (job[0] == JOB_QUERY) {
-            queries.resize((size_t)batch_ * myDim_);
-            MPI_Recv(queries.data(), (int)queries.size(), MPI_FLOAT,
-                     MASTER_RANK, TAG_QUERY, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            total_ = run.seconds();
-            continue;
-        }
-
-        int clusterId = job[0];
-        int n = job[1];
-        int item = job[2];
-        int m = job[3];
-
-        // Everything about this worker's part in the chain comes out of the
-        // table: which item it is decides where the chain starts, and the
-        // table says who is on either side.
-        int prevCol = prevOf_[item];
-        int nextCol = nextOf_[item];
-        int stage = stageOf_[item];        // 0 = first stop
-        bool isFirst = (prevCol < 0);
-        bool isLast = (nextCol < 0);
-        int prevRank = isFirst ? MASTER_RANK : rowBase_ + prevCol;
-        int nextRank = isLast ? MASTER_RANK : rowBase_ + nextCol;
-
-        qidx.resize(m);
-        MPI_Recv(qidx.data(), m, MPI_INT, MASTER_RANK, TAG_QIDX,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        thresholds.resize(m);
-        MPI_Recv(thresholds.data(), m, MPI_FLOAT, MASTER_RANK, TAG_THRESHOLD,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        Pending& p = pend[pick];
+        size_t total = (size_t)p.m * (size_t)p.n;
 
         // gemm wants the participating slices contiguous
-        picked.resize((size_t)m * myDim_);
-        for (int q = 0; q < m; ++q) {
-            const float* src = &queries[(size_t)qidx[q] * myDim_];
+        picked.resize((size_t)p.m * myDim_);
+        for (int q = 0; q < p.m; ++q) {
+            const float* src = &queries[(size_t)p.qidx[q] * myDim_];
             std::copy(src, src + myDim_, &picked[(size_t)q * myDim_]);
         }
 
-        size_t total = (size_t)m * n;
-        if (isFirst) {
-            sums.assign(total, 0.0f);
-        } else {
-            phase.reset();
-            sums.resize(total);
-            MPI_Recv(sums.data(), (int)total, MPI_FLOAT, prevRank, TAG_SUMS,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            recv_ = recv_ + phase.seconds();
-        }
-
         phase.reset();
-        accumulate(picked.data(), m, clusterId, thresholds.data(), isFirst, sums);
+        accumulate(picked.data(), p.m, p.clusterId, p.thresholds.data(),
+                   p.isFirst, p.sums);
         compute_ = compute_ + phase.seconds();
         jobs_ = jobs_ + 1;
 
         for (size_t j = 0; j < total; ++j) {
-            if (sums[j] < PRUNED) {
-                aliveAtStage_[stage] = aliveAtStage_[stage] + 1;
+            if (p.sums[j] < PRUNED) {
+                aliveAtStage_[p.stage] = aliveAtStage_[p.stage] + 1;
             }
         }
 
@@ -352,7 +437,7 @@ int WorkerNode::run() {
         MPI_Wait(&reqSums[slot], MPI_STATUS_IGNORE);
         send_ = send_ + phase.seconds();
 
-        if (isLast) {
+        if (p.isLast) {
             // End of the chain. This is the only worker that ever sees these
             // candidates' full distances, so it can pick the k nearest itself
             // and send just those, instead of handing every running total back
@@ -362,19 +447,19 @@ int WorkerNode::run() {
             // The ids kept are positions in the cluster, which is what lets
             // the master map them back and still drop the ones prewarm
             // already pushed.
-            Stopwatch pick;
-            int kSend = (k_ < n) ? k_ : n;
+            Stopwatch pickWatch;
+            int kSend = (k_ < p.n) ? k_ : p.n;
             Candidate pad;
             pad.id = -1;
             pad.dist = PRUNED;          // a query with fewer than kSend
-            outTop[slot].assign((size_t)m * kSend, pad);   // survivors pads
+            outTop[slot].assign((size_t)p.m * kSend, pad);   // survivors pads
 
             // OpenMP: one thread per query, each writing its own row
             #pragma omp parallel for schedule(static)
-            for (int q = 0; q < m; ++q) {
+            for (int q = 0; q < p.m; ++q) {
                 TopKHeap heap(kSend);
-                const float* row = &sums[(size_t)q * n];
-                for (int v = 0; v < n; ++v) {
+                const float* row = &p.sums[(size_t)q * p.n];
+                for (int v = 0; v < p.n; ++v) {
                     if (row[v] < PRUNED) {
                         heap.push(v, row[v]);
                     }
@@ -387,18 +472,33 @@ int WorkerNode::run() {
                 }
             }
 
-            compute_ = compute_ + pick.seconds();
+            compute_ = compute_ + pickWatch.seconds();
 
             // MPI: as bytes, since a Candidate is an int beside a float and
             // every rank is the same build (see topk_heap.h).
             MPI_Isend(outTop[slot].data(),
-                      (int)((size_t)m * kSend * sizeof(Candidate)), MPI_BYTE,
-                      MASTER_RANK, TAG_TOPK, MPI_COMM_WORLD, &reqSums[slot]);
+                      (int)((size_t)p.m * kSend * sizeof(Candidate)), MPI_BYTE,
+                      MASTER_RANK, tagTopk(p.slotTag), MPI_COMM_WORLD,
+                      &reqSums[slot]);
         } else {
-            outSums[slot] = sums;
-            MPI_Isend(outSums[slot].data(), (int)total, MPI_FLOAT, nextRank, TAG_SUMS,
-                      MPI_COMM_WORLD, &reqSums[slot]);
+            outSums[slot] = std::move(p.sums);
+            MPI_Isend(outSums[slot].data(), (int)total, MPI_FLOAT, p.nextRank,
+                      tagSums(p.slotTag), MPI_COMM_WORLD, &reqSums[slot]);
         }
+
+        // The ablation arm of Fig. 2(b): waiting here instead of letting the
+        // send ride alongside the next cluster is what blocking communication
+        // would cost. The send itself stays non-blocking, or a row of workers
+        // sending to each other would deadlock.
+        if (cfg_.blockSend) {
+            phase.reset();
+            MPI_Wait(&reqSums[slot], MPI_STATUS_IGNORE);
+            send_ = send_ + phase.seconds();
+        }
+
+        pend.erase(pend.begin() + pick);
+        pendReq.erase(pendReq.begin() + pick);
+
         total_ = run.seconds();
         slot = (slot + 1) % slots;
     }

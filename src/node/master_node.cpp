@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <iomanip>
 #include <ios>
 #include <cmath>
@@ -253,6 +254,16 @@ void MasterNode::splitGrid(int bVec, int bDim) {
         clusterOwner_[c] = c % bVec_;
     }
 
+    // The chain tags are derived from the master's in-flight slots, so the
+    // largest one this layout can produce is fixed here. Nothing near MPI's
+    // ceiling is reachable at any worker count that fits on a cluster, but a
+    // tag MPI rejects fails at the receive rather than at the send, which is
+    // an unpleasant way to find out.
+    if (!tagsFitMpi(bVec_ * bDim_ + 1)) {
+        std::cerr << "chain tags exceed this MPI's maximum" << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
     std::cout << "\n===== 3. layout =====" << std::endl;
     std::cout << "grid: " << bVec_ << " vector partitions x "
               << bDim_ << " dimension slices" << std::endl;
@@ -356,8 +367,8 @@ void MasterNode::resetCounters() {
     scanned_ = 0;
     scannedRow_.assign(bVec_, 0);
     for (int w = 1; w <= numWorkers_; ++w) {
-        int job[4] = {JOB_RESET, 0, 0, 0};
-        MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+        int job[5] = {JOB_RESET, 0, 0, 0, 0};
+        MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
     }
 }
 
@@ -367,8 +378,8 @@ void MasterNode::collectStats() {
     aliveAfterStage_.assign(bDim_, 0);
 
     for (int w = 1; w <= numWorkers_; ++w) {
-        int job[4] = {JOB_STATS, 0, 0, 0};
-        MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+        int job[5] = {JOB_STATS, 0, 0, 0, 0};
+        MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
     }
 
     // every worker reports its counts per chain position; sum them up
@@ -387,8 +398,8 @@ void MasterNode::collectStats() {
 
 void MasterNode::shutdown() {
     for (int w = 1; w <= numWorkers_; ++w) {
-        int job[4] = {JOB_SHUTDOWN, 0, 0, 0};
-        MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+        int job[5] = {JOB_SHUTDOWN, 0, 0, 0, 0};
+        MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
     }
 }
 
@@ -489,18 +500,28 @@ void MasterNode::prewarmHeap(const float* query, QueryState& state, TopKHeap& he
 //
 // Only the queries in `members` travel with the job, so a cluster wanted by
 // three of thirty-two costs three rows of running totals, not thirty-two.
-void MasterNode::dispatchOne(int row, int clusterId, int item,
+void MasterNode::dispatchOne(int row, int clusterId, int item, int slot,
                              const std::vector<int>& members,
                              const std::vector<float>& thresholds) {
     int n = (int)index_.clusterIds(clusterId).size();
     int m = (int)members.size();
 
+    // MPI counts are int. Nothing near this is reachable at any sane setting
+    // -- it would take a batch in the tens of thousands against a cluster of
+    // millions -- but the failure would be silent truncation, so it is worth
+    // one comparison per cluster to turn it into a stop.
+    if ((size_t)m * (size_t)n > (size_t)INT_MAX) {
+        std::cerr << "message too large: m=" << m << " n=" << n
+                  << " exceeds what an MPI count can hold" << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
     for (int col = 0; col < bDim_; ++col) {
         int w = row * bDim_ + col + 1;
         // MPI: three small messages per worker -- the job, who wants it, and
         // their thresholds
-        int job[4] = {clusterId, n, item, m};
-        MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+        int job[5] = {clusterId, n, item, m, slot};
+        MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
         MPI_Send(members.data(), m, MPI_INT, w, TAG_QIDX, MPI_COMM_WORLD);
         MPI_Send(thresholds.data(), m, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
     }
@@ -591,11 +612,14 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<std::vector<int>>>
                         continue;
                     }
 
-                    dispatchOne(r, c, p, members, thresholds);
-
+                    // The slot is picked first because its number is what
+                    // tags this cluster's messages all the way down the chain.
                     while (req[free] != MPI_REQUEST_NULL) {
                         free = (free + 1) % maxInFlight;
                     }
+
+                    dispatchOne(r, c, p, free, members, thresholds);
+
                     int n = (int)index_.clusterIds(c).size();
                     int kSend = (cfg_.k < n) ? cfg_.k : n;
                     slot[free].group = g;
@@ -612,7 +636,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<std::vector<int>>>
                     // every running total, m*k instead of m*n floats.
                     MPI_Irecv(slot[free].top.data(),
                               (int)(slot[free].top.size() * sizeof(Candidate)),
-                              MPI_BYTE, lastRankOf(r, p), TAG_TOPK,
+                              MPI_BYTE, lastRankOf(r, p), tagTopk(free),
                               MPI_COMM_WORLD, &req[free]);
                     inFlight[g] = inFlight[g] + 1;
                 }
@@ -696,8 +720,8 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
     // Every worker gets the whole batch's slices once; individual jobs then
     // name the queries they want by position.
     for (int w = 1; w <= numWorkers_; ++w) {
-        int job[4] = {JOB_QUERY, 0, 0, 0};
-        MPI_Send(job, 4, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+        int job[5] = {JOB_QUERY, 0, 0, 0, 0};
+        MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
 
         int col = (w - 1) % bDim_;
         int begin = plan_.begin(col);

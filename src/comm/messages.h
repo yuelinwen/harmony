@@ -1,6 +1,8 @@
 #ifndef HARMONY_COMM_MESSAGES_H
 #define HARMONY_COMM_MESSAGES_H
 
+#include <mpi.h>
+
 // What master and workers send each other. Both sides include this file, so a
 // tag can never disagree between them -- a mismatch would not fail to compile,
 // it would hang in MPI_Recv.
@@ -22,26 +24,44 @@ const int TAG_ORDER   = 13;  // int[3 * bDim]: this worker's rows of the
                              // per item. See engine/search_order.h.
 
 // per batch of queries
-const int TAG_JOB       = 5;   // int[4], see below
+const int TAG_JOB       = 5;   // int[5], see below
 const int TAG_QUERY     = 6;   // float[batch * myDim]: this worker's slices
 const int TAG_QIDX      = 9;   // int[m]: which queries of the batch take part
 const int TAG_THRESHOLD = 7;   // float[m]: tau^2 for each of them
-const int TAG_SUMS      = 8;   // float[m * n]: running partial distances
 const int TAG_STATS     = 10;  // long[bDim]: survivors per chain position
-const int TAG_TOPK      = 11;  // Candidate[m * kSend]: the chain tail's answer
 const int TAG_TIMES     = 12;  // double[6]: where a worker's wall time went
 
-// TAG_SUMS carries running totals from one worker to the next, one float per
-// candidate, because the next worker needs every candidate's total to add to.
-// The last worker in the chain is the only one that ever sees a full distance,
-// so it does not forward totals at all: it keeps the k nearest per query and
-// sends those as TAG_TOPK (paper §4.3, only the last reports back). k is
-// around 100 against a cluster's few thousand vectors, which is why this is
-// the hop worth shrinking.
+// Partial sums and top-K answers get a tag of their own per in-flight
+// cluster, taken from the master's slot for it.
 //
-// The ids in TAG_TOPK are positions within the cluster, not global vector
-// ids -- the master maps them back, and that lets it apply the same prewarm
+// They have to, because a worker does not process clusters in the order the
+// master handed them over: one whose upstream has arrived overtakes one still
+// waiting. Two clusters travelling between the same pair of ranks would then
+// be matched by arrival order rather than by which is which, and a worker
+// would add its slice to the wrong running totals. MPI matches on the tag
+// instead, so the order stops mattering. (The sample does the same thing with
+// tag = groupId * blockCount + blockId.)
+//
+// A slot is reused only once its cluster has fully reported, so slot numbers
+// are unique among everything in flight. Values stay small -- one per worker
+// plus a spare -- and tagsFitMpi() confirms the largest is one MPI will
+// accept.
+const int TAG_CHAIN_BASE = 100;
+
+// float[m * n]: running partial distances, one worker to the next.
+inline int tagSums(int slot) { return TAG_CHAIN_BASE + 2 * slot; }
+
+// Candidate[m * kSend]: the chain tail's answer, straight to the master. The
+// last worker is the only one that ever sees a full distance, so it does not
+// forward totals at all -- it keeps the k nearest per query and sends those
+// (paper §4.3, only the last reports back). k is around 100 against a
+// cluster's few thousand vectors, which is why this is the hop worth
+// shrinking.
+//
+// The ids are positions within the cluster, not global vector ids -- the
+// master maps them back, and that lets it apply the same prewarm
 // de-duplication it did when it received raw totals.
+inline int tagTopk(int slot) { return TAG_CHAIN_BASE + 2 * slot + 1; }
 
 // A pruned candidate is marked by setting its running sum to this, rather
 // than carrying a separate alive flag: it is larger than any real squared
@@ -54,9 +74,10 @@ const int TAG_TIMES     = 12;  // double[6]: where a worker's wall time went
 //     threshold from an empty heap prunes nothing rather than everything.
 const float PRUNED = 1e38f;
 
-// TAG_JOB carries int[4] = {what, n, item, m}. `what` >= 0 is a cluster id, n
-// is how many vectors it holds, and m is how many queries of the batch probed
-// it -- usually only part of the batch, so TAG_QIDX names which.
+// TAG_JOB carries int[5] = {what, n, item, m, slot}. `what` >= 0 is a cluster
+// id, n is how many vectors it holds, and m is how many queries of the batch
+// probed it -- usually only part of the batch, so TAG_QIDX names which. slot
+// is the master's slot for this cluster, which names its chain tags above.
 //
 // `item` is this cluster's position in the chunk its row is working on, and
 // picks a row out of the chain table the worker was given at setup. Different
@@ -72,6 +93,20 @@ const int JOB_RESET    = -3;
 // it ends the process. --nprobes runs several searches against one
 // distribution and each needs its own numbers.
 const int JOB_STATS    = -4;
+
+// The largest chain tag this layout will use has to be one MPI accepts. The
+// standard only promises 32767, and the tags here stay far below that, so
+// this is a guard against a future layout rather than a live worry. The
+// sample checks the same attribute inside its tag generator.
+inline bool tagsFitMpi(int maxSlots) {
+    int* ub = nullptr;
+    int found = 0;
+    MPI_Comm_get_attr(MPI_COMM_WORLD, MPI_TAG_UB, &ub, &found);
+    if (!found || ub == nullptr) {
+        return true;
+    }
+    return tagTopk(maxSlots - 1) <= *ub;
+}
 
 }  // namespace harmony
 

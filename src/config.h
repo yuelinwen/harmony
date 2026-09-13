@@ -37,7 +37,7 @@ struct Config {
 
     // speed
     int threads = 1;      // OpenMP threads inside each worker (paper §5)
-    int batch = 32;       // queries handled together (Algorithm 1 line 13)
+    int batch = 1024;       // queries handled together (Algorithm 1 line 13)
     // Heap seeding, Algorithm 1 lines 1-5. prewarmLists clusters of the query's
     // nprobe, prewarm vectors out of each. 0 either way turns it off.
     //
@@ -50,6 +50,9 @@ struct Config {
     int prewarmLists = 1;
     bool pruning = true;  // dimension-level early exit (paper Fig. 10)
     bool mkl = true;      // gemm for the first slice, if MKL was compiled in
+    // Wait for each forward to land before starting the next cluster, which
+    // is the blocking arm of the paper's Fig. 2(b) comparison.
+    bool blockSend = false;
     bool check = true;    // re-run each query on one machine and compare
     int loop = 1;         // timed passes over the query set, averaged
     std::string csv;      // append one row per run here, "" = off
@@ -89,12 +92,13 @@ inline void printUsage(const char* prog) {
         << "\n"
         << "speed\n"
         << "  --threads <int>    OpenMP threads per worker          (1)\n"
-        << "  --batch <int>      queries processed together         (32)\n"
+        << "  --batch <int>      queries processed together        (1024)\n"
         << "  --prewarm <int>    heap seed vectors per cluster      (500)\n"
         << "  --prewarmlists <int>  clusters seeded per query         (1)\n"
         << "                     either set to 0 turns seeding off\n"
         << "  --pruning <0|1>    dimension-level pruning            (1)\n"
         << "  --mkl <0|1>        gemm for the first slice           (1)\n"
+        << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
         << "                     costs more than the search it checks\n"
         << "  --loop <int>       timed passes, averaged               (1)\n"
@@ -161,6 +165,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.warmup = std::atoi(argv[++i]);
         } else if (opt == "--batch" && hasValue) {
             cfg.batch = std::atoi(argv[++i]);
+        } else if (opt == "--blocksend" && hasValue) {
+            cfg.blockSend = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--mkl" && hasValue) {
             cfg.mkl = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--loop" && hasValue) {
