@@ -34,6 +34,7 @@ class TopKHeap {
 public:
     TopKHeap(int k) {
         k_ = k; // top k records
+        seed_ = 1e30f;
     }
 
     // Offers a candidate to the heap. Kept only if it is among the K best.
@@ -55,11 +56,20 @@ public:
         }
     }
 
-    // The worst kept candidate's distance, or infinity while the heap is not
-    // full and every candidate is accepted.
+    // A threshold to use until the heap has K of its own. Prewarming measures
+    // a few real distances, keeps the K-th as this, and throws the candidates
+    // away -- they are all in clusters the search visits anyway, so they come
+    // back on their own. That is what the sample does, and it saves the
+    // pipeline from having to remember which ones it already has.
+    void seedThreshold(float t) {
+        seed_ = t;
+    }
+
+    // The worst kept candidate's distance, or the seeded threshold while the
+    // heap is not yet full -- infinity if nothing seeded it.
     float worst() const {
         if ((int)heap_.size() < k_) {
-            return 1e30f;
+            return seed_;
         }
         return heap_.top().dist;
     }
@@ -82,9 +92,14 @@ public:
         return (int)heap_.size();
     }
 
+    int capacity() const {
+        return k_;
+    }
+
 private:
     std::priority_queue<Candidate, std::vector<Candidate>, CandidateLess> heap_;
     int k_;
+    float seed_;
 };
 
 }  // namespace harmony

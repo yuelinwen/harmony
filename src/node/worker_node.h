@@ -71,11 +71,11 @@ public:
     // threshold -- partial sums only grow, so one that has passed can never
     // come back (paper Algorithm 1, lines 6-12).
     //
-    // Works on m queries at once: `queries` is m slices of myDim floats,
-    // `sums` is m rows of n running totals. `first` means the head of the
-    // chain, where nothing is pruned yet and the gemm path applies.
-    void accumulate(const float* queries, int m, int clusterId,
-                    const float* thresholds, bool first, std::vector<float>& sums);
+    // Works on one block of queries: [firstQ, firstQ+len) of the batch, each
+    // against every cluster of its probe list that this worker holds. qOff
+    // says where each query's run of running totals starts in sums.
+    void accumulate(int firstQ, int len, const float* thresholds,
+                    const std::vector<size_t>& qOff, std::vector<float>& sums);
 
 private:
     // Takes myDim, the cluster count, and then every cluster block.
@@ -93,6 +93,26 @@ private:
     std::vector<int> nextOf_;
     std::vector<int> prevOf_;
     std::vector<int> stageOf_;
+
+    // The batch's query slices and probe lists, sent once per batch. The
+    // probe lists are what let this worker work out a block's buffer layout
+    // for itself, the same way the rest of its row does.
+    std::vector<float> queries_;
+    std::vector<int> probes_;
+    int nprobe_;
+
+    // clusterId -> index into blocks_, or -1 for one this row does not hold.
+    // It only reaches as far as the largest id this row was given, so an id
+    // past its end is simply one of somebody else's -- which is why every
+    // lookup goes through blockOf rather than indexing it directly.
+    std::vector<int> where_;
+
+    int blockOf(int c) const {
+        if (c < 0 || c >= (int)where_.size()) {
+            return -1;
+        }
+        return where_[c];
+    }
     int rowBase_;   // rank of column 0 in this row
     int batch_;     // queries the master sends slices for
     int k_;         // neighbours to keep when this worker ends a chain

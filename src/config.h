@@ -49,18 +49,21 @@ struct Config {
     int prewarm = 500;
     int prewarmLists = 1;
     bool pruning = true;  // dimension-level early exit (paper Fig. 10)
-    bool mkl = true;      // gemm for the first slice, if MKL was compiled in
+    // Kept so runs from before block dispatch still parse. A block's natural
+    // step is one query against one cluster, which is a matrix-vector product
+    // rather than a matrix-matrix one, so there is no gemm left to hand MKL.
+    bool mkl = true;
     // Wait for each forward to land before starting the next cluster, which
     // is the blocking arm of the paper's Fig. 2(b) comparison.
     bool blockSend = false;
-    // Clusters a vector partition may have out at once, in multiples of bDim.
-    // At 1 a worker has nothing to do while it waits for one cluster's
-    // upstream; deeper, it computes another meanwhile. The sample gets the
-    // same overlap from putting every query block of a group in flight before
-    // computing any of them, and its examples use four to eight. Deeper also
-    // costs memory -- a worker holds m*n running totals per open cluster --
-    // and reads thresholds a little earlier, so it prunes slightly less.
-    int depth = 4;
+    // Query blocks a group is cut into. A block is the unit that travels the
+    // dimension chain, and all of a partition's blocks are in flight at once,
+    // so this is also how much a worker has to overlap the wait for one
+    // block's upstream with another block's arithmetic. The sample's examples
+    // use four to eight. More blocks costs memory -- a worker holds one
+    // running total per (query, candidate) pair of every open block -- and
+    // reads thresholds a little earlier, so it prunes slightly less.
+    int block = 4;
     bool check = true;    // re-run each query on one machine and compare
     int loop = 1;         // timed passes over the query set, averaged
     std::string csv;      // append one row per run here, "" = off
@@ -105,10 +108,10 @@ inline void printUsage(const char* prog) {
         << "  --prewarmlists <int>  clusters seeded per query         (1)\n"
         << "                     either set to 0 turns seeding off\n"
         << "  --pruning <0|1>    dimension-level pruning            (1)\n"
-        << "  --mkl <0|1>        gemm for the first slice           (1)\n"
+        << "  --mkl <0|1>        accepted, no longer does anything  (1)\n"
         << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
-        << "  --depth <int>      clusters in flight per partition      (4)\n"
-        << "                     in multiples of the dimension slices\n"
+        << "  --block <int>      query blocks per group               (4)\n"
+        << "                     all of a partition's blocks fly at once\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
         << "                     costs more than the search it checks\n"
         << "  --loop <int>       timed passes, averaged               (1)\n"
@@ -175,10 +178,10 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.warmup = std::atoi(argv[++i]);
         } else if (opt == "--batch" && hasValue) {
             cfg.batch = std::atoi(argv[++i]);
-        } else if (opt == "--depth" && hasValue) {
-            cfg.depth = std::atoi(argv[++i]);
-            if (cfg.depth < 1) {
-                cfg.depth = 1;
+        } else if (opt == "--block" && hasValue) {
+            cfg.block = std::atoi(argv[++i]);
+            if (cfg.block < 1) {
+                cfg.block = 1;
             }
         } else if (opt == "--blocksend" && hasValue) {
             cfg.blockSend = (std::atoi(argv[++i]) != 0);

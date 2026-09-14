@@ -81,12 +81,6 @@ public:
     struct QueryState {
         int id;                       // row in query_
         std::vector<int> clusters;    // its nprobe nearest
-
-        // Which clusters the heap was seeded from, and how many leading
-        // vectors of each went in. The pipeline needs both to avoid pushing
-        // those same vectors a second time when the cluster reports.
-        std::vector<int> prewarmCluster;
-        std::vector<int> prewarmed;
     };
 
     // Algorithm 1, lines 19-23. Runs a batch of queries, the paper's
@@ -109,17 +103,20 @@ public:
     // partition its heaps already carry the first one's distances (Fig. 5a).
     // Groups advance independently -- at any stage the mapping group -> row is
     // a permutation, so every row stays busy.
-    void vectorPipeline(const std::vector<std::vector<std::vector<int>>>& work,
-                        const std::vector<std::vector<int>>& groupMembers,
+    void vectorPipeline(const std::vector<std::vector<int>>& groupMembers,
                         const std::vector<QueryState>& batch,
                         std::vector<TopKHeap>& heaps);
 
     // Algorithm 1, lines 6-12. Sends one cluster to every worker in its row
     // and returns; the workers pass the running totals down the chain and only
     // the last reports back. `members` are the batch positions that probed it.
-    void dispatchOne(int row, int clusterId, int item, int slot,
-                     const std::vector<int>& members,
-                     const std::vector<float>& thresholds);
+    void dispatchBlock(int row, int firstQ, int len, int item, int slot,
+                       const std::vector<float>& thresholds);
+
+    // Candidates a block of queries contributes in one vector partition, in
+    // the order the workers of that row will lay them out.
+    long blockLoad(int row, int firstQ, int len,
+                   const std::vector<QueryState>& batch) const;
 
     // Which worker ends this item's chain, and so reports its result.
     int lastRankOf(int row, int item) const;

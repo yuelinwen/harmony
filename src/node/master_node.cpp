@@ -454,16 +454,19 @@ void MasterNode::printWorkerTimes() const {
 }
 
 // Without this the heap starts empty, worst() is infinite, and nothing can be
-// pruned until a whole cluster has been through the pipeline (Algorithm 1,
-// lines 1-5). Samples come from the nearest cluster, not at random, which
+// pruned until a whole block has been through the pipeline (Algorithm 1,
+// lines 1-5). Samples come from the nearest clusters, not at random, which
 // makes the starting threshold much tighter.
 //
 // Only the master can do this: distances here are over every dimension, and a
 // worker holds a fraction of each vector.
+//
+// What it keeps is the threshold, not the candidates. They all sit in
+// clusters the search is about to visit, so they come back on their own, and
+// throwing them away saves the pipeline from having to remember which ones
+// the heap already holds. This is what the sample does -- warmUpSearch, then
+// init_result to empty the heap again.
 void MasterNode::prewarmHeap(const float* query, QueryState& state, TopKHeap& heap) {
-    state.prewarmCluster.clear();
-    state.prewarmed.clear();
-
     // Spread over the nearest few clusters rather than taking everything from
     // the first one, as the authors' code does. One cluster can miss: the
     // nearest centroid is not always where the nearest vectors are, and a seed
@@ -473,57 +476,56 @@ void MasterNode::prewarmHeap(const float* query, QueryState& state, TopKHeap& he
         lists = (int)state.clusters.size();
     }
 
+    TopKHeap seed(heap.capacity());
     for (int i = 0; i < lists; ++i) {
-        int clusterId = state.clusters[i];
-        const std::vector<int>& ids = index_.clusterIds(clusterId);
+        const std::vector<int>& ids = index_.clusterIds(state.clusters[i]);
 
         int n = (int)ids.size();
         if (cfg_.prewarm < n) {
             n = cfg_.prewarm;
         }
-        if (n <= 0) {
-            continue;
-        }
-
         for (int j = 0; j < n; ++j) {
-            heap.push(ids[j], l2DistanceSquared(query, base_.vec(ids[j]),
+            seed.push(ids[j], l2DistanceSquared(query, base_.vec(ids[j]),
                                                 base_.getDim()));
         }
-        state.prewarmCluster.push_back(clusterId);
-        state.prewarmed.push_back(n);
     }
+
+    heap.seedThreshold(seed.worst());
 }
 
-// Hands one cluster to every worker in its row and returns immediately. The
-// workers of a row then run one after another, not in parallel: in parallel
-// every slice would be computed in full and nothing saved (paper §3.2).
-//
-// Only the queries in `members` travel with the job, so a cluster wanted by
-// three of thirty-two costs three rows of running totals, not thirty-two.
-void MasterNode::dispatchOne(int row, int clusterId, int item, int slot,
-                             const std::vector<int>& members,
-                             const std::vector<float>& thresholds) {
-    int n = (int)index_.clusterIds(clusterId).size();
-    int m = (int)members.size();
-
-    // MPI counts are int. Nothing near this is reachable at any sane setting
-    // -- it would take a batch in the tens of thousands against a cluster of
-    // millions -- but the failure would be silent truncation, so it is worth
-    // one comparison per cluster to turn it into a stop.
-    if ((size_t)m * (size_t)n > (size_t)INT_MAX) {
-        std::cerr << "message too large: m=" << m << " n=" << n
-                  << " exceeds what an MPI count can hold" << std::endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);
+// Candidates a block of queries contributes in one vector partition. This has
+// to walk the queries and their probe lists in exactly the order the workers
+// of that row will, since that order is the buffer layout and the master uses
+// the total to size its receive.
+long MasterNode::blockLoad(int row, int firstQ, int len,
+                           const std::vector<QueryState>& batch) const {
+    long total = 0;
+    for (int j = 0; j < len; ++j) {
+        const std::vector<int>& cl = batch[firstQ + j].clusters;
+        for (int i = 0; i < (int)cl.size(); ++i) {
+            if (clusterOwner_[cl[i]] == row) {
+                total = total + index_.clusterSize(cl[i]);
+            }
+        }
     }
+    return total;
+}
 
+// Hands one block of queries to every worker in a row and returns immediately.
+// The workers of a row then run one after another, not in parallel: in
+// parallel every slice would be computed in full and nothing saved (§3.2).
+//
+// Two small messages rather than three. The worker already has the batch's
+// probe lists, so it works out for itself which of this block's queries want
+// which of its clusters -- there is no list of participants to send.
+void MasterNode::dispatchBlock(int row, int firstQ, int len, int item, int slot,
+                               const std::vector<float>& thresholds) {
     for (int col = 0; col < bDim_; ++col) {
         int w = row * bDim_ + col + 1;
-        // MPI: three small messages per worker -- the job, who wants it, and
-        // their thresholds
-        int job[5] = {clusterId, n, item, m, slot};
+        int job[5] = {JOB_BLOCK, firstQ, len, item, slot};
         MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
-        MPI_Send(members.data(), m, MPI_INT, w, TAG_QIDX, MPI_COMM_WORLD);
-        MPI_Send(thresholds.data(), m, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
+        MPI_Send(thresholds.data(), len, MPI_FLOAT, w, TAG_THRESHOLD,
+                 MPI_COMM_WORLD);
     }
 }
 
@@ -535,63 +537,54 @@ int MasterNode::lastRankOf(int row, int item) const {
 
 // Three levels of overlap: every query group is given work before anything is
 // collected, each group holds one vector partition at a time (Fig. 5a), and
-// within that partition several clusters are in flight at once (Fig. 5b).
-// Groups refill on their own and MPI_Waitany takes whichever comes back first,
-// so a slow group never holds up a fast one.
+// within that partition all of its blocks are in flight at once (Fig. 5b,
+// stages X, Y and Z). Groups refill on their own and MPI_Waitany takes
+// whichever comes back first, so a slow group never holds up a fast one.
 //
-// How many a partition may hold is --depth, and it is what decides whether a
-// worker can hide the wait for one cluster's upstream behind another cluster's
-// arithmetic. With one each, it cannot: measured compute was 6.8% of a
-// worker's time in dimension mode, the rest of it blocked. The sample has the
-// same overlap structurally -- every query block of a group has its receive
-// posted before any of them is computed -- which is what Fig. 5b draws as
-// stages X, Y and Z running at once.
+// Having several blocks open is what lets a worker hide the wait for one
+// block's upstream behind another block's arithmetic; with one, measured
+// compute was 6.8% of a worker's time in dimension mode, the rest blocked.
 //
-// Survivors enter their query's heap as soon as the cluster reports, so
+// Survivors enter their query's heap as soon as a block reports, so
 // thresholds keep tightening -- sooner than Algorithm 1 line 18, which prunes
 // strictly more and changes nothing else.
-void MasterNode::vectorPipeline(const std::vector<std::vector<std::vector<int>>>& work,
-                                const std::vector<std::vector<int>>& groupMembers,
+void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMembers,
                                 const std::vector<QueryState>& batch,
                                 std::vector<TopKHeap>& heaps) {
     struct Slot {
         int group;
         int row;
-        int clusterId;
-        int n;       // vectors in the cluster
-        int kSend;   // how many of them the chain tail reports per query
-        std::vector<int> members;
-        std::vector<Candidate> top;   // members.size() rows of kSend
+        int firstQ;
+        int len;
+        std::vector<Candidate> top;   // len rows of k, nearest first, padded
     };
-    // Enough slots for every group to be at its limit at once, plus a spare
-    // so the search for a free one below cannot spin forever.
-    int perGroupLimit = bDim_ * cfg_.depth;
-    int maxInFlight = bVec_ * perGroupLimit + 1;
+
+    int k = cfg_.k;
+    int blocks = cfg_.block;
+
+    // Enough slots for every group to have all of its blocks out at once,
+    // plus a spare so the search for a free one below cannot spin forever.
+    int maxInFlight = bVec_ * blocks + 1;
     std::vector<Slot> slot(maxInFlight);
     std::vector<MPI_Request> req(maxInFlight, MPI_REQUEST_NULL);
 
-    std::vector<int> stage(bVec_, 0);         // which partition group g is on
-    std::vector<size_t> pos(bVec_, 0);        // how far into that partition
+    std::vector<int> stage(bVec_, 0);     // which partition group g is on
+    std::vector<int> pos(bVec_, 0);       // which of its blocks goes next
     std::vector<int> inFlight(bVec_, 0);
     int free = 0;
 
-    std::vector<int> members;
     std::vector<float> thresholds;
 
     while (true) {
         for (int g = 0; g < bVec_; ++g) {
-            // Top this group back up to its limit, or step it on to the next
-            // partition once the one it is on is finished with.
             while (stage[g] < bVec_) {
                 int r = groupOrder_.chain(g)[stage[g]];
-                const std::vector<int>& list = work[g][r];
 
-                if (pos[g] >= list.size()) {
-                    // Every cluster of this partition is out. Only when they
+                if (pos[g] >= blocks) {
+                    // Every block of this partition is out. Only once they
                     // have all come back are their distances in the heaps, and
                     // only then does the next partition start from a tighter
-                    // threshold, which is the whole point of Fig. 5a. So this
-                    // is the one place a group does have to drain.
+                    // threshold, which is the whole point of Fig. 5a.
                     if (inFlight[g] > 0) {
                         break;
                     }
@@ -600,69 +593,69 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<std::vector<int>>>
                     continue;
                 }
 
-                if (inFlight[g] >= perGroupLimit) {
-                    break;   // enough out already
+                const std::vector<int>& mem = groupMembers[g];
+                int b = pos[g];
+                pos[g] = pos[g] + 1;
+                if (mem.empty()) {
+                    continue;
                 }
 
-                {
-                    int c = list[pos[g]];
-                    // Clusters enter the row at successive columns, so no
-                    // worker is always the first stop -- the one that can
-                    // prune nothing (paper §4.3).
-                    int p = (int)(pos[g] % bDim_);
-                    pos[g] = pos[g] + 1;
-
-                    // which queries of this group actually want this cluster
-                    members.clear();
-                    thresholds.clear();
-                    for (int j = 0; j < (int)groupMembers[g].size(); ++j) {
-                        int q = groupMembers[g][j];
-                        const std::vector<int>& cl = batch[q].clusters;
-                        if (std::find(cl.begin(), cl.end(), c) != cl.end()) {
-                            members.push_back(q);
-                            // an infinite threshold means nothing is dropped,
-                            // the no-pruning arm of the ablation (Fig. 10)
-                            thresholds.push_back(cfg_.pruning ? heaps[q].worst()
-                                                              : PRUNED);
-                        }
-                    }
-                    if (members.empty()) {
-                        continue;   // pos has already stepped past it
-                    }
-
-                    // The slot is picked first because its number is what
-                    // tags this cluster's messages all the way down the chain.
-                    while (req[free] != MPI_REQUEST_NULL) {
-                        free = (free + 1) % maxInFlight;
-                    }
-
-                    dispatchOne(r, c, p, free, members, thresholds);
-
-                    int n = (int)index_.clusterIds(c).size();
-                    int kSend = (cfg_.k < n) ? cfg_.k : n;
-                    slot[free].group = g;
-                    slot[free].row = r;
-                    slot[free].clusterId = c;
-                    slot[free].n = n;
-                    slot[free].kSend = kSend;
-                    slot[free].members = members;
-                    slot[free].top.resize((size_t)members.size() * kSend);
-
-                    // MPI: non-blocking, so the next cluster can be dispatched
-                    // without waiting for this one. lastRankOf is who ends the
-                    // chain; it sends back the k nearest per query rather than
-                    // every running total, m*k instead of m*n floats.
-                    MPI_Irecv(slot[free].top.data(),
-                              (int)(slot[free].top.size() * sizeof(Candidate)),
-                              MPI_BYTE, lastRankOf(r, p), tagTopk(free),
-                              MPI_COMM_WORLD, &req[free]);
-                    inFlight[g] = inFlight[g] + 1;
+                // Groups are contiguous runs of the batch and so are their
+                // blocks, which is why a job needs only a first and a length.
+                int gStart = mem[0];
+                int gLen = (int)mem.size();
+                int firstQ = gStart + (int)((long)b * gLen / blocks);
+                int endQ = gStart + (int)((long)(b + 1) * gLen / blocks);
+                int len = endQ - firstQ;
+                if (len <= 0) {
+                    continue;
                 }
+
+                // Nothing of this partition to do for these queries.
+                if (blockLoad(r, firstQ, len, batch) == 0) {
+                    continue;
+                }
+
+                thresholds.resize(len);
+                for (int j = 0; j < len; ++j) {
+                    // an infinite threshold means nothing is dropped, the
+                    // no-pruning arm of the ablation (paper Fig. 10)
+                    thresholds[j] = cfg_.pruning ? heaps[firstQ + j].worst()
+                                                 : PRUNED;
+                }
+
+                // The slot is picked first because its number is what tags
+                // this block's messages all the way down the chain.
+                while (req[free] != MPI_REQUEST_NULL) {
+                    free = (free + 1) % maxInFlight;
+                }
+
+                // Different blocks enter the row at different columns, so no
+                // worker is always the first stop -- the one that can prune
+                // nothing (paper §4.3).
+                int item = b % bDim_;
+                dispatchBlock(r, firstQ, len, item, free, thresholds);
+
+                slot[free].group = g;
+                slot[free].row = r;
+                slot[free].firstQ = firstQ;
+                slot[free].len = len;
+                slot[free].top.assign((size_t)len * k, Candidate{-1, PRUNED});
+
+                // MPI: non-blocking, so the next block can be dispatched
+                // without waiting for this one. lastRankOf is who ends the
+                // chain; it sends back the k nearest per query rather than
+                // every running total.
+                MPI_Irecv(slot[free].top.data(),
+                          (int)(slot[free].top.size() * sizeof(Candidate)),
+                          MPI_BYTE, lastRankOf(r, item), tagTopk(free),
+                          MPI_COMM_WORLD, &req[free]);
+                inFlight[g] = inFlight[g] + 1;
             }
         }
 
-        // MPI: block until any one cluster reports, whichever it is. This is
-        // what lets a slow row not hold up a fast one.
+        // MPI: block until any one block reports, whichever it is. This is
+        // what lets a slow group not hold up a fast one.
         int index = MPI_UNDEFINED;
         MPI_Waitany(maxInFlight, req.data(), &index, MPI_STATUS_IGNORE);
         if (index == MPI_UNDEFINED) {
@@ -670,47 +663,21 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<std::vector<int>>>
         }
 
         const Slot& s = slot[index];
-        const std::vector<int>& ids = index_.clusterIds(s.clusterId);
-
-        for (int j = 0; j < (int)s.members.size(); ++j) {
-            int q = s.members[j];
-            const Candidate* top = &s.top[(size_t)j * s.kSend];
-
-            // prewarm already pushed the leading ids of this query's first
-            // cluster with their real distances; pushing them again would
-            // duplicate them in the heap. The tail reports positions within
-            // the cluster, so the same test still applies.
-            //
-            // Dropping one here can leave fewer than kSend from this cluster,
-            // which is still the right answer: anything the tail left out has
-            // kSend better candidates ahead of it, and those are either in
-            // this list or were pushed by prewarm.
-            int skip = 0;
-            for (int i = 0; i < (int)batch[q].prewarmCluster.size(); ++i) {
-                if (batch[q].prewarmCluster[i] == s.clusterId) {
-                    skip = batch[q].prewarmed[i];
-                    break;
-                }
-            }
-
-            for (int t = 0; t < s.kSend; ++t) {
+        for (int j = 0; j < s.len; ++j) {
+            const Candidate* top = &s.top[(size_t)j * k];
+            TopKHeap& heap = heaps[s.firstQ + j];
+            for (int t = 0; t < k; ++t) {
                 if (top[t].dist >= PRUNED) {
                     break;   // the tail pads its unused slots, nearest first
                 }
-                int v = top[t].id;
-                if (v < skip || v >= s.n) {
-                    continue;
-                }
-                heaps[q].push(ids[v], top[t].dist);
+                heap.push(top[t].id, top[t].dist);
             }
         }
 
-        scanned_ = scanned_ + (long)s.members.size() * s.n;
-        scannedRow_[s.row] = scannedRow_[s.row] + (long)s.members.size() * s.n;
+        scanned_ = scanned_ + blockLoad(s.row, s.firstQ, s.len, batch);
+        scannedRow_[s.row] =
+            scannedRow_[s.row] + blockLoad(s.row, s.firstQ, s.len, batch);
 
-        // pos already stepped past this cluster when it went out; the count
-        // coming down is what lets the group take another, or move on to the
-        // next partition once it reaches zero.
         inFlight[s.group] = inFlight[s.group] - 1;
     }
 }
@@ -729,10 +696,25 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
         prewarmHeap(qv, batch[q], heaps[q]);
     }
 
-    // Every worker gets the whole batch's slices once; individual jobs then
-    // name the queries they want by position.
+    // Every worker gets the batch's query slices and its probe lists once.
+    // The probe lists are what let a worker lay out a block's buffer the same
+    // way the rest of its row does, so a job can name a block and nothing
+    // more.
+    std::vector<int> probes((size_t)count * nprobe, 0);
+    for (int q = 0; q < count; ++q) {
+        const std::vector<int>& cl = batch[q].clusters;
+        for (int i = 0; i < (int)cl.size(); ++i) {
+            probes[(size_t)q * nprobe + i] = cl[i];
+        }
+        // a query with fewer than nprobe clusters pads with its last one,
+        // which the workers skip as a repeat
+        for (int i = (int)cl.size(); i < nprobe; ++i) {
+            probes[(size_t)q * nprobe + i] = -1;
+        }
+    }
+
     for (int w = 1; w <= numWorkers_; ++w) {
-        int job[5] = {JOB_QUERY, 0, 0, 0, 0};
+        int job[5] = {JOB_QUERY, count, nprobe, 0, 0};
         MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
 
         int col = (w - 1) % bDim_;
@@ -746,6 +728,8 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
         }
         MPI_Send(slices.data(), (int)slices.size(), MPI_FLOAT, w,
                  TAG_QUERY, MPI_COMM_WORLD);
+        MPI_Send(probes.data(), (int)probes.size(), MPI_INT, w,
+                 TAG_PROBES, MPI_COMM_WORLD);
     }
 
     // Stage I: vector-level pipeline (Algorithm 1 lines 21-23).
@@ -759,26 +743,7 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
         groupMembers[(int)((long)q * bVec_ / count)].push_back(q);
     }
 
-    // work[g][r]: the clusters of partition r that group g probes. A cluster
-    // wanted by two groups is visited once per group -- the same candidates
-    // against fewer queries each time, so the distance work is unchanged.
-    // Within one visit the queries still share it, which is the QueryBatch.
-    std::vector<std::vector<std::vector<int>>> work(
-        bVec_, std::vector<std::vector<int>>(bVec_));
-    for (int g = 0; g < bVec_; ++g) {
-        for (int j = 0; j < (int)groupMembers[g].size(); ++j) {
-            const QueryState& qs = batch[groupMembers[g][j]];
-            for (int i = 0; i < (int)qs.clusters.size(); ++i) {
-                int c = qs.clusters[i];
-                std::vector<int>& row = work[g][clusterOwner_[c]];
-                if (std::find(row.begin(), row.end(), c) == row.end()) {
-                    row.push_back(c);
-                }
-            }
-        }
-    }
-
-    vectorPipeline(work, groupMembers, batch, heaps);
+    vectorPipeline(groupMembers, batch, heaps);
 
     std::vector<std::vector<Candidate>> out(count);
     for (int q = 0; q < count; ++q) {

@@ -8,10 +8,6 @@
 #include <omp.h>
 #endif
 
-#ifdef HARMONY_USE_MKL
-#include <mkl.h>
-#endif
-
 #include "../comm/messages.h"
 #include "../engine/stopwatch.h"
 #include "../index/distance.h"
@@ -41,6 +37,10 @@ void WorkerNode::addCluster(int clusterId, const std::vector<int>& ids,
         block.norm[i] = s;
     }
 
+    if (clusterId >= (int)where_.size()) {
+        where_.resize(clusterId + 1, -1);
+    }
+    where_[clusterId] = (int)blocks_.size();
     blocks_.push_back(block);
 }
 
@@ -52,91 +52,43 @@ long WorkerNode::vectorCount() const {
     return n;
 }
 
-void WorkerNode::accumulate(const float* queries, int m, int clusterId,
-                            const float* thresholds, bool first,
+void WorkerNode::accumulate(int firstQ, int len, const float* thresholds,
+                            const std::vector<size_t>& qOff,
                             std::vector<float>& sums) {
-#ifndef HARMONY_USE_MKL
-    (void)first;   // only the gemm path cares which end of the chain this is
-#endif
-    // A worker is only ever sent clusters its row owns, so not finding one
-    // means the grid and the dispatch disagree. Left unnoticed it would return
-    // whatever the previous worker accumulated -- a plausible-looking but
-    // wrong answer -- so it stops the whole job instead.
-    const ClusterBlock* found = nullptr;
-    for (int b = 0; b < (int)blocks_.size(); ++b) {
-        if (blocks_[b].clusterId == clusterId) {
-            found = &blocks_[b];
-            break;
-        }
-    }
-    if (found == nullptr) {
-        std::cerr << "worker " << id_ << ": cluster " << clusterId
-                  << " was never sent here" << std::endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-
-    const ClusterBlock& block = *found;
-    int n = (int)block.ids.size();
-
-#ifdef HARMONY_USE_MKL
-    // At the head of the chain nothing can be pruned yet, so the whole
-    // m x n block has to be computed and can go through one gemm.
-    // Expanding ||a-b||^2 into ||a||^2 + ||b||^2 - 2ab makes it a matrix
-    // multiply; the norms were precomputed when the block arrived.
+    // One query at a time, walking its probe list and stopping at the
+    // clusters this row holds. That walk is the buffer layout: every worker
+    // in the row derives the same one, so nobody has to send an index.
     //
-    // Later stages skip most candidates, which a dense multiply cannot.
-    if (first && useMkl_ && m > 1) {
-        // MKL: ||q||^2 for each query in the batch
-        std::vector<float> qn(m);
-        for (int q = 0; q < m; ++q) {
-            const float* qv = &queries[(size_t)q * myDim_];
-            qn[q] = cblas_sdot(myDim_, qv, 1, qv, 1);
-        }
+    // OpenMP: a query owns its own run of sums, so the threads never write
+    // the same memory and no locking is needed (paper §5, node-level
+    // parallelism; across nodes the work is already split by MPI).
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < len; ++j) {
+        const float* qv = &queries_[(size_t)(firstQ + j) * myDim_];
+        float t = thresholds[j];
+        size_t off = qOff[j];
 
-        // MKL: one matrix multiply produces all m x n dot products
-        std::vector<float> dot((size_t)m * n);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    m, n, myDim_, 1.0f,
-                    queries, myDim_, block.data.data(), myDim_,
-                    0.0f, dot.data(), n);
+        for (int i = 0; i < nprobe_; ++i) {
+            int bi = blockOf(probes_[(size_t)(firstQ + j) * nprobe_ + i]);
+            if (bi < 0) {
+                continue;   // padding, or a cluster another partition holds
+            }
 
-        // OpenMP: turn the dot products into distances, one thread per query
-        #pragma omp parallel for schedule(static)
-        for (int q = 0; q < m; ++q) {
-            float t = thresholds[q];
-            float* row = &sums[(size_t)q * n];
-            const float* d = &dot[(size_t)q * n];
+            const ClusterBlock& cb = blocks_[bi];
+            int n = (int)cb.ids.size();
+            float* row = &sums[off];
+
             for (int v = 0; v < n; ++v) {
-                row[v] = qn[q] + block.norm[v] - 2.0f * d[v];
+                if (row[v] >= PRUNED) {
+                    continue;      // an earlier worker already dropped it
+                }
+                row[v] = row[v] + l2DistanceSquared(qv, &cb.data[(size_t)v * myDim_],
+                                                    myDim_);
                 if (row[v] > t) {
-                    row[v] = PRUNED;
+                    row[v] = PRUNED;   // cannot reach the top-K, stop here
                 }
             }
-        }
-        return;
-    }
-#endif
-
-    // The scalar path, and the only one that can stop early. Iterations
-    // touch different sums entries, so the threads never write the same
-    // memory and no locking is needed (paper Section 5, node-level
-    // parallelism; across nodes the work is already split by MPI).
-    // OpenMP: one thread per query, no locking needed (see above)
-    #pragma omp parallel for schedule(static)
-    for (int q = 0; q < m; ++q) {
-        const float* qv = &queries[(size_t)q * myDim_];
-        float t = thresholds[q];
-        float* row = &sums[(size_t)q * n];
-
-        for (int v = 0; v < n; ++v) {
-            if (row[v] >= PRUNED) {
-                continue;      // an earlier worker already dropped it
-            }
-            row[v] = row[v] + l2DistanceSquared(qv, &block.data[(size_t)v * myDim_],
-                                                myDim_);
-            if (row[v] > t) {
-                row[v] = PRUNED;   // cannot reach the top-K, stop here
-            }
+            off += n;
         }
     }
 }
@@ -203,7 +155,6 @@ void WorkerNode::receiveSetup() {
 
 int WorkerNode::run() {
     running_ = true;
-    useMkl_ = cfg_.mkl;
 
 #ifdef _OPENMP
     omp_set_num_threads(cfg_.threads);   // OpenMP: --threads takes effect here
@@ -211,13 +162,17 @@ int WorkerNode::run() {
 
     receiveSetup();
 
-    std::vector<float> queries;          // batch_ slices of myDim_ floats
-    std::vector<float> picked;           // the slices one job wants, packed
+    // Setup is not part of the search, so the clock starts at the first job.
+    Stopwatch run;
+    Stopwatch phase;
+    bool started = false;
+    bool done = false;
 
-    // Forwarding has to be non-blocking. Clusters start at different columns,
-    // so two workers can be sending to each other at once; with blocking sends
-    // both would wait in MPI_Send for the other to receive, and the row would
-    // deadlock. This is why the paper uses MPI_Isend / MPI_Irecv (§5).
+    // Forwarding has to be non-blocking. Blocks enter the row at different
+    // columns, so two workers can be sending to each other at once; with
+    // blocking sends both would wait in MPI_Send for the other to receive,
+    // and the row would deadlock. This is why the paper uses MPI_Isend /
+    // MPI_Irecv (§5).
     //
     // An outgoing buffer must stay untouched until its send completes, so
     // sends go out of a rotating pool.
@@ -227,37 +182,24 @@ int WorkerNode::run() {
     std::vector<MPI_Request> reqSums(slots, MPI_REQUEST_NULL);
     int slot = 0;
 
-    // A cluster this worker has been handed but not finished. Several stay
-    // open at once on purpose: one still waiting on its upstream must not hold
-    // up another whose turn has already come. Taking them strictly in the
-    // order the master sent them was costing 34% of a worker's time in
-    // harmony mode and 70% in dimension mode, all of it blocked in one
-    // MPI_Recv with other work sitting right there. The sample avoids the
-    // same trap by testing every pending block instead of taking them in
-    // order; the tags in messages.h are what make that safe.
+    // A block this worker has been handed but not finished. Several stay open
+    // at once on purpose: one still waiting on its upstream must not hold up
+    // another whose turn has already come.
     struct Pending {
-        int clusterId;
-        int n;
-        int m;
+        int firstQ;
+        int len;
         int stage;
-        int slotTag;             // names this cluster's chain tags
+        int slotTag;
         bool isFirst;
         bool isLast;
         int prevRank;
         int nextRank;
-        std::vector<int> qidx;
         std::vector<float> thresholds;
+        std::vector<size_t> qOff;   // where each query's totals start
         std::vector<float> sums;
     };
     std::vector<Pending> pend;
     std::vector<MPI_Request> pendReq;   // upstream receive; NULL for a head
-
-    // The clock starts at the first job, not at setup: loading the index is
-    // measured separately and would otherwise swamp everything.
-    Stopwatch run;
-    Stopwatch phase;
-    bool started = false;
-    bool done = false;
 
     while (!done) {
         // ---- 1. take every job already waiting, and block only when there
@@ -289,7 +231,7 @@ int WorkerNode::run() {
             // message: with --check the master runs its single-machine
             // reference afterwards, and counting that wait would read as idle
             // workers. The master sends the bookkeeping jobs only once every
-            // cluster has reported, so nothing is open when they arrive.
+            // block has reported, so nothing is open when they arrive.
             if (job[0] == JOB_SHUTDOWN) {
                 done = true;
                 break;
@@ -325,20 +267,25 @@ int WorkerNode::run() {
             idle_ = idle_ + waited;
 
             if (job[0] == JOB_QUERY) {
-                queries.resize((size_t)batch_ * myDim_);
-                MPI_Recv(queries.data(), (int)queries.size(), MPI_FLOAT,
+                int count = job[1];
+                nprobe_ = job[2];
+                queries_.resize((size_t)batch_ * myDim_);
+                MPI_Recv(queries_.data(), (int)queries_.size(), MPI_FLOAT,
                          MASTER_RANK, TAG_QUERY, MPI_COMM_WORLD,
+                         MPI_STATUS_IGNORE);
+                probes_.resize((size_t)count * nprobe_);
+                MPI_Recv(probes_.data(), (int)probes_.size(), MPI_INT,
+                         MASTER_RANK, TAG_PROBES, MPI_COMM_WORLD,
                          MPI_STATUS_IGNORE);
                 total_ = run.seconds();
                 continue;
             }
 
-            // ---- a cluster: open it and post its upstream receive ----
+            // ---- a block of queries: open it and post its upstream receive ----
             Pending p;
-            p.clusterId = job[0];
-            p.n = job[1];
-            int item = job[2];
-            p.m = job[3];
+            p.firstQ = job[1];
+            p.len = job[2];
+            int item = job[3];
             p.slotTag = job[4];
 
             // Everything about this worker's part in the chain comes out of
@@ -352,21 +299,31 @@ int WorkerNode::run() {
             p.prevRank = p.isFirst ? MASTER_RANK : rowBase_ + prevCol;
             p.nextRank = p.isLast ? MASTER_RANK : rowBase_ + nextCol;
 
-            p.qidx.resize(p.m);
-            MPI_Recv(p.qidx.data(), p.m, MPI_INT, MASTER_RANK, TAG_QIDX,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            p.thresholds.resize(p.m);
-            MPI_Recv(p.thresholds.data(), p.m, MPI_FLOAT, MASTER_RANK,
+            p.thresholds.resize(p.len);
+            MPI_Recv(p.thresholds.data(), p.len, MPI_FLOAT, MASTER_RANK,
                      TAG_THRESHOLD, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-            size_t total = (size_t)p.m * (size_t)p.n;
+            // The layout: each query's run of running totals is its probe
+            // list restricted to the clusters this row holds, in probe order.
+            p.qOff.resize(p.len);
+            size_t total = 0;
+            for (int j = 0; j < p.len; ++j) {
+                p.qOff[j] = total;
+                for (int i = 0; i < nprobe_; ++i) {
+                    int bi = blockOf(probes_[(size_t)(p.firstQ + j) * nprobe_ + i]);
+                    if (bi >= 0) {
+                        total += blocks_[bi].ids.size();
+                    }
+                }
+            }
+
             MPI_Request up = MPI_REQUEST_NULL;
             if (p.isFirst) {
                 p.sums.assign(total, 0.0f);   // nothing upstream to wait for
             } else {
                 p.sums.resize(total);
                 // MPI: posted now, collected later -- the point of the whole
-                // arrangement is that this wait overlaps other clusters.
+                // arrangement is that this wait overlaps other blocks.
                 MPI_Irecv(p.sums.data(), (int)total, MPI_FLOAT, p.prevRank,
                           tagSums(p.slotTag), MPI_COMM_WORLD, &up);
             }
@@ -381,7 +338,7 @@ int WorkerNode::run() {
             continue;
         }
 
-        // ---- 2. work on whichever open cluster can be worked on ----
+        // ---- 2. work on whichever open block can be worked on ----
         int pick = -1;
         for (size_t i = 0; i < pendReq.size(); ++i) {
             if (pendReq[i] == MPI_REQUEST_NULL) {
@@ -411,18 +368,10 @@ int WorkerNode::run() {
         }
 
         Pending& p = pend[pick];
-        size_t total = (size_t)p.m * (size_t)p.n;
-
-        // gemm wants the participating slices contiguous
-        picked.resize((size_t)p.m * myDim_);
-        for (int q = 0; q < p.m; ++q) {
-            const float* src = &queries[(size_t)p.qidx[q] * myDim_];
-            std::copy(src, src + myDim_, &picked[(size_t)q * myDim_]);
-        }
+        size_t total = p.sums.size();
 
         phase.reset();
-        accumulate(picked.data(), p.m, p.clusterId, p.thresholds.data(),
-                   p.isFirst, p.sums);
+        accumulate(p.firstQ, p.len, p.thresholds.data(), p.qOff, p.sums);
         compute_ = compute_ + phase.seconds();
         jobs_ = jobs_ + 1;
 
@@ -432,7 +381,8 @@ int WorkerNode::run() {
             }
         }
 
-        // reclaim this slot before overwriting it
+        // reclaim this slot before overwriting it. A large send_ is back
+        // pressure: the next hop is not taking what this worker sends.
         phase.reset();
         MPI_Wait(&reqSums[slot], MPI_STATUS_IGNORE);
         send_ = send_ + phase.seconds();
@@ -442,33 +392,35 @@ int WorkerNode::run() {
             // candidates' full distances, so it can pick the k nearest itself
             // and send just those, instead of handing every running total back
             // for the master to sift (paper §4.3). k is around a hundred
-            // against a cluster's few thousand vectors.
-            //
-            // The ids kept are positions in the cluster, which is what lets
-            // the master map them back and still drop the ones prewarm
-            // already pushed.
+            // against the thousands of candidates a query has here.
             Stopwatch pickWatch;
-            int kSend = (k_ < p.n) ? k_ : p.n;
-            Candidate pad;
-            pad.id = -1;
-            pad.dist = PRUNED;          // a query with fewer than kSend
-            outTop[slot].assign((size_t)p.m * kSend, pad);   // survivors pads
+            outTop[slot].assign((size_t)p.len * k_, Candidate{-1, PRUNED});
 
             // OpenMP: one thread per query, each writing its own row
             #pragma omp parallel for schedule(static)
-            for (int q = 0; q < p.m; ++q) {
-                TopKHeap heap(kSend);
-                const float* row = &p.sums[(size_t)q * p.n];
-                for (int v = 0; v < p.n; ++v) {
-                    if (row[v] < PRUNED) {
-                        heap.push(v, row[v]);
+            for (int j = 0; j < p.len; ++j) {
+                TopKHeap heap(k_);
+                size_t off = p.qOff[j];
+
+                for (int i = 0; i < nprobe_; ++i) {
+                    int bi = blockOf(probes_[(size_t)(p.firstQ + j) * nprobe_ + i]);
+                    if (bi < 0) {
+                        continue;
                     }
+                    const ClusterBlock& cb = blocks_[bi];
+                    int n = (int)cb.ids.size();
+                    for (int v = 0; v < n; ++v) {
+                        if (p.sums[off + v] < PRUNED) {
+                            heap.push(cb.ids[v], p.sums[off + v]);
+                        }
+                    }
+                    off += n;
                 }
 
                 std::vector<Candidate> best = heap.results();   // nearest first
-                Candidate* out = &outTop[slot][(size_t)q * kSend];
-                for (int j = 0; j < (int)best.size(); ++j) {
-                    out[j] = best[j];
+                Candidate* out = &outTop[slot][(size_t)j * k_];
+                for (int t = 0; t < (int)best.size(); ++t) {
+                    out[t] = best[t];
                 }
             }
 
@@ -477,7 +429,7 @@ int WorkerNode::run() {
             // MPI: as bytes, since a Candidate is an int beside a float and
             // every rank is the same build (see topk_heap.h).
             MPI_Isend(outTop[slot].data(),
-                      (int)((size_t)p.m * kSend * sizeof(Candidate)), MPI_BYTE,
+                      (int)((size_t)p.len * k_ * sizeof(Candidate)), MPI_BYTE,
                       MASTER_RANK, tagTopk(p.slotTag), MPI_COMM_WORLD,
                       &reqSums[slot]);
         } else {
@@ -487,7 +439,7 @@ int WorkerNode::run() {
         }
 
         // The ablation arm of Fig. 2(b): waiting here instead of letting the
-        // send ride alongside the next cluster is what blocking communication
+        // send ride alongside the next block is what blocking communication
         // would cost. The send itself stays non-blocking, or a row of workers
         // sending to each other would deadlock.
         if (cfg_.blockSend) {
