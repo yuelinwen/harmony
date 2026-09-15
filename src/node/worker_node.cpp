@@ -8,6 +8,10 @@
 #include <omp.h>
 #endif
 
+#ifdef HARMONY_USE_MKL
+#include <mkl.h>
+#endif
+
 #include "../comm/messages.h"
 #include "../engine/stopwatch.h"
 #include "../index/distance.h"
@@ -52,9 +56,96 @@ long WorkerNode::vectorCount() const {
     return n;
 }
 
+// Head of the chain: sums are all zero and nothing is pruned, so every
+// (query, candidate) pair has to be computed. Regrouping those pairs by
+// cluster turns them into one dense matrix multiply per cluster --
+// this block's queries that probe it, against all of its vectors -- which is
+// the case MKL is built for and the scalar loop is not.
+//
+//   ||q - v||^2 = ||q||^2 + ||v||^2 - 2 (q . v)
+//
+// the dot products being the matrix product. ||v||^2 came with the cluster
+// and never changes.
+//
+// Only here. Later slices skip most candidates, and a dense multiply cannot
+// skip anything, so grouping by cluster would compute what pruning just saved.
+bool WorkerNode::accumulateGemm(int firstQ, int len, const float* thresholds,
+                                const std::vector<size_t>& qOff,
+                                std::vector<float>& sums) {
+#ifndef HARMONY_USE_MKL
+    (void)firstQ; (void)len; (void)thresholds; (void)qOff; (void)sums;
+    return false;
+#else
+    // Which of this block's queries probe each cluster, and where each one's
+    // run of totals starts. This is the same walk accumulate() does, read by
+    // cluster instead of by query.
+    byCluster_.resize(blocks_.size());
+    for (size_t b = 0; b < byCluster_.size(); ++b) {
+        byCluster_[b].clear();
+    }
+    for (int j = 0; j < len; ++j) {
+        size_t off = qOff[j];
+        for (int i = 0; i < nprobe_; ++i) {
+            int bi = blockOf(probes_[(size_t)(firstQ + j) * nprobe_ + i]);
+            if (bi < 0) {
+                continue;
+            }
+            byCluster_[bi].push_back(std::make_pair(j, off));
+            off += blocks_[bi].ids.size();
+        }
+    }
+
+    // One cluster per thread. Two queries probing the same cluster write
+    // different runs of sums, and a run belongs to one query, so no two
+    // threads ever touch the same element.
+    #pragma omp parallel for schedule(dynamic)
+    for (int bi = 0; bi < (int)byCluster_.size(); ++bi) {
+        const std::vector<std::pair<int, size_t> >& mem = byCluster_[bi];
+        int m = (int)mem.size();
+        if (m == 0) {
+            continue;
+        }
+
+        const ClusterBlock& cb = blocks_[bi];
+        int n = (int)cb.ids.size();
+
+        // gemm wants the participating queries contiguous
+        std::vector<float> q((size_t)m * myDim_);
+        std::vector<float> qn(m);
+        for (int a = 0; a < m; ++a) {
+            const float* src = &queries_[(size_t)(firstQ + mem[a].first) * myDim_];
+            std::copy(src, src + myDim_, &q[(size_t)a * myDim_]);
+            qn[a] = cblas_sdot(myDim_, src, 1, src, 1);
+        }
+
+        std::vector<float> dot((size_t)m * n);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    m, n, myDim_, 1.0f,
+                    q.data(), myDim_, cb.data.data(), myDim_,
+                    0.0f, dot.data(), n);
+
+        for (int a = 0; a < m; ++a) {
+            float t = thresholds[mem[a].first];
+            float* row = &sums[mem[a].second];
+            const float* d = &dot[(size_t)a * n];
+            for (int v = 0; v < n; ++v) {
+                float dist = qn[a] + cb.norm[v] - 2.0f * d[v];
+                row[v] = (dist > t) ? PRUNED : dist;
+            }
+        }
+    }
+    return true;
+#endif
+}
+
 void WorkerNode::accumulate(int firstQ, int len, const float* thresholds,
                             const std::vector<size_t>& qOff,
-                            std::vector<float>& sums) {
+                            std::vector<float>& sums, bool first) {
+    if (first && useMkl_ &&
+        accumulateGemm(firstQ, len, thresholds, qOff, sums)) {
+        return;
+    }
+
     // One query at a time, walking its probe list and stopping at the
     // clusters this row holds. That walk is the buffer layout: every worker
     // in the row derives the same one, so nobody has to send an index.
@@ -371,7 +462,8 @@ int WorkerNode::run() {
         size_t total = p.sums.size();
 
         phase.reset();
-        accumulate(p.firstQ, p.len, p.thresholds.data(), p.qOff, p.sums);
+        accumulate(p.firstQ, p.len, p.thresholds.data(), p.qOff, p.sums,
+                   p.stage == 0);
         compute_ = compute_ + phase.seconds();
         jobs_ = jobs_ + 1;
 

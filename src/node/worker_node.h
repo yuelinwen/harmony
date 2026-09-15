@@ -2,6 +2,7 @@
 #define HARMONY_NODE_WORKER_NODE_H
 
 #include <algorithm>
+#include <utility>
 #include <vector>
 
 #include "node.h"
@@ -75,11 +76,25 @@ public:
     // against every cluster of its probe list that this worker holds. qOff
     // says where each query's run of running totals starts in sums.
     void accumulate(int firstQ, int len, const float* thresholds,
-                    const std::vector<size_t>& qOff, std::vector<float>& sums);
+                    const std::vector<size_t>& qOff, std::vector<float>& sums,
+                    bool first);
 
 private:
     // Takes myDim, the cluster count, and then every cluster block.
     void receiveSetup();
+
+    // The head of a chain, where nothing has been pruned yet and every pair
+    // has to be computed. Grouped by cluster instead of by query, that is a
+    // dense matrix multiply, which is what MKL is for (paper §5). Returns
+    // false when there is no MKL to call, so the caller falls back.
+    bool accumulateGemm(int firstQ, int len, const float* thresholds,
+                        const std::vector<size_t>& qOff,
+                        std::vector<float>& sums);
+
+    // Scratch for the above: byCluster_[bi] lists the queries of the current
+    // block that probe cluster bi, and where each one's run starts in sums.
+    // Held across calls so the allocation happens once.
+    std::vector<std::vector<std::pair<int, size_t>>> byCluster_;
 
     Config cfg_;
     int myDim_;

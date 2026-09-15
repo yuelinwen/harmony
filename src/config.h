@@ -49,9 +49,11 @@ struct Config {
     int prewarm = 500;
     int prewarmLists = 1;
     bool pruning = true;  // dimension-level early exit (paper Fig. 10)
-    // Kept so runs from before block dispatch still parse. A block's natural
-    // step is one query against one cluster, which is a matrix-vector product
-    // rather than a matrix-matrix one, so there is no gemm left to hand MKL.
+    // MKL gemm at the head of a chain, where nothing is pruned yet. Measured
+    // no faster than the scalar loop on Sapphire Rapids -- the loop is already
+    // vectorised by -O3 -march=native -fassociative-math, so there is no naive
+    // implementation left for MKL to beat. Kept because §5 calls for it and as
+    // something to compare against.
     bool mkl = true;
     // Wait for each forward to land before starting the next cluster, which
     // is the blocking arm of the paper's Fig. 2(b) comparison.
@@ -108,7 +110,8 @@ inline void printUsage(const char* prog) {
         << "  --prewarmlists <int>  clusters seeded per query         (1)\n"
         << "                     either set to 0 turns seeding off\n"
         << "  --pruning <0|1>    dimension-level pruning            (1)\n"
-        << "  --mkl <0|1>        accepted, no longer does anything  (1)\n"
+        << "  --mkl <0|1>        gemm at the head of a chain        (1)\n"
+        << "                     measured no faster here, see config.h\n"
         << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
         << "  --block <int>      query blocks per group               (4)\n"
         << "                     all of a partition's blocks fly at once\n"
