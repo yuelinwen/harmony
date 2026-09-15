@@ -58,6 +58,12 @@ struct Config {
     // Wait for each forward to land before starting the next cluster, which
     // is the blocking arm of the paper's Fig. 2(b) comparison.
     bool blockSend = false;
+    // Paper §4.3: between batches, move the column that has done the most
+    // arithmetic to the end of every chain. Off by default -- measured on
+    // eight workers the columns within a row already sit within a few points
+    // of each other, and compute is a small share of a worker's time on the
+    // deep chains where this would matter.
+    bool reorder = false;
     // Query blocks a group is cut into. A block is the unit that travels the
     // dimension chain, and all of a partition's blocks are in flight at once,
     // so this is also how much a worker has to overlap the wait for one
@@ -113,6 +119,7 @@ inline void printUsage(const char* prog) {
         << "  --mkl <0|1>        gemm at the head of a chain        (1)\n"
         << "                     measured no faster here, see config.h\n"
         << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
+        << "  --reorder <0|1>    move the busiest column to the chain end (0)\n"
         << "  --block <int>      query blocks per group               (4)\n"
         << "                     all of a partition's blocks fly at once\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
@@ -186,6 +193,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             if (cfg.block < 1) {
                 cfg.block = 1;
             }
+        } else if (opt == "--reorder" && hasValue) {
+            cfg.reorder = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--blocksend" && hasValue) {
             cfg.blockSend = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--mkl" && hasValue) {

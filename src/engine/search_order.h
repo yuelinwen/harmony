@@ -26,6 +26,19 @@ public:
         build(workers, items, rotate);
     }
 
+    // Built from chains given outright, one per item, each listing every
+    // worker in the order that item visits them. The rotation above is the
+    // only order this class makes on its own; anything else -- such as §4.3's
+    // "put the overloaded machine last" -- is a policy, and policies live
+    // where the load is measured, not here.
+    SearchOrder(const std::vector<std::vector<int> >& chains, int workers) {
+        workers_ = workers;
+        items_ = (int)chains.size();
+        step_.assign(workers_, std::vector<int>(items_, 0));
+        chain_ = chains;
+        link();
+    }
+
     int workers() const { return workers_; }
     int items() const { return items_; }
 
@@ -68,6 +81,11 @@ private:
             }
         }
 
+        link();
+    }
+
+    // next/prev tables, read off the chains.
+    void link() {
         next_.assign(workers_, std::vector<int>(items_, -1));
         prev_.assign(workers_, std::vector<int>(items_, -1));
         for (int i = 0; i < items_; ++i) {

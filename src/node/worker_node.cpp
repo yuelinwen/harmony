@@ -340,6 +340,18 @@ int WorkerNode::run() {
                 continue;
             }
 
+            // A new chain table. Safe here and only here: the master sends
+            // it between batches, when no block is part-way along a chain.
+            if (job[0] == JOB_ORDER) {
+                std::vector<int> table(3 * bDim_);
+                MPI_Recv(table.data(), 3 * bDim_, MPI_INT, MASTER_RANK,
+                         TAG_ORDER, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                nextOf_.assign(table.begin(), table.begin() + bDim_);
+                prevOf_.assign(table.begin() + bDim_, table.begin() + 2 * bDim_);
+                stageOf_.assign(table.begin() + 2 * bDim_, table.end());
+                continue;
+            }
+
             // Start of a counted stretch: forget everything before it. Sent
             // before the pass that gets reported, so an earlier --loop pass or
             // an earlier --nprobes value does not leak into these numbers.

@@ -60,6 +60,14 @@ public:
     // Cuts every cluster into per-worker slices and sends them out.
     void distributeData();
 
+    // One column's rows of the chain table, as the worker expects them.
+    std::vector<int> chainTableFor(int col) const;
+
+    // Paper §4.3: moves the column that has been doing the most arithmetic to
+    // the end of every chain, where most candidates have already been pruned.
+    // Call between batches only -- see the comment on the definition.
+    void reorderChains();
+
     // Zeroes the counters, here and on every worker.
     void resetCounters();
 
@@ -182,6 +190,14 @@ private:
 
     // [total, idle, recv, compute, send, jobs] per worker, filled by shutdown()
     std::vector<std::vector<double>> workerTimes_;
+
+    // Chain reordering state (§4.3). prevCompute_ is what each worker had
+    // done at the previous look, so the difference is this batch's work;
+    // colSmooth_ is the per-column load with the swings taken out.
+    static constexpr double kReorderDeadzone = 0.10;
+    std::vector<double> prevCompute_;
+    std::vector<double> colSmooth_;
+    int reorders_ = 0;
 };
 
 }  // namespace harmony

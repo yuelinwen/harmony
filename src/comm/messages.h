@@ -102,6 +102,10 @@ const int JOB_RESET    = -3;
 // it ends the process. --nprobes runs several searches against one
 // distribution and each needs its own numbers.
 const int JOB_STATS    = -4;
+// A new chain table follows, same int[3 * bDim] as TAG_ORDER at setup. Sent
+// between batches, when nothing is on the chain: a block carries only its
+// item, and both ends of a hop have to agree on what that item means.
+const int JOB_ORDER    = -6;
 
 // The largest chain tag this layout will use has to be one MPI accepts. The
 // standard only promises 32767, and the tags here stay far below that, so
