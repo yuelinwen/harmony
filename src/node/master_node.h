@@ -52,9 +52,9 @@ public:
     // Where a cached index with these settings lives.
     std::string indexPath(int nlist, int iterations) const;
 
-    // Lays the workers out as a bVec x bDim grid (paper Fig. 4a). Row r holds
-    // the clusters with c % bVec == r; within a row, each worker holds one
-    // slice of the dimensions.
+    // Lays the workers out as a bVec x bDim grid (paper Fig. 4a). Clusters go
+    // to rows by weight, heaviest first to the lightest row; within a row,
+    // each worker holds one slice of the dimensions.
     void splitGrid(int bVec, int bDim);
 
     // Cuts every cluster into per-worker slices and sends them out.
@@ -126,6 +126,12 @@ public:
     // Learns which clusters the workload favours, by centroid assignment only,
     // before the layout is fixed (the paper's pre-query phase).
     void warmupPlan(int queries, int nprobe);
+
+    // Assigns clusters to bVec partitions, heaviest first to whichever is
+    // lightest so far, and returns what each ends up carrying. Fills owner
+    // when one is given. Used both to make the split and, before the split
+    // exists, to tell the cost model what a given bVec would cost.
+    std::vector<double> partitionLoads(int bVec, std::vector<int>* owner) const;
 
     // I(pi): the spread of computation across the vector partitions, from how
     // often each cluster was probed and how big it is.

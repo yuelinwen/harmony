@@ -137,16 +137,60 @@ void MasterNode::warmupPlan(int queries, int nprobe) {
     std::cout << "warmup: " << n << " queries profiled" << std::endl;
 }
 
-double MasterNode::imbalanceOf(int bVec, int bDim) const {
-    // Work landing on each row: probes x cluster size x dimensions per machine.
-    // Every machine in a row carries the same amount once the rotation has
-    // evened out first-stop duty, so per-row is enough.
-    std::vector<double> load(bVec, 0.0);
-    for (int c = 0; c < index_.getNlist(); ++c) {
+// Longest-processing-time first: heaviest cluster to whichever partition is
+// lightest so far. Round-robin ignores that kmeans produces clusters of very
+// different sizes and that queries do not visit them equally often, so one
+// partition ends up doing noticeably more work -- and a query is not done
+// until its slowest partition reports. This greedy is the standard one for
+// the problem and comes within 4/3 of the best possible split. Ties go to the
+// lower cluster id so a run is reproducible.
+//
+// A cluster's weight is how often it is probed times how many vectors it
+// holds, which is the number of distance computations it brings.
+std::vector<double> MasterNode::partitionLoads(int bVec,
+                                               std::vector<int>* owner) const {
+    int nlist = index_.getNlist();
+    if (owner != nullptr) {
+        owner->assign(nlist, 0);
+    }
+
+    std::vector<std::pair<double, int> > order(nlist);
+    for (int c = 0; c < nlist; ++c) {
         long hits = clusterHits_.empty() ? 1 : clusterHits_[c];
-        load[c % bVec] += (double)hits
-                        * (double)index_.clusterIds(c).size()
-                        * ((double)base_.getDim() / bDim);
+        order[c] = std::make_pair((double)hits * index_.clusterSize(c), c);
+    }
+    std::sort(order.begin(), order.end(),
+              [](const std::pair<double, int>& a,
+                 const std::pair<double, int>& b) {
+                  if (a.first != b.first) {
+                      return a.first > b.first;
+                  }
+                  return a.second < b.second;
+              });
+
+    std::vector<double> load(bVec, 0.0);
+    for (int i = 0; i < nlist; ++i) {
+        int lightest = 0;
+        for (int r = 1; r < bVec; ++r) {
+            if (load[r] < load[lightest]) {
+                lightest = r;
+            }
+        }
+        if (owner != nullptr) {
+            (*owner)[order[i].second] = lightest;
+        }
+        load[lightest] = load[lightest] + order[i].first;
+    }
+    return load;
+}
+
+double MasterNode::imbalanceOf(int bVec, int bDim) const {
+    // The split this bVec would actually get, since that is what the term is
+    // meant to price. Each machine in a row carries its row's clusters over
+    // its own slice of the dimensions.
+    std::vector<double> load = partitionLoads(bVec, nullptr);
+    for (int r = 0; r < bVec; ++r) {
+        load[r] = load[r] * ((double)base_.getDim() / bDim);
     }
 
     double mean = 0.0;
@@ -248,11 +292,22 @@ void MasterNode::splitGrid(int bVec, int bDim) {
     chainOrder_ = SearchOrder(bDim_, bDim_, true);
     groupOrder_ = SearchOrder(bVec_, bVec_, true);
 
+    // Which partition gets which cluster. Round-robin ignores that kmeans
+    // produces clusters of very different sizes, and that queries do not visit
+    // them equally often, so one partition ends up doing noticeably more work
+    // than another -- and since a query is not done until its slowest
+    // partition reports, that difference is throughput.
+    //
+    // Longest-processing-time first instead: heaviest cluster to whichever
+    // partition is lightest so far. It is the standard greedy for this and
+    // comes within 4/3 of the best possible split. Ties go to the lower
+    // cluster id so a run is reproducible.
+    //
+    // This is the assignment the cost model's I(pi) measures. Until now that
+    // term could only rank grid shapes, since the assignment inside a grid was
+    // fixed; the paper's pi is the partition plan itself (§4.2.1).
     int nlist = index_.getNlist();
-    clusterOwner_.resize(nlist);
-    for (int c = 0; c < nlist; ++c) {
-        clusterOwner_[c] = c % bVec_;
-    }
+    partitionLoads(bVec_, &clusterOwner_);
 
     // The chain tags are derived from the master's in-flight slots, so the
     // largest one this layout can produce is fixed here. Nothing near MPI's
@@ -264,9 +319,20 @@ void MasterNode::splitGrid(int bVec, int bDim) {
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
+    // Vectors are what a partition stores; the share is what it works on.
+    // They are not the same number, and it is the second one that decides how
+    // long a query waits -- a small partition of much-probed clusters is the
+    // slow one. The shares are what the split above evens out.
+    std::vector<double> load = partitionLoads(bVec_, nullptr);
+    double total = 0.0;
+    for (int r = 0; r < bVec_; ++r) {
+        total = total + load[r];
+    }
+
     std::cout << "\n===== 3. layout =====" << std::endl;
     std::cout << "grid: " << bVec_ << " vector partitions x "
-              << bDim_ << " dimension slices" << std::endl;
+              << bDim_ << " dimension slices  (even share would be "
+              << (100.0 / bVec_) << "%)" << std::endl;
     for (int r = 0; r < bVec_; ++r) {
         long vectors = 0;
         for (int c = 0; c < nlist; ++c) {
@@ -274,11 +340,13 @@ void MasterNode::splitGrid(int bVec, int bDim) {
                 vectors = vectors + index_.clusterSize(c);
             }
         }
+        double share = (total > 0.0) ? (100.0 * load[r] / total) : 0.0;
         for (int col = 0; col < bDim_; ++col) {
             std::cout << "  worker " << (r * bDim_ + col + 1)
                       << ": partition " << r << ", dims ["
                       << plan_.begin(col) << "," << plan_.end(col)
-                      << "), " << vectors << " vectors" << std::endl;
+                      << "), " << vectors << " vectors, "
+                      << share << "% of the work" << std::endl;
         }
     }
 }
@@ -762,10 +830,12 @@ int MasterNode::run() {
     }
     buildIndex(cfg_.nlist, cfg_.iters);
 
-    // The layout has to be settled before any data moves, so the cost model
-    // runs on a profiling pass first (paper Fig. 3, step 1).
+    // The layout has to be settled before any data moves, so the profiling
+    // pass comes first (paper Fig. 3, step 1). It runs whatever the mode is:
+    // the cost model is one consumer of the cluster hit counts, splitGrid is
+    // the other, and it only costs one centroid scan per profiled query.
+    warmupPlan(cfg_.warmup, cfg_.nprobe);
     if (cfg_.costModel) {
-        warmupPlan(cfg_.warmup, cfg_.nprobe);
         choosePlan();
     }
 
