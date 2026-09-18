@@ -47,6 +47,13 @@ public:
 
     // Returns the k nearest neighbors of one query vector, scanning only
     // the nprobe nearest clusters.
+    // Same, but told which clusters to scan instead of working them out. The
+    // skewed workload needs this: the reference has to visit exactly the
+    // clusters the distributed search was sent, or the two are answering
+    // different questions and differing stops meaning anything.
+    std::vector<Candidate> search(const Dataset& base, const float* query,
+                                  const std::vector<int>& clusters, int k);
+
     std::vector<Candidate> search(const Dataset& base, const float* query,
                                   int nprobe, int k);
 

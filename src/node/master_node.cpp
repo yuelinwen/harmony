@@ -118,6 +118,74 @@ void MasterNode::buildIndex(int nlist, int iterations) {
     }
 }
 
+// Paper §6.6 wants a workload where some machines are asked for much more than
+// others, which needs the probe lists themselves to be lopsided -- the real
+// nearest clusters of real queries are not.
+//
+// --skew s sends that share of every query's probes into a hot eighth of the
+// clusters and scatters the rest. Two things matter about how it is written.
+// It depends on the cluster ids alone, not on the layout, so the same workload
+// can be put to a 8x1 and a 1x8 and the numbers compared. And it is a pure
+// function of the query id, so the profiling pass, the search and the
+// reference all derive the same list without anybody storing or sending it --
+// which is what keeps differing a verdict in the one experiment where recall
+// has stopped being one.
+//
+// (The sample fakes its listidqueries the same way, but only in the
+// distributed path, so recall there is meaningless and nothing checks the
+// answer at all.)
+std::vector<int> MasterNode::probesFor(int queryId, int nprobe) const {
+    if (cfg_.skew <= 0.0) {
+        return index_.nearestClusters(query_.vec(queryId), nprobe);
+    }
+
+    int nlist = index_.getNlist();
+    if (nprobe > nlist) {
+        nprobe = nlist;
+    }
+    int hot = nlist / 8;
+    if (hot < 1) {
+        hot = 1;
+    }
+
+    int wanted = (int)(cfg_.skew * nprobe + 0.5);   // probes aimed at the hot set
+    if (wanted > hot) {
+        wanted = hot;      // cannot take more distinct clusters than there are
+    }
+
+    // A generator seeded from the query id, so this is reproducible and every
+    // caller gets the same answer for the same query.
+    unsigned int state = (unsigned int)queryId * 2654435761u + 12345u;
+    std::vector<char> taken(nlist, 0);
+    std::vector<int> out;
+    out.reserve(nprobe);
+
+    for (int pass = 0; pass < 2; ++pass) {
+        int want = (pass == 0) ? wanted : nprobe;
+        int range = (pass == 0) ? hot : nlist;
+
+        // Rejection sampling, then a linear walk, so a full range still
+        // terminates rather than spinning on collisions.
+        int tries = 0;
+        while ((int)out.size() < want && tries < 8 * nprobe) {
+            state = state * 1103515245u + 12345u;
+            int c = (int)((state >> 16) % (unsigned int)range);
+            if (!taken[c]) {
+                taken[c] = 1;
+                out.push_back(c);
+            }
+            tries = tries + 1;
+        }
+        for (int c = 0; (int)out.size() < want && c < range; ++c) {
+            if (!taken[c]) {
+                taken[c] = 1;
+                out.push_back(c);
+            }
+        }
+    }
+    return out;
+}
+
 // Centroid assignment only -- no worker is involved and nothing is searched,
 // so this is cheap: it just records which clusters the workload touches.
 void MasterNode::warmupPlan(int queries, int nprobe) {
@@ -128,13 +196,39 @@ void MasterNode::warmupPlan(int queries, int nprobe) {
         n = queries;
     }
     for (int q = 0; q < n; ++q) {
-        std::vector<int> clusters = index_.nearestClusters(query_.vec(q), nprobe);
+        std::vector<int> clusters = probesFor(q, nprobe);
         for (int i = 0; i < (int)clusters.size(); ++i) {
             clusterHits_[clusters[i]] = clusterHits_[clusters[i]] + 1;
         }
     }
 
-    std::cout << "warmup: " << n << " queries profiled" << std::endl;
+    // The paper labels its workloads by "variance" and never says how it is
+    // obtained; the sample computes it as the standard deviation of how often
+    // each cluster is probed (query.cpp:735-746), which is what §4.2.1 calls
+    // I(pi) in the text.
+    //
+    // That number cannot be matched to the paper's. It carries units of probe
+    // counts, so it scales with how many queries were profiled: the most it
+    // can reach is mean * sqrt((nlist - hot) / hot) with mean = n * nprobe /
+    // nlist, which here tops out near 330 while Fig. 7 says 500. Fig. 7 states
+    // none of n, nprobe or nlist, so there is nothing to match against. The
+    // ratio to the mean is printed alongside because it is scale-free, and is
+    // the figure worth comparing between runs.
+    double mean = (double)n * nprobe / index_.getNlist();
+    double var = 0.0;
+    for (int c = 0; c < index_.getNlist(); ++c) {
+        double d = (double)clusterHits_[c] - mean;
+        var = var + d * d;
+    }
+    var = std::sqrt(var / index_.getNlist());
+
+    std::cout << "warmup: " << n << " queries profiled, cluster probe counts"
+              << " mean " << mean << " variance " << var
+              << " (" << (mean > 0.0 ? var / mean : 0.0) << " x mean)" << std::endl;
+    if (cfg_.skew > 0.0) {
+        std::cout << "SKEWED WORKLOAD (--skew " << cfg_.skew << "): probe lists"
+                  << " are synthetic, recall is not meaningful" << std::endl;
+    }
 }
 
 // Longest-processing-time first: heaviest cluster to whichever partition is
@@ -854,7 +948,7 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
     for (int q = 0; q < count; ++q) {
         const float* qv = query_.vec(firstQuery + q);
         batch[q].id = firstQuery + q;
-        batch[q].clusters = index_.nearestClusters(qv, nprobe);
+        batch[q].clusters = probesFor(batch[q].id, nprobe);
         prewarmHeap(qv, batch[q], heaps[q]);
     }
 
@@ -1023,7 +1117,8 @@ int MasterNode::run() {
             if (!cfg_.check) {
                 continue;
             }
-            std::vector<Candidate> single = index_.search(base_, query_.vec(q), nprobe, k);
+            std::vector<Candidate> single =
+                index_.search(base_, query_.vec(q), probesFor(q, nprobe), k);
 
             std::vector<int> a;
             std::vector<int> b;

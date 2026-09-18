@@ -131,6 +131,12 @@ public:
 
     // ---- cost model, paper Section 4.2.1 ----
 
+    // The clusters one query visits. The only place probe lists come from --
+    // the profiling pass, the search, and the single-machine reference all go
+    // through it, so a synthetic workload stays consistent between them and
+    // differing keeps its meaning.
+    std::vector<int> probesFor(int queryId, int nprobe) const;
+
     // Learns which clusters the workload favours, by centroid assignment only,
     // before the layout is fixed (the paper's pre-query phase).
     void warmupPlan(int queries, int nprobe);

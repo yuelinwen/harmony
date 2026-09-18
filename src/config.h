@@ -76,6 +76,13 @@ struct Config {
     int loop = 1;         // timed passes over the query set, averaged
     std::string csv;      // append one row per run here, "" = off
 
+    // Synthetic skewed workload (paper §6.6, Fig. 7/8; the sample's
+    // --HardInBalance). 0 uses the real nearest clusters. Above that, this
+    // share of every query's probes is drawn from a hot eighth of the
+    // clusters and the rest uniformly, which concentrates the work without
+    // touching the index or the layout.
+    double skew = 0.0;
+
     // cost model, read only when mode is "harmony" (paper §4.2.1)
     double commCost = 100.0;  // a transferred byte, in multiply-adds. Hardware.
     double alpha = 0.3;       // weight on the imbalance term of C(pi,Q)
@@ -128,6 +135,12 @@ inline void printUsage(const char* prog) {
         << "                     above 1 adds an untimed warm-up pass\n"
         << "  --csv <path>       append one row per run to this file\n"
         << "\n"
+        << "skewed workload (paper 6.6)\n"
+        << "  --skew <float>     share of probes aimed at a hot eighth  (0)\n"
+        << "                     0 searches for real; above it the probe lists\n"
+        << "                     are synthetic, so recall stops meaning anything\n"
+        << "                     while differing still does\n"
+        << "\n"
         << "cost model, only read when --mode harmony\n"
         << "  --commcost <float> a transferred byte, in multiply-adds (100)\n"
         << "  --alpha <float>    weight on the imbalance term        (0.3)\n"
@@ -168,6 +181,14 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             }
         } else if (opt == "--csv" && hasValue) {
             cfg.csv = argv[++i];
+        } else if (opt == "--skew" && hasValue) {
+            cfg.skew = std::atof(argv[++i]);
+            if (cfg.skew < 0.0) {
+                cfg.skew = 0.0;
+            }
+            if (cfg.skew > 1.0) {
+                cfg.skew = 1.0;
+            }
         } else if (opt == "--k" && hasValue) {
             cfg.k = std::atoi(argv[++i]);
         } else if (opt == "--nq" && hasValue) {

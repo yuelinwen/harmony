@@ -181,10 +181,12 @@ std::vector<int> IvfIndex::nearestClusters(const float* query, int nprobe) const
 // Not part of the system itself; run() calls it only to check the result.
 std::vector<Candidate> IvfIndex::search(const Dataset& base, const float* query,
                                         int nprobe, int k) {
-    // 1. rank the centroids, keep the nprobe nearest clusters
-    std::vector<int> clusters = nearestClusters(query, nprobe);
+    return search(base, query, nearestClusters(query, nprobe), k);
+}
 
-    // 2. scan only the vectors inside those clusters
+std::vector<Candidate> IvfIndex::search(const Dataset& base, const float* query,
+                                        const std::vector<int>& clusters, int k) {
+    // Scan only the vectors inside those clusters
     TopKHeap heap(k);
     for (int ci = 0; ci < (int)clusters.size(); ++ci) {
         int c = clusters[ci];
