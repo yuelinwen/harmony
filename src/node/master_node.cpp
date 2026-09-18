@@ -576,8 +576,8 @@ std::vector<int> MasterNode::chainTableFor(int col) const {
 // every chain. The others keep rotating among the earlier stages, which is
 // what stops any of them becoming the permanent head.
 void MasterNode::reorderChains() {
-    if (!cfg_.reorder || bDim_ < 2) {
-        return;
+    if (bDim_ < 2) {
+        return;      // a chain of one has no order to change
     }
 
     collectStats();
@@ -1299,7 +1299,7 @@ int MasterNode::run() {
               << (100.0 * done / (double)(scanned_ * bDim_)) << "%" << std::endl;
 
     printWorkerTimes();
-    if (cfg_.reorder) {
+    if (bDim_ > 1) {
         std::cout << "chain reordered " << reorders_ << " time(s)" << std::endl;
     }
     writeCsv(nprobe, nq, recallSum / nq, seconds, differing, ties);

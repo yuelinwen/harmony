@@ -26,10 +26,11 @@ struct Config {
     bool costModel = false;          // set by resolveGrid, not by a flag
 
     // the search
-    // Clusters visited per query: recall against speed. --nprobes takes
-    // several and runs them one after another, sharing one index and one
+    // Clusters visited per query: recall against speed. Several may be given,
+    // and are then run one after another against one index and one
     // distribution -- nprobe only decides which clusters the master dispatches,
-    // so nothing a worker holds depends on it.
+    // so nothing a worker holds depends on it. nprobe is the first of them,
+    // which is what the profiling pass and the cost model read.
     int nprobe = 32;
     std::vector<int> nprobes;
     int k = 100;       // neighbours returned
@@ -58,12 +59,6 @@ struct Config {
     // Wait for each forward to land before starting the next cluster, which
     // is the blocking arm of the paper's Fig. 2(b) comparison.
     bool blockSend = false;
-    // Paper §4.3: between batches, move the column that has done the most
-    // arithmetic to the end of every chain. Off by default -- measured on
-    // eight workers the columns within a row already sit within a few points
-    // of each other, and compute is a small share of a worker's time on the
-    // deep chains where this would matter.
-    bool reorder = false;
     // Query blocks a group is cut into. A block is the unit that travels the
     // dimension chain, and all of a partition's blocks are in flight at once,
     // so this is also how much a worker has to overlap the wait for one
@@ -118,8 +113,9 @@ inline void printUsage(const char* prog) {
         << "\n"
         << "the search\n"
         << "  --nq <int>         queries to run                     (100)\n"
-        << "  --nprobe <int>     clusters visited per query         (32)\n"
-        << "  --nprobes <int>... several of them, run one after another\n"
+        << "  --nprobe <int>...  clusters visited per query         (32)\n"
+        << "                     several values run one after another, sharing\n"
+        << "                     one index: --nprobe 8 16 32\n"
         << "  --k <int>          neighbours returned                (100)\n"
         << "\n"
         << "speed\n"
@@ -132,7 +128,6 @@ inline void printUsage(const char* prog) {
         << "  --mkl <0|1>        gemm at the head of a chain        (1)\n"
         << "                     measured no faster here, see config.h\n"
         << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
-        << "  --reorder <0|1>    move the busiest column to the chain end (0)\n"
         << "  --block <int>      query blocks per group               (4)\n"
         << "                     all of a partition's blocks fly at once\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
@@ -181,11 +176,13 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
         } else if (opt == "--bdim" && hasValue) {
             cfg.bDim = std::atoi(argv[++i]);
         } else if (opt == "--nprobe" && hasValue) {
-            cfg.nprobe = std::atoi(argv[++i]);
-        } else if (opt == "--nprobes" && hasValue) {
-            // eats values until the next option
+            // eats values until the next option, so one or several both work
+            cfg.nprobes.clear();
             while (i + 1 < argc && argv[i + 1][0] != '-') {
                 cfg.nprobes.push_back(std::atoi(argv[++i]));
+            }
+            if (!cfg.nprobes.empty()) {
+                cfg.nprobe = cfg.nprobes[0];
             }
         } else if (opt == "--csv" && hasValue) {
             cfg.csv = argv[++i];
@@ -229,8 +226,6 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             if (cfg.block < 1) {
                 cfg.block = 1;
             }
-        } else if (opt == "--reorder" && hasValue) {
-            cfg.reorder = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--blocksend" && hasValue) {
             cfg.blockSend = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--mkl" && hasValue) {
