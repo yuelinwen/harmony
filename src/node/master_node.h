@@ -49,6 +49,9 @@ public:
     // whole dataset, before anything is handed to the workers.
     void buildIndex(int nlist, int iterations);
 
+    // Running totals of cluster sizes, once the index exists.
+    void buildSizePrefix();
+
     // Where a cached index with these settings lives.
     std::string indexPath(int nlist, int iterations) const;
 
@@ -180,6 +183,21 @@ private:
     SlicePlan plan_;                 // how a row cuts up the dimensions
     std::vector<int> clusterOwner_;  // cluster id -> vector partition (row)
     std::vector<long> clusterHits_;  // how often each cluster has been probed
+
+    // The two pools --skew draws from, with running totals of their cluster
+    // sizes so a draw can be made proportional to size. allIds_ is every
+    // cluster; hotIds_ is the eighth that the skew concentrates on. Both are
+    // built once the index exists.
+    std::vector<int> allIds_;
+    std::vector<double> allPrefix_;
+    std::vector<int> hotIds_;
+    std::vector<double> hotPrefix_;
+
+    // Draws one cluster from a pool with probability proportional to size,
+    // advancing the caller's generator state.
+    int drawWeighted(const std::vector<int>& ids,
+                     const std::vector<double>& prefix,
+                     unsigned int& state) const;
 
     // pruning counters (paper Table 3), by position in the chain rather than
     // by worker, since rotation moves each worker between the two.

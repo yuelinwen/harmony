@@ -100,6 +100,7 @@ void MasterNode::buildIndex(int nlist, int iterations) {
         std::cout << "loaded index from " << path << " ("
                   << std::chrono::duration<double>(t1 - t0).count() << " s)"
                   << std::endl;
+        buildSizePrefix();
         return;
     }
 
@@ -109,6 +110,8 @@ void MasterNode::buildIndex(int nlist, int iterations) {
     std::cout << "build time: "
               << std::chrono::duration<double>(t1 - t0).count() << " s" << std::endl;
 
+    buildSizePrefix();
+
     if (cfg_.cache) {
         if (index_.save(path)) {
             std::cout << "saved index to " << path << std::endl;
@@ -116,6 +119,80 @@ void MasterNode::buildIndex(int nlist, int iterations) {
             std::cout << "could not write " << path << ", carrying on" << std::endl;
         }
     }
+}
+
+// The pools --skew draws from, and their size prefix sums.
+//
+// The hot eighth is itself drawn proportional to size rather than taken as the
+// first eighth of the cluster ids. Two reasons. Cluster ids come out of the
+// kmeans initialisation order and mean nothing, so a prefix of them is an
+// arbitrary set. And at a high --skew a query probes the whole hot set, which
+// leaves no sampling freedom at all -- the candidate count is then just the
+// hot set's total size, so that set has to be representative or the workload
+// changes weight rather than only shape.
+void MasterNode::buildSizePrefix() {
+    int nlist = index_.getNlist();
+
+    allIds_.resize(nlist);
+    for (int c = 0; c < nlist; ++c) {
+        allIds_[c] = c;
+    }
+    allPrefix_.assign(nlist + 1, 0.0);
+    for (int c = 0; c < nlist; ++c) {
+        allPrefix_[c + 1] = allPrefix_[c] + (double)index_.clusterSize(c);
+    }
+
+    int hot = nlist / 8;
+    if (hot < 1) {
+        hot = 1;
+    }
+    hotIds_.clear();
+    std::vector<char> taken(nlist, 0);
+    unsigned int state = 987654321u;          // fixed: the hot set is the same every run
+    for (int tries = 0; (int)hotIds_.size() < hot && tries < 64 * hot; ++tries) {
+        int c = drawWeighted(allIds_, allPrefix_, state);
+        if (!taken[c]) {
+            taken[c] = 1;
+            hotIds_.push_back(c);
+        }
+    }
+    for (int c = 0; (int)hotIds_.size() < hot && c < nlist; ++c) {
+        if (!taken[c]) {
+            taken[c] = 1;
+            hotIds_.push_back(c);
+        }
+    }
+
+    hotPrefix_.assign(hotIds_.size() + 1, 0.0);
+    for (size_t i = 0; i < hotIds_.size(); ++i) {
+        hotPrefix_[i + 1] = hotPrefix_[i] + (double)index_.clusterSize(hotIds_[i]);
+    }
+}
+
+// One cluster out of a pool, with probability proportional to how many vectors
+// it holds.
+//
+// Uniform draws would make the synthetic workload lighter than a real one:
+// a query's nearest clusters are biased towards the big ones, since a bigger
+// cluster covers more space and is more often the nearest. Measured on sift1M
+// that bias is 16% of the candidates, which would show up as a throughput
+// gain and have nothing to do with the skew being studied.
+int MasterNode::drawWeighted(const std::vector<int>& ids,
+                             const std::vector<double>& prefix,
+                             unsigned int& state) const {
+    state = state * 1103515245u + 12345u;
+    double u = (double)((state >> 8) & 0xFFFFFFu) / 16777216.0;
+    double target = u * prefix[prefix.size() - 1];
+
+    size_t i = (size_t)(std::upper_bound(prefix.begin(), prefix.end(), target)
+                        - prefix.begin());
+    if (i == 0) {
+        i = 1;
+    }
+    if (i > ids.size()) {
+        i = ids.size();
+    }
+    return ids[i - 1];
 }
 
 // Paper §6.6 wants a workload where some machines are asked for much more than
@@ -143,10 +220,7 @@ std::vector<int> MasterNode::probesFor(int queryId, int nprobe) const {
     if (nprobe > nlist) {
         nprobe = nlist;
     }
-    int hot = nlist / 8;
-    if (hot < 1) {
-        hot = 1;
-    }
+    int hot = (int)hotIds_.size();
 
     int wanted = (int)(cfg_.skew * nprobe + 0.5);   // probes aimed at the hot set
     if (wanted > hot) {
@@ -162,24 +236,24 @@ std::vector<int> MasterNode::probesFor(int queryId, int nprobe) const {
 
     for (int pass = 0; pass < 2; ++pass) {
         int want = (pass == 0) ? wanted : nprobe;
-        int range = (pass == 0) ? hot : nlist;
+        const std::vector<int>& pool = (pass == 0) ? hotIds_ : allIds_;
+        const std::vector<double>& prefix = (pass == 0) ? hotPrefix_ : allPrefix_;
 
-        // Rejection sampling, then a linear walk, so a full range still
-        // terminates rather than spinning on collisions.
+        // Rejection sampling, then a linear walk over the pool, so a pool that
+        // is nearly exhausted still terminates rather than spinning.
         int tries = 0;
         while ((int)out.size() < want && tries < 8 * nprobe) {
-            state = state * 1103515245u + 12345u;
-            int c = (int)((state >> 16) % (unsigned int)range);
+            int c = drawWeighted(pool, prefix, state);
             if (!taken[c]) {
                 taken[c] = 1;
                 out.push_back(c);
             }
             tries = tries + 1;
         }
-        for (int c = 0; (int)out.size() < want && c < range; ++c) {
-            if (!taken[c]) {
-                taken[c] = 1;
-                out.push_back(c);
+        for (size_t i = 0; (int)out.size() < want && i < pool.size(); ++i) {
+            if (!taken[pool[i]]) {
+                taken[pool[i]] = 1;
+                out.push_back(pool[i]);
             }
         }
     }
@@ -253,6 +327,20 @@ std::vector<double> MasterNode::partitionLoads(int bVec,
         long hits = clusterHits_.empty() ? 1 : clusterHits_[c];
         order[c] = std::make_pair((double)hits * index_.clusterSize(c), c);
     }
+
+    // The arm to measure the greedy against: deal the clusters out in id
+    // order, taking no notice of how big or how popular any of them is.
+    if (cfg_.assign == "roundrobin") {
+        std::vector<double> load(bVec, 0.0);
+        for (int c = 0; c < nlist; ++c) {
+            if (owner != nullptr) {
+                (*owner)[c] = c % bVec;
+            }
+            load[c % bVec] = load[c % bVec] + order[c].first;
+        }
+        return load;
+    }
+
     std::sort(order.begin(), order.end(),
               [](const std::pair<double, int>& a,
                  const std::pair<double, int>& b) {

@@ -83,6 +83,12 @@ struct Config {
     // touching the index or the layout.
     double skew = 0.0;
 
+    // How clusters are handed to vector partitions. "lpt" gives the heaviest
+    // to whichever partition is lightest so far; "roundrobin" is c % bVec,
+    // which is what this used to do and what the sample still does (as
+    // contiguous ranges). The second is only there to measure the first.
+    std::string assign = "lpt";
+
     // cost model, read only when mode is "harmony" (paper §4.2.1)
     double commCost = 100.0;  // a transferred byte, in multiply-adds. Hardware.
     double alpha = 0.3;       // weight on the imbalance term of C(pi,Q)
@@ -136,6 +142,8 @@ inline void printUsage(const char* prog) {
         << "  --csv <path>       append one row per run to this file\n"
         << "\n"
         << "skewed workload (paper 6.6)\n"
+        << "  --assign <name>    lpt | roundrobin                    (lpt)\n"
+        << "                     roundrobin is the arm to measure lpt against\n"
         << "  --skew <float>     share of probes aimed at a hot eighth  (0)\n"
         << "                     0 searches for real; above it the probe lists\n"
         << "                     are synthetic, so recall stops meaning anything\n"
@@ -181,6 +189,13 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             }
         } else if (opt == "--csv" && hasValue) {
             cfg.csv = argv[++i];
+        } else if (opt == "--assign" && hasValue) {
+            cfg.assign = argv[++i];
+            if (cfg.assign != "lpt" && cfg.assign != "roundrobin") {
+                std::cerr << "unknown assign: " << cfg.assign << std::endl;
+                printUsage(argv[0]);
+                return false;
+            }
         } else if (opt == "--skew" && hasValue) {
             cfg.skew = std::atof(argv[++i]);
             if (cfg.skew < 0.0) {
