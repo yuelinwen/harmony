@@ -80,6 +80,9 @@ public:
     // Tells the workers to stop.
     void shutdown();
 
+    // The pruning switches as one word for the CSV.
+    std::string pruningLabel() const;
+
     // Appends one row describing this run to cfg_.csv, writing the header
     // first if the file is new. Nothing happens when --csv was not given.
     void writeCsv(int nprobe, int nq, double recall, double seconds,

@@ -49,8 +49,8 @@ struct Config {
     // threshold costs speed and never recall.
     int prewarm = 500;
     int prewarmLists = 1;
-    // Which of the paper's two pruning levels are on (§5's
-    // --Pruning_Configuration): "both" | "dim" | "vector" | "none".
+    // The paper's two pruning levels (§5's --Pruning_Configuration), both on
+    // unless switched off:
     //
     //   dim     a candidate whose running total has passed the threshold is
     //           dropped where it stands (§4.3, Fig. 10)
@@ -58,10 +58,15 @@ struct Config {
     //           the next, so the next one starts from a threshold the first
     //           has already tightened (Fig. 5a)
     //
-    // "vector" alone is degenerate -- the threshold tightens but nothing reads
-    // it -- and is accepted only for completeness.
-    std::string pruning = "both";
-    bool pruneDim = true;      // set from pruning by resolveGrid
+    // Named the way the sample names its own, as switches that are either
+    // present or absent rather than flags taking a value. A value flag whose
+    // meaning has changed reads as valid and quietly does something else; an
+    // absent one cannot.
+    //
+    // Turning dim off while leaving vector on is the control for measuring
+    // what dim pruning is worth: the threshold still tightens between
+    // partitions, nothing reads it, and the pipeline is otherwise untouched.
+    bool pruneDim = true;
     bool pruneVector = true;
     // MKL gemm at the head of a chain, where nothing is pruned yet. Measured
     // no faster than the scalar loop on Sapphire Rapids -- the loop is already
@@ -137,9 +142,10 @@ inline void printUsage(const char* prog) {
         << "  --prewarm <int>    heap seed vectors per cluster      (500)\n"
         << "  --prewarmlists <int>  clusters seeded per query         (1)\n"
         << "                     either set to 0 turns seeding off\n"
-        << "  --pruning <name>   both | dim | vector | none        (both)\n"
-        << "                     dim = drop a candidate past the threshold\n"
-        << "                     vector = tighten it between partitions\n"
+        << "  --disablepruning   turn off dimension-level pruning\n"
+        << "                     (drop a candidate past the threshold)\n"
+        << "  --disablevectorpruning  turn off vector-level pruning\n"
+        << "                     (tighten the threshold between partitions)\n"
         << "  --mkl <0|1>        gemm at the head of a chain        (1)\n"
         << "                     measured no faster here, see config.h\n"
         << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
@@ -224,36 +230,10 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.prewarm = std::atoi(argv[++i]);
         } else if (opt == "--prewarmlists" && hasValue) {
             cfg.prewarmLists = std::atoi(argv[++i]);
-        } else if (opt == "--pruning" && hasValue) {
-            cfg.pruning = argv[++i];
-            if (cfg.pruning == "1") {
-                cfg.pruning = "both";      // what this used to take
-            } else if (cfg.pruning == "0") {
-                cfg.pruning = "none";
-            }
-            if (cfg.pruning != "both" && cfg.pruning != "dim" &&
-                cfg.pruning != "vector" && cfg.pruning != "none") {
-                std::cerr << "unknown pruning: " << cfg.pruning << std::endl;
-                printUsage(argv[0]);
-                return false;
-            }
-        } else if (opt == "--threads" && hasValue) {
-            cfg.threads = std::atoi(argv[++i]);
-        } else if (opt == "--alpha" && hasValue) {
-            cfg.alpha = std::atof(argv[++i]);
-        } else if (opt == "--commcost" && hasValue) {
-            cfg.commCost = std::atof(argv[++i]);
-        } else if (opt == "--warmup" && hasValue) {
-            cfg.warmup = std::atoi(argv[++i]);
-        } else if (opt == "--batch" && hasValue) {
-            cfg.batch = std::atoi(argv[++i]);
-        } else if (opt == "--block" && hasValue) {
-            cfg.block = std::atoi(argv[++i]);
-            if (cfg.block < 1) {
-                cfg.block = 1;
-            }
-        } else if (opt == "--blocksend" && hasValue) {
-            cfg.blockSend = (std::atoi(argv[++i]) != 0);
+        } else if (opt == "--disablepruning") {
+            cfg.pruneDim = false;
+        } else if (opt == "--disablevectorpruning") {
+            cfg.pruneVector = false;
         } else if (opt == "--mkl" && hasValue) {
             cfg.mkl = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--loop" && hasValue) {
@@ -263,6 +243,23 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             }
         } else if (opt == "--check" && hasValue) {
             cfg.check = (std::atoi(argv[++i]) != 0);
+        } else if (opt == "--threads" && hasValue) {
+            cfg.threads = std::atoi(argv[++i]);
+        } else if (opt == "--batch" && hasValue) {
+            cfg.batch = std::atoi(argv[++i]);
+        } else if (opt == "--block" && hasValue) {
+            cfg.block = std::atoi(argv[++i]);
+            if (cfg.block < 1) {
+                cfg.block = 1;
+            }
+        } else if (opt == "--blocksend" && hasValue) {
+            cfg.blockSend = (std::atoi(argv[++i]) != 0);
+        } else if (opt == "--alpha" && hasValue) {
+            cfg.alpha = std::atof(argv[++i]);
+        } else if (opt == "--commcost" && hasValue) {
+            cfg.commCost = std::atof(argv[++i]);
+        } else if (opt == "--warmup" && hasValue) {
+            cfg.warmup = std::atoi(argv[++i]);
         } else {
             std::cerr << "bad option: " << opt << std::endl;
             printUsage(argv[0]);
@@ -275,8 +272,6 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
 // Turns --mode into a grid, unless --bvec/--bdim were given. bVec * bDim has
 // to come out equal to the worker count.
 inline bool resolveGrid(Config& cfg, int numWorkers) {
-    cfg.pruneDim = (cfg.pruning == "both" || cfg.pruning == "dim");
-    cfg.pruneVector = (cfg.pruning == "both" || cfg.pruning == "vector");
 
     // -n 1 留不下 worker，下面每种布局都会除以零。放在这里是因为
     // master 和 worker 都要经过这个函数。

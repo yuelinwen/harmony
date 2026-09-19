@@ -1346,6 +1346,23 @@ int MasterNode::run() {
     return 0;
 }
 
+// The two pruning switches as one word, for the CSV: both | dim | vector |
+// none. dim and vector both come out at 100% of the distance work, since
+// nothing reads the threshold either way -- they differ in the pipeline, not
+// in the arithmetic.
+std::string MasterNode::pruningLabel() const {
+    if (cfg_.pruneDim && cfg_.pruneVector) {
+        return "both";
+    }
+    if (cfg_.pruneDim) {
+        return "dim";
+    }
+    if (cfg_.pruneVector) {
+        return "vector";
+    }
+    return "none";
+}
+
 // One row per run, appended, header written when the file is new. Everything
 // that was varied over a set of runs has to be in the row, or the rows cannot
 // be told apart later.
@@ -1390,7 +1407,7 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
         numWorkers_, bVec_, bDim_, cfg_.mode.c_str(),
         cfg_.assign.c_str(), cfg_.skew,
         cfg_.batch, cfg_.threads, cfg_.prewarm, cfg_.prewarmLists,
-        cfg_.pruning.c_str(), cfg_.mkl ? 1 : 0, cfg_.loop,
+        pruningLabel().c_str(), cfg_.mkl ? 1 : 0, cfg_.loop,
         nprobe, cfg_.k, nq, recall, nq / seconds, 1000.0 * seconds / nq,
         differing, ties, scanned_, work);
 
