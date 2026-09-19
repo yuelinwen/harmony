@@ -55,10 +55,6 @@ public:
     // stop.
     int run() override;
 
-    // How many dimensions per vector the master will be sending.
-    // Must be called before addCluster.
-    void setDimCount(int myDim);
-
     // Takes one cluster: the global ids, and their vectors already cut down to
     // this worker's dimensions.
     void addCluster(int clusterId, const std::vector<int>& ids,

@@ -34,24 +34,16 @@ public:
     SearchOrder(const std::vector<std::vector<int> >& chains, int workers) {
         workers_ = workers;
         items_ = (int)chains.size();
-        step_.assign(workers_, std::vector<int>(items_, 0));
         chain_ = chains;
         link();
     }
 
-    int workers() const { return workers_; }
-    int items() const { return items_; }
-
     // The workers handling this item, first stop first.
     const std::vector<int>& chain(int item) const { return chain_[item]; }
 
-    // Who this worker passes the item to, and who it takes it from.
-    // -1 means there is nobody: the end and the start of the chain.
-    int next(int worker, int item) const { return next_[worker][item]; }
-    int prev(int worker, int item) const { return prev_[worker][item]; }
-
-    // Flattened [worker][item] table, for handing a worker its own row over
-    // MPI. Row w is nextRow(w), which is items() long.
+    // One worker's row of the table, which is what gets handed to it over
+    // MPI: entry i is who it passes item i to, or takes item i from, and -1
+    // means it is the end or the start of that item's chain.
     const std::vector<int>& nextRow(int worker) const { return next_[worker]; }
     const std::vector<int>& prevRow(int worker) const { return prev_[worker]; }
 
@@ -60,15 +52,16 @@ private:
         workers_ = workers;
         items_ = items;
 
-        // step_[w][t]: the item worker w takes at step t. Every worker walks
+        // step[w][t]: the item worker w takes at step t. Every worker walks
         // the same list of items, offset by gap per worker, so at any step the
-        // workers are on different items and none of them collide.
-        step_.assign(workers_, std::vector<int>(items_, 0));
+        // workers are on different items and none of them collide. Only the
+        // chains read off it below outlive this function.
+        std::vector<std::vector<int> > step(workers_, std::vector<int>(items_, 0));
         int gap = rotate ? ((items_ + workers_ - 1) / workers_) : 0;
         for (int w = 0; w < workers_; ++w) {
             for (int i = 0; i < items_; ++i) {
                 int t = (items_ > 0) ? ((i + gap * w) % items_) : 0;
-                step_[w][t] = i;
+                step[w][t] = i;
             }
         }
 
@@ -77,7 +70,7 @@ private:
         chain_.assign(items_, std::vector<int>());
         for (int t = 0; t < items_; ++t) {
             for (int w = 0; w < workers_; ++w) {
-                chain_[step_[w][t]].push_back(w);
+                chain_[step[w][t]].push_back(w);
             }
         }
 
@@ -99,7 +92,6 @@ private:
 
     int workers_;
     int items_;
-    std::vector<std::vector<int>> step_;
     std::vector<std::vector<int>> chain_;
     std::vector<std::vector<int>> next_;
     std::vector<std::vector<int>> prev_;

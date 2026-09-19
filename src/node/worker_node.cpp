@@ -18,10 +18,6 @@
 
 namespace harmony {
 
-void WorkerNode::setDimCount(int myDim) {
-    myDim_ = myDim;
-}
-
 void WorkerNode::addCluster(int clusterId, const std::vector<int>& ids,
                             const std::vector<float>& data) {
     ClusterBlock block;
