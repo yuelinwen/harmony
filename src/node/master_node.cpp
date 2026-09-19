@@ -862,14 +862,32 @@ long MasterNode::blockLoad(int row, int firstQ, int len,
 // Two small messages rather than three. The worker already has the batch's
 // probe lists, so it works out for itself which of this block's queries want
 // which of its clusters -- there is no list of participants to send.
-void MasterNode::dispatchBlock(int row, int firstQ, int len, int item, int slot,
-                               const std::vector<float>& thresholds) {
+void MasterNode::dispatchBlock(int row, int firstQ, int len, int item, int slot) {
     for (int col = 0; col < bDim_; ++col) {
         int w = row * bDim_ + col + 1;
         int job[5] = {JOB_BLOCK, firstQ, len, item, slot};
         MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
-        MPI_Send(thresholds.data(), len, MPI_FLOAT, w, TAG_THRESHOLD,
-                 MPI_COMM_WORLD);
+    }
+}
+
+// The thresholds for one query group, to the row about to work on it. Sent
+// once per partition a group enters rather than with every block: the blocks
+// of a partition all go out before any comes back, so they share one snapshot
+// anyway, and this is the "periodically updates ... broadcast to workers" of
+// §5. Workers keep them between jobs.
+void MasterNode::sendThresholds(int row, int firstQ, int len,
+                                const std::vector<TopKHeap>& heaps) {
+    std::vector<float> t(len);
+    for (int j = 0; j < len; ++j) {
+        // an infinite threshold drops nothing, which is the no-dimension-level
+        // arm of --pruning (paper Fig. 10)
+        t[j] = cfg_.pruneDim ? heaps[firstQ + j].worst() : PRUNED;
+    }
+    for (int col = 0; col < bDim_; ++col) {
+        int w = row * bDim_ + col + 1;
+        int job[5] = {JOB_THRESH, firstQ, len, 0, 0};
+        MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
+        MPI_Send(t.data(), len, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
     }
 }
 
@@ -908,7 +926,15 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
 
     // Enough slots for every group to have all of its blocks out at once,
     // plus a spare so the search for a free one below cannot spin forever.
-    int maxInFlight = bVec_ * blocks + 1;
+    // Without the vector-level barrier a group holds every partition at once
+    // rather than one, so the budget is squared.
+    int perGroup = cfg_.pruneVector ? blocks : (bVec_ * blocks);
+    int maxInFlight = bVec_ * perGroup + 1;
+    if (!tagsFitMpi(maxInFlight)) {
+        std::cerr << "chain tags exceed this MPI's maximum at "
+                  << maxInFlight << " slots; lower --block" << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
     std::vector<Slot> slot(maxInFlight);
     std::vector<MPI_Request> req(maxInFlight, MPI_REQUEST_NULL);
 
@@ -917,19 +943,19 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
     std::vector<int> inFlight(bVec_, 0);
     int free = 0;
 
-    std::vector<float> thresholds;
-
     while (true) {
         for (int g = 0; g < bVec_; ++g) {
             while (stage[g] < bVec_) {
                 int r = groupOrder_.chain(g)[stage[g]];
 
                 if (pos[g] >= blocks) {
-                    // Every block of this partition is out. Only once they
-                    // have all come back are their distances in the heaps, and
-                    // only then does the next partition start from a tighter
-                    // threshold, which is the whole point of Fig. 5a.
-                    if (inFlight[g] > 0) {
+                    // Vector-level pruning, Fig. 5a: every block of this
+                    // partition is out, and only once they have all come back
+                    // are their distances in the heaps -- so waiting here is
+                    // what makes the next partition start from a threshold
+                    // this one has tightened. Without it the partitions all go
+                    // at once and the threshold never tightens within a batch.
+                    if (cfg_.pruneVector && inFlight[g] > 0) {
                         break;
                     }
                     stage[g] = stage[g] + 1;
@@ -938,11 +964,20 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
                 }
 
                 const std::vector<int>& mem = groupMembers[g];
-                int b = pos[g];
-                pos[g] = pos[g] + 1;
                 if (mem.empty()) {
+                    stage[g] = bVec_;      // nothing for this group to do
                     continue;
                 }
+
+                // Entering a partition: hand that row this group's thresholds
+                // once, before any of its blocks. Same tag as the jobs, so MPI
+                // delivers it first.
+                if (pos[g] == 0) {
+                    sendThresholds(r, mem[0], (int)mem.size(), heaps);
+                }
+
+                int b = pos[g];
+                pos[g] = pos[g] + 1;
 
                 // Groups are contiguous runs of the batch and so are their
                 // blocks, which is why a job needs only a first and a length.
@@ -960,14 +995,6 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
                     continue;
                 }
 
-                thresholds.resize(len);
-                for (int j = 0; j < len; ++j) {
-                    // an infinite threshold means nothing is dropped, the
-                    // no-pruning arm of the ablation (paper Fig. 10)
-                    thresholds[j] = cfg_.pruning ? heaps[firstQ + j].worst()
-                                                 : PRUNED;
-                }
-
                 // The slot is picked first because its number is what tags
                 // this block's messages all the way down the chain.
                 while (req[free] != MPI_REQUEST_NULL) {
@@ -978,7 +1005,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
                 // worker is always the first stop -- the one that can prune
                 // nothing (paper §4.3).
                 int item = b % bDim_;
-                dispatchBlock(r, firstQ, len, item, free, thresholds);
+                dispatchBlock(r, firstQ, len, item, free);
 
                 slot[free].group = g;
                 slot[free].row = r;
@@ -1057,6 +1084,14 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
         }
     }
 
+    // Thresholds prewarm has just produced, one per query, sent with the
+    // batch. Every worker gets the whole batch's, and sendThresholds()
+    // refreshes the parts of it that matter as the groups move on (paper §5).
+    std::vector<float> seed(count);
+    for (int q = 0; q < count; ++q) {
+        seed[q] = cfg_.pruneDim ? heaps[q].worst() : PRUNED;
+    }
+
     for (int w = 1; w <= numWorkers_; ++w) {
         int job[5] = {JOB_QUERY, count, nprobe, 0, 0};
         MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
@@ -1074,6 +1109,8 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
                  TAG_QUERY, MPI_COMM_WORLD);
         MPI_Send(probes.data(), (int)probes.size(), MPI_INT, w,
                  TAG_PROBES, MPI_COMM_WORLD);
+        MPI_Send(seed.data(), count, MPI_FLOAT, w,
+                 TAG_THRESHOLD, MPI_COMM_WORLD);
     }
 
     // Stage I: vector-level pipeline (Algorithm 1 lines 21-23).
@@ -1334,9 +1371,9 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
 
     if (isNew) {
         std::fprintf(f, "data,nlist,iters,trainpoints,workers,bvec,bdim,mode,"
-                        "batch,threads,prewarm,prewarmlists,pruning,mkl,loop,"
-                        "nprobe,k,nq,recall,qps,ms_per_query,differing,ties,"
-                        "scanned,work_pct\n");
+                        "assign,skew,batch,threads,prewarm,prewarmlists,"
+                        "pruning,mkl,loop,nprobe,k,nq,recall,qps,ms_per_query,"
+                        "differing,ties,scanned,work_pct\n");
     }
 
     long done = 0;
@@ -1347,12 +1384,13 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
                 ? (100.0 * done / (double)(scanned_ * bDim_)) : 0.0;
 
     std::fprintf(f,
-        "%s,%d,%d,%d,%d,%d,%d,%s,%d,%d,%d,%d,%d,%d,%d,"
+        "%s,%d,%d,%d,%d,%d,%d,%s,%s,%.3f,%d,%d,%d,%d,%s,%d,%d,"
         "%d,%d,%d,%.6f,%.3f,%.4f,%d,%d,%ld,%.4f\n",
         cfg_.data.c_str(), cfg_.nlist, cfg_.iters, cfg_.trainPoints,
         numWorkers_, bVec_, bDim_, cfg_.mode.c_str(),
+        cfg_.assign.c_str(), cfg_.skew,
         cfg_.batch, cfg_.threads, cfg_.prewarm, cfg_.prewarmLists,
-        cfg_.pruning ? 1 : 0, cfg_.mkl ? 1 : 0, cfg_.loop,
+        cfg_.pruning.c_str(), cfg_.mkl ? 1 : 0, cfg_.loop,
         nprobe, cfg_.k, nq, recall, nq / seconds, 1000.0 * seconds / nq,
         differing, ties, scanned_, work);
 

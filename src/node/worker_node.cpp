@@ -65,11 +65,11 @@ long WorkerNode::vectorCount() const {
 //
 // Only here. Later slices skip most candidates, and a dense multiply cannot
 // skip anything, so grouping by cluster would compute what pruning just saved.
-bool WorkerNode::accumulateGemm(int firstQ, int len, const float* thresholds,
+bool WorkerNode::accumulateGemm(int firstQ, int len,
                                 const std::vector<size_t>& qOff,
                                 std::vector<float>& sums) {
 #ifndef HARMONY_USE_MKL
-    (void)firstQ; (void)len; (void)thresholds; (void)qOff; (void)sums;
+    (void)firstQ; (void)len; (void)qOff; (void)sums;
     return false;
 #else
     // Which of this block's queries probe each cluster, and where each one's
@@ -121,7 +121,7 @@ bool WorkerNode::accumulateGemm(int firstQ, int len, const float* thresholds,
                     0.0f, dot.data(), n);
 
         for (int a = 0; a < m; ++a) {
-            float t = thresholds[mem[a].first];
+            float t = thresholds_[firstQ + mem[a].first];
             float* row = &sums[mem[a].second];
             const float* d = &dot[(size_t)a * n];
             for (int v = 0; v < n; ++v) {
@@ -134,11 +134,10 @@ bool WorkerNode::accumulateGemm(int firstQ, int len, const float* thresholds,
 #endif
 }
 
-void WorkerNode::accumulate(int firstQ, int len, const float* thresholds,
+void WorkerNode::accumulate(int firstQ, int len,
                             const std::vector<size_t>& qOff,
                             std::vector<float>& sums, bool first) {
-    if (first && useMkl_ &&
-        accumulateGemm(firstQ, len, thresholds, qOff, sums)) {
+    if (first && useMkl_ && accumulateGemm(firstQ, len, qOff, sums)) {
         return;
     }
 
@@ -152,7 +151,7 @@ void WorkerNode::accumulate(int firstQ, int len, const float* thresholds,
     #pragma omp parallel for schedule(static)
     for (int j = 0; j < len; ++j) {
         const float* qv = &queries_[(size_t)(firstQ + j) * myDim_];
-        float t = thresholds[j];
+        float t = thresholds_[firstQ + j];
         size_t off = qOff[j];
 
         for (int i = 0; i < nprobe_; ++i) {
@@ -281,7 +280,6 @@ int WorkerNode::run() {
         bool isLast;
         int prevRank;
         int nextRank;
-        std::vector<float> thresholds;
         std::vector<size_t> qOff;   // where each query's totals start
         std::vector<float> sums;
     };
@@ -336,6 +334,14 @@ int WorkerNode::run() {
                 continue;
             }
 
+            // Thresholds for a run of the batch, refreshed between
+            // partitions. job[1] is where the run starts and job[2] how long.
+            if (job[0] == JOB_THRESH) {
+                MPI_Recv(&thresholds_[job[1]], job[2], MPI_FLOAT, MASTER_RANK,
+                         TAG_THRESHOLD, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                continue;
+            }
+
             // A new chain table. Safe here and only here: the master sends
             // it between batches, when no block is part-way along a chain.
             if (job[0] == JOB_ORDER) {
@@ -376,6 +382,9 @@ int WorkerNode::run() {
                 MPI_Recv(probes_.data(), (int)probes_.size(), MPI_INT,
                          MASTER_RANK, TAG_PROBES, MPI_COMM_WORLD,
                          MPI_STATUS_IGNORE);
+                thresholds_.assign(batch_, PRUNED);
+                MPI_Recv(thresholds_.data(), count, MPI_FLOAT, MASTER_RANK,
+                         TAG_THRESHOLD, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 total_ = run.seconds();
                 continue;
             }
@@ -398,9 +407,6 @@ int WorkerNode::run() {
             p.prevRank = p.isFirst ? MASTER_RANK : rowBase_ + prevCol;
             p.nextRank = p.isLast ? MASTER_RANK : rowBase_ + nextCol;
 
-            p.thresholds.resize(p.len);
-            MPI_Recv(p.thresholds.data(), p.len, MPI_FLOAT, MASTER_RANK,
-                     TAG_THRESHOLD, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             // The layout: each query's run of running totals is its probe
             // list restricted to the clusters this row holds, in probe order.
@@ -470,8 +476,7 @@ int WorkerNode::run() {
         size_t total = p.sums.size();
 
         phase.reset();
-        accumulate(p.firstQ, p.len, p.thresholds.data(), p.qOff, p.sums,
-                   p.stage == 0);
+        accumulate(p.firstQ, p.len, p.qOff, p.sums, p.stage == 0);
         compute_ = compute_ + phase.seconds();
         jobs_ = jobs_ + 1;
 

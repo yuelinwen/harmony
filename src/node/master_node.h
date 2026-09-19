@@ -121,8 +121,13 @@ public:
     // Algorithm 1, lines 6-12. Sends one cluster to every worker in its row
     // and returns; the workers pass the running totals down the chain and only
     // the last reports back. `members` are the batch positions that probed it.
-    void dispatchBlock(int row, int firstQ, int len, int item, int slot,
-                       const std::vector<float>& thresholds);
+    void dispatchBlock(int row, int firstQ, int len, int item, int slot);
+
+    // One query group's thresholds to the row about to work on it (paper §5).
+    // Workers keep them between jobs, so this goes once per partition a group
+    // enters rather than with every block.
+    void sendThresholds(int row, int firstQ, int len,
+                        const std::vector<TopKHeap>& heaps);
 
     // Candidates a block of queries contributes in one vector partition, in
     // the order the workers of that row will lay them out.

@@ -71,7 +71,7 @@ public:
     // Works on one block of queries: [firstQ, firstQ+len) of the batch, each
     // against every cluster of its probe list that this worker holds. qOff
     // says where each query's run of running totals starts in sums.
-    void accumulate(int firstQ, int len, const float* thresholds,
+    void accumulate(int firstQ, int len,
                     const std::vector<size_t>& qOff, std::vector<float>& sums,
                     bool first);
 
@@ -83,7 +83,7 @@ private:
     // has to be computed. Grouped by cluster instead of by query, that is a
     // dense matrix multiply, which is what MKL is for (paper §5). Returns
     // false when there is no MKL to call, so the caller falls back.
-    bool accumulateGemm(int firstQ, int len, const float* thresholds,
+    bool accumulateGemm(int firstQ, int len,
                         const std::vector<size_t>& qOff,
                         std::vector<float>& sums);
 
@@ -104,6 +104,10 @@ private:
     std::vector<int> nextOf_;
     std::vector<int> prevOf_;
     std::vector<int> stageOf_;
+
+    // tau^2 per query of the current batch, kept between jobs and refreshed by
+    // JOB_THRESH. Indexed by position in the batch, like queries_ and probes_.
+    std::vector<float> thresholds_;
 
     // The batch's query slices and probe lists, sent once per batch. The
     // probe lists are what let this worker work out a block's buffer layout

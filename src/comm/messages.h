@@ -30,7 +30,7 @@ const int TAG_PROBES    = 9;   // int[count * nprobe]: every query's clusters,
                                // nearest first. Sent once per batch. A worker
                                // needs them to lay out a block's buffer the
                                // same way its neighbours in the chain do.
-const int TAG_THRESHOLD = 7;   // float[m]: tau^2 for each of them
+const int TAG_THRESHOLD = 7;   // float[len]: tau^2 per query, see JOB_THRESH
 const int TAG_STATS     = 10;  // long[bDim]: survivors per chain position
 const int TAG_TIMES     = 12;  // double[6]: where a worker's wall time went
 
@@ -106,6 +106,15 @@ const int JOB_STATS    = -4;
 // between batches, when nothing is on the chain: a block carries only its
 // item, and both ends of a hop have to agree on what that item means.
 const int JOB_ORDER    = -6;
+// float[len] of thresholds for [firstQuery, firstQuery+len) of the batch,
+// which the worker keeps and reads when a block of those queries arrives.
+//
+// §5 has the master "periodically update pruning thresholds, which are
+// broadcast to workers" rather than attach them to every job. It is also one
+// message per job cheaper: a group's whole partition is dispatched at once and
+// shares one snapshot of the thresholds, so sending it per block sent the same
+// numbers bDim times over.
+const int JOB_THRESH   = -7;
 
 // The largest chain tag this layout will use has to be one MPI accepts. The
 // standard only promises 32767, and the tags here stay far below that, so

@@ -49,7 +49,20 @@ struct Config {
     // threshold costs speed and never recall.
     int prewarm = 500;
     int prewarmLists = 1;
-    bool pruning = true;  // dimension-level early exit (paper Fig. 10)
+    // Which of the paper's two pruning levels are on (§5's
+    // --Pruning_Configuration): "both" | "dim" | "vector" | "none".
+    //
+    //   dim     a candidate whose running total has passed the threshold is
+    //           dropped where it stands (§4.3, Fig. 10)
+    //   vector  a query group finishes one vector partition before starting
+    //           the next, so the next one starts from a threshold the first
+    //           has already tightened (Fig. 5a)
+    //
+    // "vector" alone is degenerate -- the threshold tightens but nothing reads
+    // it -- and is accepted only for completeness.
+    std::string pruning = "both";
+    bool pruneDim = true;      // set from pruning by resolveGrid
+    bool pruneVector = true;
     // MKL gemm at the head of a chain, where nothing is pruned yet. Measured
     // no faster than the scalar loop on Sapphire Rapids -- the loop is already
     // vectorised by -O3 -march=native -fassociative-math, so there is no naive
@@ -124,7 +137,9 @@ inline void printUsage(const char* prog) {
         << "  --prewarm <int>    heap seed vectors per cluster      (500)\n"
         << "  --prewarmlists <int>  clusters seeded per query         (1)\n"
         << "                     either set to 0 turns seeding off\n"
-        << "  --pruning <0|1>    dimension-level pruning            (1)\n"
+        << "  --pruning <name>   both | dim | vector | none        (both)\n"
+        << "                     dim = drop a candidate past the threshold\n"
+        << "                     vector = tighten it between partitions\n"
         << "  --mkl <0|1>        gemm at the head of a chain        (1)\n"
         << "                     measured no faster here, see config.h\n"
         << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
@@ -210,7 +225,18 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
         } else if (opt == "--prewarmlists" && hasValue) {
             cfg.prewarmLists = std::atoi(argv[++i]);
         } else if (opt == "--pruning" && hasValue) {
-            cfg.pruning = (std::atoi(argv[++i]) != 0);
+            cfg.pruning = argv[++i];
+            if (cfg.pruning == "1") {
+                cfg.pruning = "both";      // what this used to take
+            } else if (cfg.pruning == "0") {
+                cfg.pruning = "none";
+            }
+            if (cfg.pruning != "both" && cfg.pruning != "dim" &&
+                cfg.pruning != "vector" && cfg.pruning != "none") {
+                std::cerr << "unknown pruning: " << cfg.pruning << std::endl;
+                printUsage(argv[0]);
+                return false;
+            }
         } else if (opt == "--threads" && hasValue) {
             cfg.threads = std::atoi(argv[++i]);
         } else if (opt == "--alpha" && hasValue) {
@@ -249,6 +275,9 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
 // Turns --mode into a grid, unless --bvec/--bdim were given. bVec * bDim has
 // to come out equal to the worker count.
 inline bool resolveGrid(Config& cfg, int numWorkers) {
+    cfg.pruneDim = (cfg.pruning == "both" || cfg.pruning == "dim");
+    cfg.pruneVector = (cfg.pruning == "both" || cfg.pruning == "vector");
+
     // -n 1 留不下 worker，下面每种布局都会除以零。放在这里是因为
     // master 和 worker 都要经过这个函数。
     if (numWorkers < 1) {
