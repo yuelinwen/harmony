@@ -49,7 +49,6 @@ public:
         send_ = 0.0;
         setup_ = 0.0;
         poll_ = 0.0;
-        count_ = 0.0;
         admin_ = 0.0;
         jobs_ = 0;
     }
@@ -75,7 +74,13 @@ public:
     // Works on one block of queries: [firstQ, firstQ+len) of the batch, each
     // against every cluster of its probe list that this worker holds. qOff
     // says where each query's run of running totals starts in sums.
-    void accumulate(int firstQ, int len,
+    //
+    // Returns how many candidates came out of it still alive, which is what
+    // the paper's Table 3 ratios are built from. Counted here rather than by a
+    // pass over sums afterwards: this loop already visits every element, and
+    // has threads, whereas that pass was serial over millions of floats and
+    // measured 2.5% of the run at bDim = 1 and 14% at bDim = 4.
+    long accumulate(int firstQ, int len,
                     const std::vector<size_t>& qOff, std::vector<float>& sums,
                     bool first);
 
@@ -86,10 +91,11 @@ private:
     // The head of a chain, where nothing has been pruned yet and every pair
     // has to be computed. Grouped by cluster instead of by query, that is a
     // dense matrix multiply, which is what MKL is for (paper §5). Returns
-    // false when there is no MKL to call, so the caller falls back.
+    // false when there is no MKL to call, so the caller falls back. On true,
+    // alive holds the survivor count, as accumulate() returns.
     bool accumulateGemm(int firstQ, int len,
                         const std::vector<size_t>& qOff,
-                        std::vector<float>& sums);
+                        std::vector<float>& sums, long* alive);
 
     // Scratch for the above: byCluster_[bi] lists the queries of the current
     // block that probe cluster bi, and where each one's run starts in sums.
@@ -153,7 +159,6 @@ private:
     double send_;      // blocked reclaiming a send slot
     double setup_;     // opening a block: its buffer layout and its buffer
     double poll_;      // asking whether anything has arrived, and taking it
-    double count_;     // counting survivors for the Table 3 pruning ratios
     double admin_;     // waiting for the master's stats / re-plan messages,
                        // so mostly master-side serial work between batches
     long jobs_;        // clusters served

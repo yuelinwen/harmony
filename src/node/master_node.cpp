@@ -856,8 +856,8 @@ void MasterNode::printWorkerTimes() const {
 
     std::cout << "\n===== where each worker's time went =====" << std::endl;
     std::cout << "  worker   grid    jobs     total    compute      idle"
-              << "      recv      send     setup      poll     count"
-              << "     admin     other"
+              << "      recv      send     setup      poll     admin"
+              << "     other"
               << std::endl;
 
     // setprecision and fixed stay on the stream, and with --nprobes there is
@@ -880,10 +880,10 @@ void MasterNode::printWorkerTimes() const {
                   << std::setw(9) << std::fixed << std::setprecision(2)
                   << t[0] << "s";
 
-        // compute, idle, recv, send, setup, poll, count, admin
-        int order[8] = {3, 1, 2, 4, 6, 7, 8, 9};
+        // compute, idle, recv, send, setup, poll, admin
+        int order[7] = {3, 1, 2, 4, 6, 7, 8};
         double named = 0.0;
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 7; ++i) {
             named = named + t[order[i]];
             std::cout << std::setw(8) << std::setprecision(1)
                       << (100.0 * t[order[i]] / total) << "%";

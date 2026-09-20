@@ -67,9 +67,9 @@ long WorkerNode::vectorCount() const {
 // skip anything, so grouping by cluster would compute what pruning just saved.
 bool WorkerNode::accumulateGemm(int firstQ, int len,
                                 const std::vector<size_t>& qOff,
-                                std::vector<float>& sums) {
+                                std::vector<float>& sums, long* alive) {
 #ifndef HARMONY_USE_MKL
-    (void)firstQ; (void)len; (void)qOff; (void)sums;
+    (void)firstQ; (void)len; (void)qOff; (void)sums; (void)alive;
     return false;
 #else
     // Which of this block's queries probe each cluster, and where each one's
@@ -94,7 +94,8 @@ bool WorkerNode::accumulateGemm(int firstQ, int len,
     // One cluster per thread. Two queries probing the same cluster write
     // different runs of sums, and a run belongs to one query, so no two
     // threads ever touch the same element.
-    #pragma omp parallel for schedule(dynamic)
+    long survivors = 0;
+    #pragma omp parallel for schedule(dynamic) reduction(+ : survivors)
     for (int bi = 0; bi < (int)byCluster_.size(); ++bi) {
         const std::vector<std::pair<int, size_t> >& mem = byCluster_[bi];
         int m = (int)mem.size();
@@ -126,19 +127,28 @@ bool WorkerNode::accumulateGemm(int firstQ, int len,
             const float* d = &dot[(size_t)a * n];
             for (int v = 0; v < n; ++v) {
                 float dist = qn[a] + cb.norm[v] - 2.0f * d[v];
-                row[v] = (dist > t) ? PRUNED : dist;
+                if (dist > t) {
+                    row[v] = PRUNED;
+                } else {
+                    row[v] = dist;
+                    survivors = survivors + 1;
+                }
             }
         }
     }
+
+    *alive = survivors;
     return true;
 #endif
 }
 
-void WorkerNode::accumulate(int firstQ, int len,
+long WorkerNode::accumulate(int firstQ, int len,
                             const std::vector<size_t>& qOff,
                             std::vector<float>& sums, bool first) {
-    if (first && useMkl_ && accumulateGemm(firstQ, len, qOff, sums)) {
-        return;
+    long survivors = 0;
+    if (first && useMkl_ &&
+        accumulateGemm(firstQ, len, qOff, sums, &survivors)) {
+        return survivors;
     }
 
     // One query at a time, walking its probe list and stopping at the
@@ -148,7 +158,7 @@ void WorkerNode::accumulate(int firstQ, int len,
     // OpenMP: a query owns its own run of sums, so the threads never write
     // the same memory and no locking is needed (paper §5, node-level
     // parallelism; across nodes the work is already split by MPI).
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) reduction(+ : survivors)
     for (int j = 0; j < len; ++j) {
         const float* qv = &queries_[(size_t)(firstQ + j) * myDim_];
         float t = thresholds_[firstQ + j];
@@ -172,11 +182,15 @@ void WorkerNode::accumulate(int firstQ, int len,
                                                     myDim_);
                 if (row[v] > t) {
                     row[v] = PRUNED;   // cannot reach the top-K, stop here
+                } else {
+                    survivors = survivors + 1;
                 }
             }
             off += n;
         }
     }
+
+    return survivors;
 }
 
 void WorkerNode::receiveSetup() {
@@ -347,7 +361,7 @@ int WorkerNode::run() {
                          TAG_STATS, MPI_COMM_WORLD);
                 double times[WORKER_TIMES] = {total_, idle_, recv_, compute_,
                                               send_, (double)jobs_,
-                                              setup_, poll_, count_, admin_};
+                                              setup_, poll_, admin_};
                 MPI_Send(times, WORKER_TIMES, MPI_DOUBLE, MASTER_RANK,
                          TAG_TIMES, MPI_COMM_WORLD);
                 admin_ = admin_ + adminWatch.seconds();
@@ -381,7 +395,6 @@ int WorkerNode::run() {
                 send_ = 0.0;
                 setup_ = 0.0;
                 poll_ = 0.0;
-                count_ = 0.0;
                 admin_ = 0.0;
                 jobs_ = 0;
                 total_ = 0.0;
@@ -512,22 +525,11 @@ int WorkerNode::run() {
         size_t total = p.sums.size();
 
         phase.reset();
-        accumulate(p.firstQ, p.len, p.qOff, p.sums, p.stage == 0);
+        aliveAtStage_[p.stage] = aliveAtStage_[p.stage]
+                               + accumulate(p.firstQ, p.len, p.qOff, p.sums,
+                                            p.stage == 0);
         compute_ = compute_ + phase.seconds();
         jobs_ = jobs_ + 1;
-
-        // Nothing but a statistic -- it feeds the paper's Table 3 and no
-        // decision. Timed separately because it turned out to be one of the
-        // largest costs in the run: a serial pass over every (query,
-        // candidate) pair, with a dependent counter the compiler cannot
-        // vectorise, on a buffer that at bDim = 8 holds millions of floats.
-        phase.reset();
-        for (size_t j = 0; j < total; ++j) {
-            if (p.sums[j] < PRUNED) {
-                aliveAtStage_[p.stage] = aliveAtStage_[p.stage] + 1;
-            }
-        }
-        count_ = count_ + phase.seconds();
 
         // reclaim this slot before overwriting it. A large send_ is back
         // pressure: the next hop is not taking what this worker sends.
