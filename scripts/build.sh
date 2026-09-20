@@ -105,7 +105,7 @@ fi
 
 # mpicxx is a wrapper around the system compiler that adds the MPI include and
 # library paths, so no MPI flags are needed here.
-mpicxx $FLAGS main.cpp src/node/*.cpp src/index/*.cpp -o main $LIBS
+mpicxx $FLAGS main.cpp src/node/*.cpp src/index/*.cpp src/test/*.cpp -o main $LIBS
 echo "built ./main"
 
 # ---- copy to the workers, if this is the master ------------------------

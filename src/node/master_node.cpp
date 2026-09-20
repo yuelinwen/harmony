@@ -3,52 +3,18 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
-#include <iomanip>
-#include <ios>
 #include <cmath>
 #include <cstdio>
-#include <ctime>
 #include <iostream>
 #include <string>
 
 #include <mpi.h>
-#include <unistd.h>
-
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 #include "../index/distance.h"
 
-// Which source produced this binary, stamped in by scripts/build.sh as
-// <commit>+<digest of the compiled sources>. The fallback is for a build that
-// went around the script.
-#ifndef HARMONY_COMMIT
-#define HARMONY_COMMIT "unknown"
-#endif
-
 namespace harmony {
 
-// Local wall-clock time, to the second. Not steady_clock: this one exists to
-// line a result up against a shell history or a log, not to measure anything.
-static std::string timestampNow() {
-    std::time_t t = std::time(nullptr);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", std::localtime(&t));
-    return std::string(buf);
-}
 
-// Which machine rank 0 ran on. Worth recording because a run that landed on
-// the wrong master, or shared a machine with somebody else's leftovers, looks
-// perfectly normal in every other column.
-static std::string hostName() {
-    char buf[256];
-    if (gethostname(buf, sizeof(buf)) != 0) {
-        return "unknown";
-    }
-    buf[sizeof(buf) - 1] = '\0';
-    return std::string(buf);
-}
 
 bool MasterNode::loadData(const std::string& basePath, const std::string& queryPath) {
     if (!base_.load(basePath)) {
@@ -63,112 +29,9 @@ bool MasterNode::loadData(const std::string& basePath, const std::string& queryP
     return true;
 }
 
-bool MasterNode::loadGroundtruth(const std::string& path) {
-    FILE* file = std::fopen(path.c_str(), "rb");
-    if (file == nullptr) {
-        std::cerr << "cannot open file: " << path << std::endl;
-        return false;
-    }
 
-    int header[2];
-    if (std::fread(header, sizeof(int), 2, file) != 2) {
-        std::cerr << "cannot read header: " << path << std::endl;
-        std::fclose(file);
-        return false;
-    }
-    gtCount_ = header[0];
-    gtDim_ = header[1];
 
-    gt_.resize((size_t)gtCount_ * gtDim_);
-    size_t got = std::fread(gt_.data(), sizeof(int), gt_.size(), file);
-    std::fclose(file);
 
-    if (got != gt_.size()) {
-        std::cerr << "short read: " << path << std::endl;
-        return false;
-    }
-
-    std::cout << "gt:    n=" << gtCount_ << " dim=" << gtDim_ << std::endl;
-    return true;
-}
-
-// The distances of the true neighbours. Same file layout as the ids, and the
-// same row count and width, so it is checked against those rather than trusted.
-bool MasterNode::loadGroundtruthDistances(const std::string& path) {
-    FILE* file = std::fopen(path.c_str(), "rb");
-    if (file == nullptr) {
-        std::cout << "no " << path << ", so no r2"
-                  << "   (scripts/data.sh writes it)" << std::endl;
-        return false;
-    }
-
-    int header[2];
-    if (std::fread(header, sizeof(int), 2, file) != 2) {
-        std::cerr << "cannot read header: " << path << std::endl;
-        std::fclose(file);
-        return false;
-    }
-
-    if (header[0] != gtCount_ || header[1] != gtDim_) {
-        std::cerr << path << " is " << header[0] << "x" << header[1]
-                  << " but the ids are " << gtCount_ << "x" << gtDim_
-                  << "; ignoring it" << std::endl;
-        std::fclose(file);
-        return false;
-    }
-
-    gtd_.resize((size_t)gtCount_ * gtDim_);
-    size_t got = std::fread(gtd_.data(), sizeof(float), gtd_.size(), file);
-    std::fclose(file);
-
-    if (got != gtd_.size()) {
-        std::cerr << "short read: " << path << std::endl;
-        gtd_.clear();
-        return false;
-    }
-    return true;
-}
-
-// sum(returned distances) / sum(true distances) - 1, over this query's k.
-// Both lists are nearest first, so they are compared rank against rank: the
-// question is not which ids came back but how much further away they are.
-double MasterNode::r2Of(int queryId, const std::vector<Candidate>& got,
-                        int k) const {
-    if (gtd_.empty() || queryId >= gtCount_ || k <= 0) {
-        return 0.0;
-    }
-    int want = (k < gtDim_) ? k : gtDim_;
-    const float* truth = &gtd_[(size_t)queryId * gtDim_];
-
-    double mine = 0.0;
-    double real = 0.0;
-    for (int i = 0; i < want && i < (int)got.size(); ++i) {
-        mine = mine + got[i].dist;
-        real = real + truth[i];
-    }
-    return (real > 0.0) ? (mine / real - 1.0) : 0.0;
-}
-
-// Counts how many of the true top-k this result found, as a fraction. Order
-// does not matter -- a neighbour found at a different rank is still found.
-double MasterNode::recallAt(int queryId, const std::vector<Candidate>& got, int k) const {
-    if (queryId >= gtCount_ || k <= 0) {
-        return 0.0;
-    }
-    int want = (k < gtDim_) ? k : gtDim_;   // the file may hold fewer than k
-    const int* truth = &gt_[(size_t)queryId * gtDim_];
-
-    int hits = 0;
-    for (int i = 0; i < want; ++i) {
-        for (int j = 0; j < (int)got.size(); ++j) {
-            if (got[j].id == truth[i]) {
-                hits = hits + 1;
-                break;
-            }
-        }
-    }
-    return (double)hits / (double)want;
-}
 
 // The file an index with these settings would be written to. Everything that
 // changes the clustering is in the name, so two runs that differ in any of it
@@ -360,32 +223,28 @@ void MasterNode::warmupPlan(int queries, int nprobe) {
     if (queries < n) {
         n = queries;
     }
+    std::vector<std::vector<int>> probes(n);
     for (int q = 0; q < n; ++q) {
-        std::vector<int> clusters = probesFor(q, nprobe);
-        for (int i = 0; i < (int)clusters.size(); ++i) {
-            clusterHits_[clusters[i]] = clusterHits_[clusters[i]] + 1;
+        probes[q] = probesFor(q, nprobe);
+        for (int i = 0; i < (int)probes[q].size(); ++i) {
+            clusterHits_[probes[q][i]] = clusterHits_[probes[q][i]] + 1;
         }
     }
 
-    // The paper labels its workloads by "variance" and never says how it is
-    // obtained; the sample computes it as the standard deviation of how often
-    // each cluster is probed (query.cpp:735-746), which is what §4.2.1 calls
-    // I(pi) in the text.
+    // How lopsided the profiling workload was. Same measure as the one
+    // reported for the test workload (src/test/metrics.h) -- this one is the
+    // distribution the layout was built from, that one is what was then
+    // actually searched.
     //
-    // That number cannot be matched to the paper's. It carries units of probe
-    // counts, so it scales with how many queries were profiled: the most it
-    // can reach is mean * sqrt((nlist - hot) / hot) with mean = n * nprobe /
-    // nlist, which here tops out near 330 while Fig. 7 says 500. Fig. 7 states
+    // Neither can be matched to the paper's "variance = 500". The number
+    // carries units of probe counts, so it scales with how many queries were
+    // profiled: the most it can reach is mean * sqrt((nlist - hot) / hot) with
+    // mean = n * nprobe / nlist, which here tops out near 330. Fig. 7 states
     // none of n, nprobe or nlist, so there is nothing to match against. The
     // ratio to the mean is printed alongside because it is scale-free, and is
     // the figure worth comparing between runs.
     double mean = (double)n * nprobe / index_.getNlist();
-    double var = 0.0;
-    for (int c = 0; c < index_.getNlist(); ++c) {
-        double d = (double)clusterHits_[c] - mean;
-        var = var + d * d;
-    }
-    var = std::sqrt(var / index_.getNlist());
+    double var = workloadVariance(probes, index_.getNlist());
 
     std::cout << "warmup: " << n << " queries profiled, cluster probe counts"
               << " mean " << mean << " variance " << var
@@ -797,67 +656,7 @@ void MasterNode::distributeData() {
               << " (" << distributeSeconds_ << " s)" << std::endl;
 }
 
-// One machine, all its cores, the same clusters the distributed run visits.
-//
-// Parallel over queries because that is how a single-node engine uses a
-// machine, and a serial baseline would hand the cluster a speedup equal to
-// the core count before any distribution happened. Faiss, the paper's
-// baseline, is threaded the same way.
-//
-// Timed like the distributed search: one untimed warm-up when --loop is
-// above 1, then loop passes averaged, so the two numbers are comparable.
-double MasterNode::referencePass(int nq, int nprobe, int k) {
-    reference_.assign(nq, std::vector<Candidate>());
 
-    int passes = (cfg_.loop > 1) ? (cfg_.loop + 1) : 1;
-    double seconds = 0.0;
-
-    for (int pass = 0; pass < passes; ++pass) {
-        Stopwatch watch;
-        #pragma omp parallel for schedule(dynamic)
-        for (int q = 0; q < nq; ++q) {
-            reference_[q] = index_.search(base_, query_.vec(q),
-                                          probesFor(q, nprobe), k);
-        }
-        double took = watch.seconds();
-        if (!(passes > 1 && pass == 0)) {
-            seconds = seconds + took;
-        }
-    }
-
-    return (cfg_.loop > 1) ? (seconds / cfg_.loop) : seconds;
-}
-
-// How lopsided the workload actually searched was. The sample's formula
-// exactly (query.cpp:735-746): count how often each cluster is probed, then
-// take the standard deviation across the nlist clusters.
-//
-// The paper calls this "variance" and labels its workloads with it, but the
-// number carries units of probe counts and so scales with nq and nprobe --
-// see the note in warmupPlan. Recorded to compare runs against each other,
-// not against the paper's 500.
-double MasterNode::workloadVariance(int nq, int nprobe) const {
-    int nlist = index_.getNlist();
-    if (nlist <= 0) {
-        return 0.0;
-    }
-
-    std::vector<long> hits(nlist, 0);
-    for (int q = 0; q < nq; ++q) {
-        std::vector<int> clusters = probesFor(q, nprobe);
-        for (int i = 0; i < (int)clusters.size(); ++i) {
-            hits[clusters[i]] = hits[clusters[i]] + 1;
-        }
-    }
-
-    double mean = (double)nq * nprobe / nlist;
-    double var = 0.0;
-    for (int c = 0; c < nlist; ++c) {
-        double d = (double)hits[c] - mean;
-        var = var + d * d;
-    }
-    return std::sqrt(var / nlist);
-}
 
 // Zeroes every worker's counters. Sent just before the stretch that gets
 // reported, so an untimed --loop pass or a previous --nprobes value cannot
@@ -895,6 +694,17 @@ void MasterNode::collectStats() {
     }
 }
 
+// The same index on one machine. This is the paper's Faiss column, except
+// that it is this program's own single-machine form rather than another
+// implementation's, so the comparison is only about the partitioning.
+long MasterNode::singleMachineMemory() const {
+    long n = base_.getN();
+    long dim = base_.getDim();
+    return n * dim * (long)sizeof(float)
+         + n * (long)sizeof(int)
+         + (long)index_.getNlist() * dim * (long)sizeof(float);
+}
+
 void MasterNode::shutdown() {
     for (int w = 1; w <= numWorkers_; ++w) {
         int job[5] = {JOB_SHUTDOWN, 0, 0, 0, 0};
@@ -906,141 +716,10 @@ void MasterNode::shutdown() {
 // waiting for somebody else. A worker that is mostly idle is being starved by
 // the master; mostly in recv means its upstream is the slow one (paper
 // Fig. 9).
-void MasterNode::printWorkerTimes() const {
-    if (workerTimes_.empty()) {
-        return;
-    }
 
-    std::cout << "\n===== where each worker's time went =====" << std::endl;
-    std::cout << "  worker   grid    jobs     total    compute      idle"
-              << "      recv      send     setup      poll     admin"
-              << "     other"
-              << std::endl;
 
-    // setprecision and fixed stay on the stream, and with --nprobes there is
-    // another run's output after this table.
-    std::ios_base::fmtflags flags = std::cout.flags();
-    std::streamsize digits = std::cout.precision();
 
-    for (int w = 1; w <= numWorkers_; ++w) {
-        const std::vector<double>& t = workerTimes_[w - 1];
-        double total = t[0];
-        if (total <= 0.0) {
-            total = 1e-9;
-        }
 
-        std::string grid = std::to_string((w - 1) / bDim_) + "x"
-                         + std::to_string((w - 1) % bDim_);
-        std::cout << "  " << std::setw(6) << w
-                  << std::setw(7) << grid
-                  << std::setw(8) << (long)t[5]
-                  << std::setw(9) << std::fixed << std::setprecision(2)
-                  << t[0] << "s";
-
-        // compute, idle, recv, send, setup, poll, admin
-        int order[7] = {3, 1, 2, 4, 6, 7, 8};
-        double named = 0.0;
-        for (int i = 0; i < 7; ++i) {
-            named = named + t[order[i]];
-            std::cout << std::setw(8) << std::setprecision(1)
-                      << (100.0 * t[order[i]] / total) << "%";
-        }
-
-        // Printed rather than left to be worked out, so it is obvious when
-        // the six above stop covering the run.
-        std::cout << std::setw(8) << std::setprecision(1)
-                  << (100.0 * (total - named) / total) << "%" << std::endl;
-    }
-
-    std::cout.flags(flags);
-    std::cout.precision(digits);
-
-    printTimeBreakdown();
-}
-
-// The paper's Fig. 9 buckets, averaged over the workers.
-//
-//   communication   recv + send -- blocked moving partial sums along a chain.
-//                   This is the sample's waitTime (node.cpp:275).
-//   computation     accumulate() and the top-k pick at a chain tail.
-//   other           everything else: waiting for the master to dispatch,
-//                   opening a block, polling, and the counters.
-//
-// "other" is large here and small in the paper, and the reason is in the
-// design rather than in the measurement: this master dispatches at run time,
-// so a worker waits on it, while the sample's schedule is fixed at setup and
-// its workers never wait for work at all.
-void MasterNode::timeBreakdown(double* comm, double* compute,
-                               double* other) const {
-    *comm = 0.0;
-    *compute = 0.0;
-    *other = 0.0;
-    if (workerTimes_.empty()) {
-        return;
-    }
-
-    for (int w = 0; w < numWorkers_; ++w) {
-        const std::vector<double>& t = workerTimes_[w];
-        *comm = *comm + t[2] + t[4];
-        *compute = *compute + t[3];
-        // By subtraction, so that whatever is not in a bucket still shows up
-        // rather than quietly going missing.
-        *other = *other + (t[0] - t[2] - t[4] - t[3]);
-    }
-
-    *comm = *comm / numWorkers_;
-    *compute = *compute / numWorkers_;
-    *other = *other / numWorkers_;
-}
-
-// Table 4's two numbers. Bytes, so the printing decides the unit.
-long MasterNode::workerMemory() const {
-    long b = 0;
-    for (int w = 0; w < (int)workerTimes_.size(); ++w) {
-        b = b + (long)workerTimes_[w][9];
-    }
-    return b;
-}
-
-// The same index on one machine: the vectors, one id per vector in the
-// inverted lists, and the centroids. This is the paper's Faiss column, except
-// that it is this program's own single-machine form rather than another
-// implementation's, so the comparison is only about the partitioning.
-long MasterNode::singleMachineMemory() const {
-    long n = base_.getN();
-    long dim = base_.getDim();
-    return n * dim * (long)sizeof(float)
-         + n * (long)sizeof(int)
-         + (long)index_.getNlist() * dim * (long)sizeof(float);
-}
-
-void MasterNode::printTimeBreakdown() const {
-    double comm = 0.0;
-    double compute = 0.0;
-    double other = 0.0;
-    timeBreakdown(&comm, &compute, &other);
-
-    double total = comm + compute + other;
-    if (total <= 0.0) {
-        return;
-    }
-
-    std::ios_base::fmtflags flags = std::cout.flags();
-    std::streamsize digits = std::cout.precision();
-
-    std::cout << "  ---- paper Fig. 9, mean worker ----" << std::endl;
-    std::cout << std::fixed << std::setprecision(3)
-              << "  communication " << comm << "s (" << std::setprecision(1)
-              << (100.0 * comm / total) << "%)   "
-              << std::setprecision(3) << "computation " << compute << "s ("
-              << std::setprecision(1) << (100.0 * compute / total) << "%)   "
-              << std::setprecision(3) << "other " << other << "s ("
-              << std::setprecision(1) << (100.0 * other / total) << "%)"
-              << std::endl;
-
-    std::cout.flags(flags);
-    std::cout.precision(digits);
-}
 
 // Without this the heap starts empty, worst() is infinite, and nothing can be
 // pruned until a whole block has been through the pipeline (Algorithm 1,
@@ -1398,16 +1077,16 @@ int MasterNode::run() {
     // Printed before anything can go wrong, so a run that dies half way still
     // says which binary died. The same three values go into every CSV row.
     std::cout << "run " << timestampNow()
-              << "  build " << HARMONY_COMMIT
+              << "  build " << buildId()
               << "  host " << hostName() << std::endl;
 
     std::cout << "\n===== 1. data =====" << std::endl;
 
     if (!loadData(cfg_.data + "_base.bin", cfg_.data + "_query.bin") ||
-        !loadGroundtruth(cfg_.data + "_gt.bin")) {
+        !truth_.loadIds(cfg_.data + "_gt.bin")) {
         return 1;
     }
-    loadGroundtruthDistances(cfg_.data + "_gtd.bin");
+    truth_.loadDistances(cfg_.data + "_gtd.bin");
     buildIndex(cfg_.nlist, cfg_.iters);
 
     // The layout has to be settled before any data moves, so the profiling
@@ -1451,8 +1130,7 @@ int MasterNode::run() {
                   << std::endl;
     }
 
-    int differing = 0;
-    int ties = 0;
+    Agreement agree;
 
     // Only the distributed search is timed. The single-machine pass below is
     // both the baseline it is compared against and the answer key --check
@@ -1461,12 +1139,22 @@ int MasterNode::run() {
     double recallSum = 0.0;
     double r2Sum = 0.0;
 
+    // Every probe list of this nprobe, worked out once. The search, the
+    // single-machine reference and the workload statistic all read this same
+    // set, which is what keeps `differing` meaningful under a synthetic
+    // workload.
+    std::vector<std::vector<int>> probes(nq);
+    for (int q = 0; q < nq; ++q) {
+        probes[q] = probesFor(q, nprobe);
+    }
+
     // Before the search rather than inside it: the probe lists depend on
     // nprobe but not on anything the search does, so this can be computed
     // once, and doing it here keeps it out of the workers' idle time.
     double single = 0.0;
     if (cfg_.baseline || cfg_.check) {
-        single = referencePass(nq, nprobe, k);
+        single = referencePass(index_, base_, query_, probes, k, cfg_.loop,
+                              reference_);
     }
 
     // The query set can be run several times and the time averaged, which is
@@ -1486,8 +1174,7 @@ int MasterNode::run() {
 
     recallSum = 0.0;
     r2Sum = 0.0;
-    differing = 0;
-    ties = 0;
+    agree = Agreement();
 
     // Every pass, not just the counted one: the counters are sized here as
     // well as zeroed, and the warm-up pass reads them too.
@@ -1513,41 +1200,15 @@ int MasterNode::run() {
 
         for (int j = 0; j < count; ++j) {
             int q = start + j;
-            recallSum = recallSum + recallAt(q, spread[j], k);
-            r2Sum = r2Sum + r2Of(q, spread[j], k);
+            recallSum = recallSum + truth_.recallAt(q, spread[j], k);
+            r2Sum = r2Sum + truth_.r2Of(q, spread[j], k);
 
             // 这个参考对照比它检查的搜索还贵（单机、不剪枝），跑上千条查询时
             // 它就是大部分墙钟时间，所以可以关掉。
             if (!cfg_.check) {
                 continue;
             }
-            const std::vector<Candidate>& ref = reference_[q];
-
-            std::vector<int> a;
-            std::vector<int> b;
-            std::vector<float> da;
-            std::vector<float> db;
-            for (int i = 0; i < k; ++i) {
-                a.push_back(spread[j][i].id);
-                b.push_back(ref[i].id);
-                da.push_back(spread[j][i].dist);
-                db.push_back(ref[i].dist);
-            }
-            std::sort(a.begin(), a.end());
-            std::sort(b.begin(), b.end());
-            std::sort(da.begin(), da.end());
-            std::sort(db.begin(), db.end());
-
-            if (a != b) {
-                // Same distances but different members means a tie at rank k
-                // was broken the other way -- both answers are equally
-                // correct. Only a differing distance sequence is wrong.
-                if (da == db) {
-                    ties = ties + 1;
-                } else {
-                    differing = differing + 1;
-                }
-            }
+            compare(spread[j], reference_[q], k, &agree);
         }
     }
     }
@@ -1558,228 +1219,52 @@ int MasterNode::run() {
 
     collectStats();   // the workers keep running, the next nprobe needs them
 
-    std::cout << "\n===== 5. results =====" << std::endl;
-    std::cout << "setup: " << numWorkers_ << " workers, grid "
-              << bVec_ << " x " << bDim_ << ", nlist " << index_.getNlist()
-              << ", nprobe " << nprobe << ", k " << k
-              << ", batch " << cfg_.batch << std::endl;
-    std::cout << "arms: pruning " << pruningLabel()
-              << ", assign " << cfg_.assign
-              << ", pipeline " << (cfg_.pipeline ? "on" : "OFF")
-              << ", blocksend " << (cfg_.blockSend ? "ON" : "off")
-              << std::endl;
+    // Everything measured, handed to the one place that knows how to say it.
+    Metrics m;
+    m.cfg = cfg_;
+    m.workers = numWorkers_;
+    m.bVec = bVec_;
+    m.bDim = bDim_;
+    m.nlist = index_.getNlist();
+    m.nprobe = nprobe;
+    m.k = k;
+    m.nq = nq;
+    m.baseCount = base_.getN();
 
-    // Is the distributed answer the same as one machine's? This is the check
-    // that has to pass; everything below it is a measurement, not a verdict.
-    std::cout << "\ncorrectness" << std::endl;
-    std::cout << "  queries differing from single machine: "
-              << differing << "/" << nq
-              << "   (ties broken differently: " << ties << ")" << std::endl;
-    std::cout << "  recall@" << k << ": " << (recallSum / nq)
-              << "   (" << (k * (1.0 - recallSum / nq))
-              << " of " << k << " true neighbours missed per query)" << std::endl;
-    if (!gtd_.empty()) {
-        std::cout << "  r2: " << (r2Sum / nq)
-                  << "   (squared distances this much further than the true"
-                  << " top-" << k << ")" << std::endl;
+    m.differing = agree.differing;
+    m.ties = agree.ties;
+    m.recall = recallSum / nq;
+    m.r2 = r2Sum / nq;
+    m.haveR2 = truth_.haveDistances();
+
+    m.seconds = seconds;
+    m.single = single;
+    m.elapsed = wall_.seconds();
+    m.variance = workloadVariance(probes, index_.getNlist());
+    m.trainSeconds = index_.trainSeconds();
+    m.addSeconds = index_.addSeconds();
+    m.distributeSeconds = distributeSeconds_;
+
+    m.workerBytes = 0;
+    for (int w = 0; w < (int)workerTimes_.size(); ++w) {
+        m.workerBytes = m.workerBytes + (long)workerTimes_[w][9];
     }
+    m.singleBytes = singleMachineMemory();
 
-    std::cout << "\nthroughput" << std::endl;
-    std::cout << "  " << nq << " queries in " << seconds << " s" << std::endl;
-    std::cout << "  QPS: " << (nq / seconds)
-              << "   (" << (1000.0 * seconds / nq) << " ms per query)" << std::endl;
+    m.scanned = scanned_;
+    m.scannedRow = scannedRow_;
+    m.aliveAfterStage = aliveAfterStage_;
+    m.workerTimes = workerTimes_;
+    m.reorders = reorders_;
 
-    // What distributing bought, against the same clustering and the same
-    // probe lists on one machine (paper §6.2.1). The thread count is printed
-    // because the comparison only means anything with it: this is one node
-    // using all of its cores against numWorkers_ nodes using theirs.
-    if (cfg_.baseline && single > 0.0) {
-        int cores = 1;
-        #ifdef _OPENMP
-        cores = omp_get_max_threads();
-        #endif
-        std::cout << "  single machine: " << single << " s   ("
-                  << (nq / single) << " QPS, " << cores << " threads on "
-                  << hostName() << ")" << std::endl;
-        std::cout << "  speedup: " << (single / seconds) << "x over one machine"
-                  << "   (" << numWorkers_ << " workers)" << std::endl;
-    }
-
-    // How lopsided this workload was, in the units the paper labels its
-    // workloads with. Index and test workload are separate numbers: the
-    // layout was built from the profiling pass (see warmup above), this is
-    // what was then actually searched.
-    double variance = workloadVariance(nq, nprobe);
-    std::cout << "  test workload variance: " << variance
-              << "   (mean " << ((double)nq * nprobe / index_.getNlist())
-              << " probes per cluster)" << std::endl;
-
-    std::cout << "\nindex build" << std::endl;
-    std::cout << "  train " << index_.trainSeconds() << " s, add "
-              << index_.addSeconds() << " s, distribute "
-              << distributeSeconds_ << " s";
-    if (index_.trainSeconds() == 0.0 && index_.addSeconds() == 0.0) {
-        std::cout << "   (loaded from cache, so train and add are 0)";
-    }
-    std::cout << std::endl;
-
-    // Paper Table 4. The interesting number is the ratio: the workers between
-    // them should hold about what one machine would, and whatever they hold
-    // beyond it is what the partitioning costs.
-    long mem = workerMemory();
-    long one = singleMachineMemory();
-    if (mem > 0 && one > 0) {
-        std::cout << "  index memory: " << (mem / 1048576) << " MB over "
-                  << numWorkers_ << " workers ("
-                  << (mem / 1048576 / numWorkers_) << " MB each), vs "
-                  << (one / 1048576) << " MB on one machine" << std::endl;
-        std::cout << "    " << (100.0 * mem / one) << "% of the single-machine"
-                  << " index, so " << (100.0 * (mem - one) / one)
-                  << "% overhead" << std::endl;
-    }
-
-    // How much of the base each query actually touched, and how evenly that
-    // work fell across the vector partitions. The spread here is what the
-    // cost model's I(pi) term estimates in advance.
-    double perQuery = (double)scanned_ / nq;
-    std::cout << "\nwork" << std::endl;
-    std::cout << "  candidates scanned: " << scanned_
-              << "   (" << perQuery << " per query, "
-              << (100.0 * perQuery / base_.getN()) << "% of the base)" << std::endl;
-    if (bVec_ > 1) {
-        std::cout << "  per vector partition   (even would be "
-                  << (100.0 / bVec_) << "% each)" << std::endl;
-        for (int r = 0; r < bVec_; ++r) {
-            std::cout << "    partition " << r << ": " << scannedRow_[r]
-                      << " candidates   "
-                      << (100.0 * scannedRow_[r] / scanned_) << "%" << std::endl;
-        }
-    }
-
-    // Pruning ratios in the shape of the paper's Table 3: the share of
-    // candidates that never had to reach the s-th slice of the chain. Slice 1
-    // is always 0 -- everyone computes the first slice, there is nothing to
-    // skip yet.
-    std::cout << "\npruning (" << bDim_ << " slices per chain)" << std::endl;
-    long done = 0;
-    for (int s = 0; s < bDim_; ++s) {
-        long processed = (s == 0) ? scanned_ : aliveAfterStage_[s - 1];
-        std::cout << "  slice " << (s + 1) << ": skipped "
-                  << (100.0 * (1.0 - (double)processed / (double)scanned_))
-                  << "%   (" << processed << " candidates reached it)" << std::endl;
-        done = done + processed;
-    }
-    std::cout << "distance work vs no pruning: "
-              << (100.0 * done / (double)(scanned_ * bDim_)) << "%" << std::endl;
-
-    printWorkerTimes();
-    if (bDim_ > 1) {
-        std::cout << "chain reordered " << reorders_ << " time(s)" << std::endl;
-    }
-    writeCsv(nprobe, nq, recallSum / nq, seconds, differing, ties,
-             wall_.seconds(), single, variance, r2Sum / nq);
+    m.print();
+    m.writeCsv();
     }   // end of the nprobe sweep
 
     shutdown();
     return 0;
 }
 
-// The two pruning switches as one word, for the CSV: both | dim | vector |
-// none. dim and vector both come out at 100% of the distance work, since
-// nothing reads the threshold either way -- they differ in the pipeline, not
-// in the arithmetic.
-std::string MasterNode::pruningLabel() const {
-    if (cfg_.pruneDim && cfg_.pruneVector) {
-        return "both";
-    }
-    if (cfg_.pruneDim) {
-        return "dim";
-    }
-    if (cfg_.pruneVector) {
-        return "vector";
-    }
-    return "none";
-}
 
-// One row per run, appended, header written when the file is new. Everything
-// that was varied over a set of runs has to be in the row, or the rows cannot
-// be told apart later.
-void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
-                          int differing, int ties, double elapsed,
-                          double single, double variance, double r2) const {
-    if (cfg_.csv.empty()) {
-        return;
-    }
-
-    bool isNew = true;
-    std::FILE* probe = std::fopen(cfg_.csv.c_str(), "rb");
-    if (probe != nullptr) {
-        std::fseek(probe, 0, SEEK_END);
-        isNew = (std::ftell(probe) == 0);
-        std::fclose(probe);
-    }
-
-    std::FILE* f = std::fopen(cfg_.csv.c_str(), "ab");
-    if (f == nullptr) {
-        std::cout << "could not write " << cfg_.csv << std::endl;
-        return;
-    }
-
-    // The four identity columns come first: a row has to say when it was
-    // taken, from what, and where, or a file of them cannot be sorted, and a
-    // repeat of the same settings is indistinguishable from the original.
-    if (isNew) {
-        std::fprintf(f, "timestamp,build,host,elapsed,"
-                        "data,nlist,iters,trainpoints,workers,bvec,bdim,mode,"
-                        "assign,skew,batch,block,blocksend,pipeline,"
-                        "threads,prewarm,prewarmlists,"
-                        "pruning,mkl,loop,nprobe,k,nq,recall,r2,qps,ms_per_query,"
-                        "single_time,speedup,variance,"
-                        "comm_time,compute_time,other_time,"
-                        "train_time,add_time,distribute_time,"
-                        "mem_mb,mem_pct,"
-                        "differing,ties,scanned,work_pct\n");
-    }
-
-    double comm = 0.0;
-    double compute = 0.0;
-    double other = 0.0;
-    timeBreakdown(&comm, &compute, &other);
-
-    long done = 0;
-    for (int s = 0; s < bDim_; ++s) {
-        done = done + ((s == 0) ? scanned_ : aliveAfterStage_[s - 1]);
-    }
-    double work = (scanned_ > 0)
-                ? (100.0 * done / (double)(scanned_ * bDim_)) : 0.0;
-
-    std::fprintf(f,
-        "%s,%s,%s,%.1f,"
-        "%s,%d,%d,%d,%d,%d,%d,%s,%s,%.3f,%d,%d,%d,%d,%d,%d,%d,%s,%d,%d,"
-        "%d,%d,%d,%.6f,%.6f,%.3f,%.4f,"
-        "%.4f,%.3f,%.2f,"
-        "%.4f,%.4f,%.4f,"
-        "%.3f,%.3f,%.3f,"
-        "%ld,%.2f,"
-        "%d,%d,%ld,%.4f\n",
-        timestampNow().c_str(), HARMONY_COMMIT, hostName().c_str(), elapsed,
-        cfg_.data.c_str(), cfg_.nlist, cfg_.iters, cfg_.trainPoints,
-        numWorkers_, bVec_, bDim_, cfg_.mode.c_str(),
-        cfg_.assign.c_str(), cfg_.skew,
-        cfg_.batch, cfg_.block, cfg_.blockSend ? 1 : 0, cfg_.pipeline ? 1 : 0,
-        cfg_.threads, cfg_.prewarm, cfg_.prewarmLists,
-        pruningLabel().c_str(), cfg_.mkl ? 1 : 0, cfg_.loop,
-        nprobe, cfg_.k, nq, recall, r2, nq / seconds, 1000.0 * seconds / nq,
-        single, (single > 0.0) ? (single / seconds) : 0.0, variance,
-        comm, compute, other,
-        index_.trainSeconds(), index_.addSeconds(), distributeSeconds_,
-        workerMemory() / 1048576,
-        (singleMachineMemory() > 0)
-            ? (100.0 * workerMemory() / singleMachineMemory()) : 0.0,
-        differing, ties, scanned_, work);
-
-    std::fclose(f);
-    std::cout << "appended to " << cfg_.csv << std::endl;
-}
 
 }  // namespace harmony

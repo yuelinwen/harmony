@@ -12,6 +12,8 @@
 #include "../engine/stopwatch.h"
 #include "../index/dataset.h"
 #include "../index/ivf_index.h"
+#include "../test/metrics.h"
+#include "../test/verify.h"
 
 // MasterNode (rank 0): decides and coordinates, but does almost no distance
 // work. Paper Fig. 3 left side; Algorithm 1 is spread across the *Pipeline
@@ -26,8 +28,6 @@ public:
         cfg_ = cfg;
         bVec_ = cfg.bVec;
         bDim_ = cfg.bDim;
-        gtCount_ = 0;
-        gtDim_ = 0;
         scanned_ = 0;
     }
     ~MasterNode() override = default;
@@ -38,29 +38,6 @@ public:
 
     // Reads the base and query vectors. Returns false if either file fails.
     bool loadData(const std::string& basePath, const std::string& queryPath);
-
-    // Reads the true nearest neighbours: same layout as the vector files, but
-    // int32 ids. Row q holds the real answer for query q, nearest first.
-    bool loadGroundtruth(const std::string& path);
-
-    // Reads how far away those true neighbours are, squared. Optional: the
-    // file was added after the first datasets were converted, and only r2
-    // needs it, so a missing one is reported and nothing else changes.
-    bool loadGroundtruthDistances(const std::string& path);
-
-    // The sample's r2 (utils.h:734): how much further away this result's
-    // neighbours are than the true ones, as a fraction. 0 means it found
-    // distances as good as the groundtruth's. Named r2 because the sample
-    // calls it that; it is not a coefficient of determination.
-    double r2Of(int queryId, const std::vector<Candidate>& got, int k) const;
-
-    // Bytes every worker holds between them, and what one machine would need
-    // for the same index (paper Table 4).
-    long workerMemory() const;
-    long singleMachineMemory() const;
-
-    // Share of the true top-k this result actually found (paper Section 6).
-    double recallAt(int queryId, const std::vector<Candidate>& got, int k) const;
 
     // Clusters the base vectors into nlist groups. This runs once, over the
     // whole dataset, before anything is handed to the workers.
@@ -80,19 +57,6 @@ public:
     // Cuts every cluster into per-worker slices and sends them out.
     void distributeData();
 
-    // The whole query set on this one machine, using the same clustering and
-    // the same probe lists as the distributed run: the paper's Faiss column
-    // (§6.2.1), and at the same time the answers --check compares against.
-    // Parallel over queries, so it uses this node's cores the way a
-    // single-node engine would. Returns the seconds it took, and leaves the
-    // answers in reference_.
-    double referencePass(int nq, int nprobe, int k);
-
-    // Standard deviation of how often each cluster is probed, over the
-    // queries actually searched. Copied from the sample (query.cpp:735-746),
-    // which is where the paper's unexplained "variance = 500" comes from.
-    double workloadVariance(int nq, int nprobe) const;
-
     // One column's rows of the chain table, as the worker expects them.
     std::vector<int> chainTableFor(int col) const;
 
@@ -110,29 +74,11 @@ public:
     // Tells the workers to stop.
     void shutdown();
 
-    // The pruning switches as one word for the CSV.
-    std::string pruningLabel() const;
-
-    // Appends one row describing this run to cfg_.csv, writing the header
-    // first if the file is new. Nothing happens when --csv was not given.
-    // `elapsed` is the whole run so far, not the search -- a row carries both
-    // so a long wall time can be told apart from a slow search.
-    void writeCsv(int nprobe, int nq, double recall, double seconds,
-                  int differing, int ties, double elapsed,
-                  double single, double variance, double r2) const;
-
-    // Rolls the per-worker buckets up into the paper's three (Fig. 9) and
-    // prints them. Called by printWorkerTimes, under the per-worker table.
-    void printTimeBreakdown() const;
-
-    // Prints the per-worker time breakdown gathered by shutdown().
-    void printWorkerTimes() const;
-
-    // The per-worker buckets rolled up into the paper's three (Fig. 9), as
-    // seconds averaged over the workers: communication, computation, other.
-    // Seconds rather than percentages because Fig. 9 normalises each mode
-    // against the slowest one, which only a set of runs can do.
-    void timeBreakdown(double* comm, double* compute, double* other) const;
+    // What one machine would need for this index: the vectors, one id per
+    // vector in the inverted lists, and the centroids. The denominator of
+    // paper Table 4, and the only half of it the master can work out on its
+    // own -- what the workers hold, they report.
+    long singleMachineMemory() const;
 
     // What one query of the current batch needs.
     struct QueryState {
@@ -223,11 +169,6 @@ private:
     Dataset query_;   // the vectors to search for
     IvfIndex index_;  // global clustering: centroids + inverted lists
 
-    std::vector<int> gt_;   // gtCount_ rows of gtDim_ ids, row-major
-    std::vector<float> gtd_;   // the same shape, their squared distances
-    int gtCount_;
-    int gtDim_;
-
     Config cfg_;
     int numWorkers_;
     int bVec_;                       // rows: vector partitions
@@ -275,6 +216,9 @@ private:
     // What distributeData() took: the paper's index-build cost that is not
     // clustering, and the sample's preSearchTime.
     double distributeSeconds_ = 0.0;
+
+    // The true neighbours, for recall and r2 (src/test/verify.h).
+    Groundtruth truth_;
 
     // The single-machine answers for the nprobe being run, one entry per
     // query. Computed once by referencePass() rather than per query inside the
