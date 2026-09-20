@@ -9,6 +9,7 @@
 #include "../comm/messages.h"
 #include "../engine/search_order.h"
 #include "../engine/slice_plan.h"
+#include "../engine/stopwatch.h"
 #include "../index/dataset.h"
 #include "../index/ivf_index.h"
 
@@ -85,8 +86,10 @@ public:
 
     // Appends one row describing this run to cfg_.csv, writing the header
     // first if the file is new. Nothing happens when --csv was not given.
+    // `elapsed` is the whole run so far, not the search -- a row carries both
+    // so a long wall time can be told apart from a slow search.
     void writeCsv(int nprobe, int nq, double recall, double seconds,
-                  int differing, int ties) const;
+                  int differing, int ties, double elapsed) const;
 
     // Prints the per-worker time breakdown gathered by shutdown().
     void printWorkerTimes() const;
@@ -222,6 +225,11 @@ private:
 
     // [total, idle, recv, compute, send, jobs] per worker, filled by shutdown()
     std::vector<std::vector<double>> workerTimes_;
+
+    // Wall time from the start of run(), so a CSV row can say how long the
+    // whole thing took -- loading, clustering and distribution included, none
+    // of which the search timer sees.
+    Stopwatch wall_;
 
     // Chain reordering state (§4.3). prevCompute_ is what each worker had
     // done at the previous look, so the difference is this batch's work;

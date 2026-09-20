@@ -7,14 +7,44 @@
 #include <ios>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <iostream>
 #include <string>
 
 #include <mpi.h>
+#include <unistd.h>
 
 #include "../index/distance.h"
 
+// Which source produced this binary, stamped in by scripts/build.sh as
+// <commit>+<digest of the compiled sources>. The fallback is for a build that
+// went around the script.
+#ifndef HARMONY_COMMIT
+#define HARMONY_COMMIT "unknown"
+#endif
+
 namespace harmony {
+
+// Local wall-clock time, to the second. Not steady_clock: this one exists to
+// line a result up against a shell history or a log, not to measure anything.
+static std::string timestampNow() {
+    std::time_t t = std::time(nullptr);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", std::localtime(&t));
+    return std::string(buf);
+}
+
+// Which machine rank 0 ran on. Worth recording because a run that landed on
+// the wrong master, or shared a machine with somebody else's leftovers, looks
+// perfectly normal in every other column.
+static std::string hostName() {
+    char buf[256];
+    if (gethostname(buf, sizeof(buf)) != 0) {
+        return "unknown";
+    }
+    buf[sizeof(buf) - 1] = '\0';
+    return std::string(buf);
+}
 
 bool MasterNode::loadData(const std::string& basePath, const std::string& queryPath) {
     if (!base_.load(basePath)) {
@@ -1135,7 +1165,15 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
 
 int MasterNode::run() {
     running_ = true;
-    std::cout << "===== 1. data =====" << std::endl;
+    wall_.reset();
+
+    // Printed before anything can go wrong, so a run that dies half way still
+    // says which binary died. The same three values go into every CSV row.
+    std::cout << "run " << timestampNow()
+              << "  build " << HARMONY_COMMIT
+              << "  host " << hostName() << std::endl;
+
+    std::cout << "\n===== 1. data =====" << std::endl;
 
     if (!loadData(cfg_.data + "_base.bin", cfg_.data + "_query.bin") ||
         !loadGroundtruth(cfg_.data + "_gt.bin")) {
@@ -1339,7 +1377,8 @@ int MasterNode::run() {
     if (bDim_ > 1) {
         std::cout << "chain reordered " << reorders_ << " time(s)" << std::endl;
     }
-    writeCsv(nprobe, nq, recallSum / nq, seconds, differing, ties);
+    writeCsv(nprobe, nq, recallSum / nq, seconds, differing, ties,
+             wall_.seconds());
     }   // end of the nprobe sweep
 
     shutdown();
@@ -1367,7 +1406,7 @@ std::string MasterNode::pruningLabel() const {
 // that was varied over a set of runs has to be in the row, or the rows cannot
 // be told apart later.
 void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
-                          int differing, int ties) const {
+                          int differing, int ties, double elapsed) const {
     if (cfg_.csv.empty()) {
         return;
     }
@@ -1386,8 +1425,12 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
         return;
     }
 
+    // The four identity columns come first: a row has to say when it was
+    // taken, from what, and where, or a file of them cannot be sorted, and a
+    // repeat of the same settings is indistinguishable from the original.
     if (isNew) {
-        std::fprintf(f, "data,nlist,iters,trainpoints,workers,bvec,bdim,mode,"
+        std::fprintf(f, "timestamp,build,host,elapsed,"
+                        "data,nlist,iters,trainpoints,workers,bvec,bdim,mode,"
                         "assign,skew,batch,threads,prewarm,prewarmlists,"
                         "pruning,mkl,loop,nprobe,k,nq,recall,qps,ms_per_query,"
                         "differing,ties,scanned,work_pct\n");
@@ -1401,8 +1444,10 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
                 ? (100.0 * done / (double)(scanned_ * bDim_)) : 0.0;
 
     std::fprintf(f,
+        "%s,%s,%s,%.1f,"
         "%s,%d,%d,%d,%d,%d,%d,%s,%s,%.3f,%d,%d,%d,%d,%s,%d,%d,"
         "%d,%d,%d,%.6f,%.3f,%.4f,%d,%d,%ld,%.4f\n",
+        timestampNow().c_str(), HARMONY_COMMIT, hostName().c_str(), elapsed,
         cfg_.data.c_str(), cfg_.nlist, cfg_.iters, cfg_.trainPoints,
         numWorkers_, bVec_, bDim_, cfg_.mode.c_str(),
         cfg_.assign.c_str(), cfg_.skew,

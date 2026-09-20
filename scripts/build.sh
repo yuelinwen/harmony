@@ -46,6 +46,23 @@ cd "$(dirname "$0")/.."
 FLAGS="-std=c++20 -O3 -march=native -Wall -Wextra -I."
 FLAGS="$FLAGS -fassociative-math -fno-signed-zeros -fno-trapping-math"
 
+# ---- which source this binary was built from ---------------------------
+#
+# Stamped into the binary and written to every CSV row, so a measurement can
+# be traced back to the code that produced it.
+#
+# Both halves are needed. The commit alone is not enough: measurements are
+# normally taken before the change is committed, and on the cluster the tree
+# is updated by tar, which leaves .git pointing at whatever was last
+# committed -- so the hash would label a week of different runs identically.
+# The digest of the sources actually handed to the compiler cannot.
+
+if command -v sha1sum > /dev/null 2>&1; then SHA=sha1sum; else SHA=shasum; fi
+COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
+SRC=$(cat main.cpp src/*.h src/*/*.h src/*/*.cpp | $SHA | cut -c1-8)
+FLAGS="$FLAGS -DHARMONY_COMMIT=\"$COMMIT+$SRC\""
+echo "build $COMMIT+$SRC"
+
 # ---- OpenMP, which is where the platforms differ -----------------------
 
 if [ "$(uname)" = "Darwin" ] && [ -d "$(brew --prefix libomp 2>/dev/null)" ]; then
