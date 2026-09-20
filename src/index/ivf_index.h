@@ -65,6 +65,17 @@ public:
         return nlist_;
     }
 
+    // How long build() spent in each of its two halves, named the way the
+    // sample names them (stats.h): train is the kmeans rounds over the sample
+    // of vectors, add is the final pass that puts all n of them into inverted
+    // lists. Both are 0 for an index that came off disk.
+    double trainSeconds() const {
+        return trainSeconds_;
+    }
+    double addSeconds() const {
+        return addSeconds_;
+    }
+
     int clusterSize(int c) const {
         return (int)invlists_[c].size();
     }
@@ -80,6 +91,8 @@ private:
     int builtFrom_ = 0;                        // base vectors it was built on
     std::vector<float> centroids_;             // nlist * dim, row-major
     std::vector<std::vector<int>> invlists_;   // invlists_[c] = ids in cluster c
+    double trainSeconds_ = 0.0;
+    double addSeconds_ = 0.0;
 
     // Returns the id of the centroid nearest to vector v.
     // const because build() calls it from a parallel loop: it must only read.

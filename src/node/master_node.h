@@ -64,6 +64,19 @@ public:
     // Cuts every cluster into per-worker slices and sends them out.
     void distributeData();
 
+    // The whole query set on this one machine, using the same clustering and
+    // the same probe lists as the distributed run: the paper's Faiss column
+    // (§6.2.1), and at the same time the answers --check compares against.
+    // Parallel over queries, so it uses this node's cores the way a
+    // single-node engine would. Returns the seconds it took, and leaves the
+    // answers in reference_.
+    double referencePass(int nq, int nprobe, int k);
+
+    // Standard deviation of how often each cluster is probed, over the
+    // queries actually searched. Copied from the sample (query.cpp:735-746),
+    // which is where the paper's unexplained "variance = 500" comes from.
+    double workloadVariance(int nq, int nprobe) const;
+
     // One column's rows of the chain table, as the worker expects them.
     std::vector<int> chainTableFor(int col) const;
 
@@ -89,7 +102,8 @@ public:
     // `elapsed` is the whole run so far, not the search -- a row carries both
     // so a long wall time can be told apart from a slow search.
     void writeCsv(int nprobe, int nq, double recall, double seconds,
-                  int differing, int ties, double elapsed) const;
+                  int differing, int ties, double elapsed,
+                  double single, double variance) const;
 
     // Prints the per-worker time breakdown gathered by shutdown().
     void printWorkerTimes() const;
@@ -230,6 +244,17 @@ private:
     // whole thing took -- loading, clustering and distribution included, none
     // of which the search timer sees.
     Stopwatch wall_;
+
+    // What distributeData() took: the paper's index-build cost that is not
+    // clustering, and the sample's preSearchTime.
+    double distributeSeconds_ = 0.0;
+
+    // The single-machine answers for the nprobe being run, one entry per
+    // query. Computed once by referencePass() rather than per query inside the
+    // batch loop, which is where it used to live: there it ran between
+    // batches and the workers' idle time absorbed it, so the Fig. 9
+    // breakdown could not be read with --check on.
+    std::vector<std::vector<Candidate>> reference_;
 
     // Chain reordering state (§4.3). prevCompute_ is what each worker had
     // done at the previous look, so the difference is this batch's work;

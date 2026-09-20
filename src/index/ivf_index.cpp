@@ -5,6 +5,7 @@
 #include <iostream>
 
 #include "distance.h"
+#include "../engine/stopwatch.h"
 
 namespace harmony {
 
@@ -27,6 +28,11 @@ void IvfIndex::build(const Dataset& base, int nlist, int iterations,
     dim_ = base.getDim();
     int n = base.getN();
     builtFrom_ = n;
+
+    // Split in two at phase 3, which is the line the sample draws between
+    // train and add: everything above it works on the sample of vectors,
+    // everything below it touches all n.
+    Stopwatch watch;
 
     // --- 1. init: copy nlist random vectors as starting centroids ---
     std::srand(42);   // fixed seed -> same clustering every run (reproducible)
@@ -117,6 +123,8 @@ void IvfIndex::build(const Dataset& base, int nlist, int iterations,
         std::cout << "kmeans iteration " << (it + 1) << "/" << iterations << " done" << std::endl;
     }
 
+    trainSeconds_ = watch.seconds(true);
+
     // --- 3. final assign -> inverted lists ---
     //
     // Two passes: the distances in parallel, then the lists filled in order.
@@ -135,6 +143,8 @@ void IvfIndex::build(const Dataset& base, int nlist, int iterations,
     for (int i = 0; i < n; ++i) {
         invlists_[owner[i]].push_back(i);
     }
+
+    addSeconds_ = watch.seconds();
 }
 
 // Which cluster does this vector belong to: compare against all nlist

@@ -14,6 +14,10 @@
 #include <mpi.h>
 #include <unistd.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "../index/distance.h"
 
 // Which source produced this binary, stamped in by scripts/build.sh as
@@ -681,6 +685,7 @@ void MasterNode::reorderChains() {
 
 void MasterNode::distributeData() {
     std::cout << "\n===== 4. distribute =====" << std::endl;
+    Stopwatch watch;
 
     // how many clusters each row will receive
     std::vector<int> rowClusters(bVec_, 0);
@@ -730,8 +735,71 @@ void MasterNode::distributeData() {
         }
     }
 
+    distributeSeconds_ = watch.seconds();
     std::cout << "distributed " << index_.getNlist() << " clusters over the grid"
-              << std::endl;
+              << " (" << distributeSeconds_ << " s)" << std::endl;
+}
+
+// One machine, all its cores, the same clusters the distributed run visits.
+//
+// Parallel over queries because that is how a single-node engine uses a
+// machine, and a serial baseline would hand the cluster a speedup equal to
+// the core count before any distribution happened. Faiss, the paper's
+// baseline, is threaded the same way.
+//
+// Timed like the distributed search: one untimed warm-up when --loop is
+// above 1, then loop passes averaged, so the two numbers are comparable.
+double MasterNode::referencePass(int nq, int nprobe, int k) {
+    reference_.assign(nq, std::vector<Candidate>());
+
+    int passes = (cfg_.loop > 1) ? (cfg_.loop + 1) : 1;
+    double seconds = 0.0;
+
+    for (int pass = 0; pass < passes; ++pass) {
+        Stopwatch watch;
+        #pragma omp parallel for schedule(dynamic)
+        for (int q = 0; q < nq; ++q) {
+            reference_[q] = index_.search(base_, query_.vec(q),
+                                          probesFor(q, nprobe), k);
+        }
+        double took = watch.seconds();
+        if (!(passes > 1 && pass == 0)) {
+            seconds = seconds + took;
+        }
+    }
+
+    return (cfg_.loop > 1) ? (seconds / cfg_.loop) : seconds;
+}
+
+// How lopsided the workload actually searched was. The sample's formula
+// exactly (query.cpp:735-746): count how often each cluster is probed, then
+// take the standard deviation across the nlist clusters.
+//
+// The paper calls this "variance" and labels its workloads with it, but the
+// number carries units of probe counts and so scales with nq and nprobe --
+// see the note in warmupPlan. Recorded to compare runs against each other,
+// not against the paper's 500.
+double MasterNode::workloadVariance(int nq, int nprobe) const {
+    int nlist = index_.getNlist();
+    if (nlist <= 0) {
+        return 0.0;
+    }
+
+    std::vector<long> hits(nlist, 0);
+    for (int q = 0; q < nq; ++q) {
+        std::vector<int> clusters = probesFor(q, nprobe);
+        for (int i = 0; i < (int)clusters.size(); ++i) {
+            hits[clusters[i]] = hits[clusters[i]] + 1;
+        }
+    }
+
+    double mean = (double)nq * nprobe / nlist;
+    double var = 0.0;
+    for (int c = 0; c < nlist; ++c) {
+        double d = (double)hits[c] - mean;
+        var = var + d * d;
+    }
+    return std::sqrt(var / nlist);
 }
 
 // Zeroes every worker's counters. Sent just before the stretch that gets
@@ -787,10 +855,6 @@ void MasterNode::printWorkerTimes() const {
     }
 
     std::cout << "\n===== where each worker's time went =====" << std::endl;
-    if (cfg_.check) {
-        std::cout << "  (--check is on: idle also covers the reference pass"
-                  << " the master runs between batches)" << std::endl;
-    }
     std::cout << "  worker   grid    jobs     total    compute      idle"
               << "      recv      send" << std::endl;
 
@@ -1225,10 +1289,19 @@ int MasterNode::run() {
     int differing = 0;
     int ties = 0;
 
-    // Only the distributed search is timed. index_.search() below is the
-    // single-machine reference used to check the answer, not part of the work.
+    // Only the distributed search is timed. The single-machine pass below is
+    // both the baseline it is compared against and the answer key --check
+    // uses, and is timed separately.
     double seconds = 0.0;
     double recallSum = 0.0;
+
+    // Before the search rather than inside it: the probe lists depend on
+    // nprobe but not on anything the search does, so this can be computed
+    // once, and doing it here keeps it out of the workers' idle time.
+    double single = 0.0;
+    if (cfg_.baseline || cfg_.check) {
+        single = referencePass(nq, nprobe, k);
+    }
 
     // The query set can be run several times and the time averaged, which is
     // what a throughput number needs -- one pass on a cold cache is not
@@ -1275,13 +1348,12 @@ int MasterNode::run() {
             int q = start + j;
             recallSum = recallSum + recallAt(q, spread[j], k);
 
-            // 这个参考对照比它检查的搜索还贵（单机、不剪枝），在计时区间之外，
-            // 但跑上千条查询时它就是大部分墙钟时间，所以可以关掉。
+            // 这个参考对照比它检查的搜索还贵（单机、不剪枝），跑上千条查询时
+            // 它就是大部分墙钟时间，所以可以关掉。
             if (!cfg_.check) {
                 continue;
             }
-            std::vector<Candidate> single =
-                index_.search(base_, query_.vec(q), probesFor(q, nprobe), k);
+            const std::vector<Candidate>& ref = reference_[q];
 
             std::vector<int> a;
             std::vector<int> b;
@@ -1289,9 +1361,9 @@ int MasterNode::run() {
             std::vector<float> db;
             for (int i = 0; i < k; ++i) {
                 a.push_back(spread[j][i].id);
-                b.push_back(single[i].id);
+                b.push_back(ref[i].id);
                 da.push_back(spread[j][i].dist);
-                db.push_back(single[i].dist);
+                db.push_back(ref[i].dist);
             }
             std::sort(a.begin(), a.end());
             std::sort(b.begin(), b.end());
@@ -1339,6 +1411,40 @@ int MasterNode::run() {
     std::cout << "  QPS: " << (nq / seconds)
               << "   (" << (1000.0 * seconds / nq) << " ms per query)" << std::endl;
 
+    // What distributing bought, against the same clustering and the same
+    // probe lists on one machine (paper §6.2.1). The thread count is printed
+    // because the comparison only means anything with it: this is one node
+    // using all of its cores against numWorkers_ nodes using theirs.
+    if (cfg_.baseline && single > 0.0) {
+        int cores = 1;
+        #ifdef _OPENMP
+        cores = omp_get_max_threads();
+        #endif
+        std::cout << "  single machine: " << single << " s   ("
+                  << (nq / single) << " QPS, " << cores << " threads on "
+                  << hostName() << ")" << std::endl;
+        std::cout << "  speedup: " << (single / seconds) << "x over one machine"
+                  << "   (" << numWorkers_ << " workers)" << std::endl;
+    }
+
+    // How lopsided this workload was, in the units the paper labels its
+    // workloads with. Index and test workload are separate numbers: the
+    // layout was built from the profiling pass (see warmup above), this is
+    // what was then actually searched.
+    double variance = workloadVariance(nq, nprobe);
+    std::cout << "  test workload variance: " << variance
+              << "   (mean " << ((double)nq * nprobe / index_.getNlist())
+              << " probes per cluster)" << std::endl;
+
+    std::cout << "\nindex build" << std::endl;
+    std::cout << "  train " << index_.trainSeconds() << " s, add "
+              << index_.addSeconds() << " s, distribute "
+              << distributeSeconds_ << " s";
+    if (index_.trainSeconds() == 0.0 && index_.addSeconds() == 0.0) {
+        std::cout << "   (loaded from cache, so train and add are 0)";
+    }
+    std::cout << std::endl;
+
     // How much of the base each query actually touched, and how evenly that
     // work fell across the vector partitions. The spread here is what the
     // cost model's I(pi) term estimates in advance.
@@ -1378,7 +1484,7 @@ int MasterNode::run() {
         std::cout << "chain reordered " << reorders_ << " time(s)" << std::endl;
     }
     writeCsv(nprobe, nq, recallSum / nq, seconds, differing, ties,
-             wall_.seconds());
+             wall_.seconds(), single, variance);
     }   // end of the nprobe sweep
 
     shutdown();
@@ -1406,7 +1512,8 @@ std::string MasterNode::pruningLabel() const {
 // that was varied over a set of runs has to be in the row, or the rows cannot
 // be told apart later.
 void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
-                          int differing, int ties, double elapsed) const {
+                          int differing, int ties, double elapsed,
+                          double single, double variance) const {
     if (cfg_.csv.empty()) {
         return;
     }
@@ -1433,6 +1540,8 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
                         "data,nlist,iters,trainpoints,workers,bvec,bdim,mode,"
                         "assign,skew,batch,threads,prewarm,prewarmlists,"
                         "pruning,mkl,loop,nprobe,k,nq,recall,qps,ms_per_query,"
+                        "single_time,speedup,variance,"
+                        "train_time,add_time,distribute_time,"
                         "differing,ties,scanned,work_pct\n");
     }
 
@@ -1446,7 +1555,10 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
     std::fprintf(f,
         "%s,%s,%s,%.1f,"
         "%s,%d,%d,%d,%d,%d,%d,%s,%s,%.3f,%d,%d,%d,%d,%s,%d,%d,"
-        "%d,%d,%d,%.6f,%.3f,%.4f,%d,%d,%ld,%.4f\n",
+        "%d,%d,%d,%.6f,%.3f,%.4f,"
+        "%.4f,%.3f,%.2f,"
+        "%.3f,%.3f,%.3f,"
+        "%d,%d,%ld,%.4f\n",
         timestampNow().c_str(), HARMONY_COMMIT, hostName().c_str(), elapsed,
         cfg_.data.c_str(), cfg_.nlist, cfg_.iters, cfg_.trainPoints,
         numWorkers_, bVec_, bDim_, cfg_.mode.c_str(),
@@ -1454,6 +1566,8 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
         cfg_.batch, cfg_.threads, cfg_.prewarm, cfg_.prewarmLists,
         pruningLabel().c_str(), cfg_.mkl ? 1 : 0, cfg_.loop,
         nprobe, cfg_.k, nq, recall, nq / seconds, 1000.0 * seconds / nq,
+        single, (single > 0.0) ? (single / seconds) : 0.0, variance,
+        index_.trainSeconds(), index_.addSeconds(), distributeSeconds_,
         differing, ties, scanned_, work);
 
     std::fclose(f);

@@ -86,6 +86,13 @@ struct Config {
     // reads thresholds a little earlier, so it prunes slightly less.
     int block = 4;
     bool check = true;    // re-run each query on one machine and compare
+
+    // Time that single-machine pass and report the speedup over it (paper
+    // §6.2.1, the sample's faiss_query_time). It is the same clustering and
+    // the same probe lists as the distributed run, so it measures what
+    // distributing bought and nothing else -- a fairer baseline than the
+    // paper's, which compares against a different implementation.
+    bool baseline = true;
     int loop = 1;         // timed passes over the query set, averaged
     std::string csv;      // append one row per run here, "" = off
 
@@ -153,6 +160,7 @@ inline void printUsage(const char* prog) {
         << "                     all of a partition's blocks fly at once\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
         << "                     costs more than the search it checks\n"
+        << "  --baseline <0|1>   time that pass, report the speedup  (1)\n"
         << "  --loop <int>       timed passes, averaged               (1)\n"
         << "                     above 1 adds an untimed warm-up pass\n"
         << "  --csv <path>       append one row per run to this file\n"
@@ -243,6 +251,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             }
         } else if (opt == "--check" && hasValue) {
             cfg.check = (std::atoi(argv[++i]) != 0);
+        } else if (opt == "--baseline" && hasValue) {
+            cfg.baseline = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--threads" && hasValue) {
             cfg.threads = std::atoi(argv[++i]);
         } else if (opt == "--batch" && hasValue) {
