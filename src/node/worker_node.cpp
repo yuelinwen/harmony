@@ -330,15 +330,19 @@ int WorkerNode::run() {
                 break;
             }
 
-            // The master measuring, printing or re-planning. Not idleness --
-            // it is not withholding work -- but not free either: with bDim
-            // above 1 the chain reordering collects these every batch, and
-            // that showed up as a quarter of the run going nowhere. Its own
-            // bucket, so the cost of the instrumentation is visible instead
-            // of being either hidden or blamed on the search.
+            // Every wait for the master is idleness, whichever message
+            // ends it. Charging the bookkeeping ones elsewhere made idle mean
+            // different things at different bDim: at bDim = 1 nothing
+            // collects stats per batch, so the batch-boundary wait landed in
+            // idle, and at bDim = 8 the same wait landed in admin. The two
+            // then could not be compared, and admin looked like a cost of the
+            // instrumentation when it was the boundary itself. admin below is
+            // only the handling -- the messages, which are small.
+            idle_ = idle_ + waited;
+
             if (job[0] == JOB_STATS) {
-                admin_ = admin_ + waited;
                 total_ = run.seconds();
+                Stopwatch adminWatch;
                 MPI_Send(aliveAtStage_.data(), bDim_, MPI_LONG, MASTER_RANK,
                          TAG_STATS, MPI_COMM_WORLD);
                 double times[WORKER_TIMES] = {total_, idle_, recv_, compute_,
@@ -346,20 +350,22 @@ int WorkerNode::run() {
                                               setup_, poll_, count_, admin_};
                 MPI_Send(times, WORKER_TIMES, MPI_DOUBLE, MASTER_RANK,
                          TAG_TIMES, MPI_COMM_WORLD);
+                admin_ = admin_ + adminWatch.seconds();
                 continue;
             }
 
             // A new chain table. Safe here and only here: the master sends
             // it between batches, when no block is part-way along a chain.
             if (job[0] == JOB_ORDER) {
-                admin_ = admin_ + waited;
                 total_ = run.seconds();
+                Stopwatch adminWatch;
                 std::vector<int> table(3 * bDim_);
                 MPI_Recv(table.data(), 3 * bDim_, MPI_INT, MASTER_RANK,
                          TAG_ORDER, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 nextOf_.assign(table.begin(), table.begin() + bDim_);
                 prevOf_.assign(table.begin() + bDim_, table.begin() + 2 * bDim_);
                 stageOf_.assign(table.begin() + 2 * bDim_, table.end());
+                admin_ = admin_ + adminWatch.seconds();
                 continue;
             }
 
@@ -367,7 +373,6 @@ int WorkerNode::run() {
             // before the pass that gets reported, so an earlier --loop pass or
             // an earlier --nprobes value does not leak into these numbers.
             if (job[0] == JOB_RESET) {
-                admin_ = admin_ + waited;
                 total_ = run.seconds();
                 aliveAtStage_.assign(bDim_, 0);
                 idle_ = 0.0;
@@ -384,17 +389,8 @@ int WorkerNode::run() {
                 continue;
             }
 
-            idle_ = idle_ + waited;
-
             // Thresholds for a run of the batch, refreshed between
             // partitions. job[1] is where the run starts and job[2] how long.
-            //
-            // Below the idle_ line, unlike the three above it: waiting for a
-            // threshold is waiting for the master to get on with the search,
-            // which is idleness. Those three are the master measuring or
-            // replanning, which is not part of the run being measured. Having
-            // this one above the line left the wait in no bucket at all, and
-            // that gap was most of the unexplained remainder at bDim = 1.
             if (job[0] == JOB_THRESH) {
                 MPI_Recv(&thresholds_[job[1]], job[2], MPI_FLOAT, MASTER_RANK,
                          TAG_THRESHOLD, MPI_COMM_WORLD, MPI_STATUS_IGNORE);

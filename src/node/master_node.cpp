@@ -880,7 +880,7 @@ void MasterNode::printWorkerTimes() const {
                   << std::setw(9) << std::fixed << std::setprecision(2)
                   << t[0] << "s";
 
-        // compute, idle, recv, send, setup, poll, count
+        // compute, idle, recv, send, setup, poll, count, admin
         int order[8] = {3, 1, 2, 4, 6, 7, 8, 9};
         double named = 0.0;
         for (int i = 0; i < 8; ++i) {
@@ -894,6 +894,71 @@ void MasterNode::printWorkerTimes() const {
         std::cout << std::setw(8) << std::setprecision(1)
                   << (100.0 * (total - named) / total) << "%" << std::endl;
     }
+
+    std::cout.flags(flags);
+    std::cout.precision(digits);
+
+    printTimeBreakdown();
+}
+
+// The paper's Fig. 9 buckets, averaged over the workers.
+//
+//   communication   recv + send -- blocked moving partial sums along a chain.
+//                   This is the sample's waitTime (node.cpp:275).
+//   computation     accumulate() and the top-k pick at a chain tail.
+//   other           everything else: waiting for the master to dispatch,
+//                   opening a block, polling, and the counters.
+//
+// "other" is large here and small in the paper, and the reason is in the
+// design rather than in the measurement: this master dispatches at run time,
+// so a worker waits on it, while the sample's schedule is fixed at setup and
+// its workers never wait for work at all.
+void MasterNode::timeBreakdown(double* comm, double* compute,
+                               double* other) const {
+    *comm = 0.0;
+    *compute = 0.0;
+    *other = 0.0;
+    if (workerTimes_.empty()) {
+        return;
+    }
+
+    for (int w = 0; w < numWorkers_; ++w) {
+        const std::vector<double>& t = workerTimes_[w];
+        *comm = *comm + t[2] + t[4];
+        *compute = *compute + t[3];
+        // By subtraction, so that whatever is not in a bucket still shows up
+        // rather than quietly going missing.
+        *other = *other + (t[0] - t[2] - t[4] - t[3]);
+    }
+
+    *comm = *comm / numWorkers_;
+    *compute = *compute / numWorkers_;
+    *other = *other / numWorkers_;
+}
+
+void MasterNode::printTimeBreakdown() const {
+    double comm = 0.0;
+    double compute = 0.0;
+    double other = 0.0;
+    timeBreakdown(&comm, &compute, &other);
+
+    double total = comm + compute + other;
+    if (total <= 0.0) {
+        return;
+    }
+
+    std::ios_base::fmtflags flags = std::cout.flags();
+    std::streamsize digits = std::cout.precision();
+
+    std::cout << "  ---- paper Fig. 9, mean worker ----" << std::endl;
+    std::cout << std::fixed << std::setprecision(3)
+              << "  communication " << comm << "s (" << std::setprecision(1)
+              << (100.0 * comm / total) << "%)   "
+              << std::setprecision(3) << "computation " << compute << "s ("
+              << std::setprecision(1) << (100.0 * compute / total) << "%)   "
+              << std::setprecision(3) << "other " << other << "s ("
+              << std::setprecision(1) << (100.0 * other / total) << "%)"
+              << std::endl;
 
     std::cout.flags(flags);
     std::cout.precision(digits);
@@ -1549,9 +1614,15 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
                         "assign,skew,batch,threads,prewarm,prewarmlists,"
                         "pruning,mkl,loop,nprobe,k,nq,recall,qps,ms_per_query,"
                         "single_time,speedup,variance,"
+                        "comm_time,compute_time,other_time,"
                         "train_time,add_time,distribute_time,"
                         "differing,ties,scanned,work_pct\n");
     }
+
+    double comm = 0.0;
+    double compute = 0.0;
+    double other = 0.0;
+    timeBreakdown(&comm, &compute, &other);
 
     long done = 0;
     for (int s = 0; s < bDim_; ++s) {
@@ -1565,6 +1636,7 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
         "%s,%d,%d,%d,%d,%d,%d,%s,%s,%.3f,%d,%d,%d,%d,%s,%d,%d,"
         "%d,%d,%d,%.6f,%.3f,%.4f,"
         "%.4f,%.3f,%.2f,"
+        "%.4f,%.4f,%.4f,"
         "%.3f,%.3f,%.3f,"
         "%d,%d,%ld,%.4f\n",
         timestampNow().c_str(), HARMONY_COMMIT, hostName().c_str(), elapsed,
@@ -1575,6 +1647,7 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
         pruningLabel().c_str(), cfg_.mkl ? 1 : 0, cfg_.loop,
         nprobe, cfg_.k, nq, recall, nq / seconds, 1000.0 * seconds / nq,
         single, (single > 0.0) ? (single / seconds) : 0.0, variance,
+        comm, compute, other,
         index_.trainSeconds(), index_.addSeconds(), distributeSeconds_,
         differing, ties, scanned_, work);
 

@@ -105,8 +105,18 @@ public:
                   int differing, int ties, double elapsed,
                   double single, double variance) const;
 
+    // Rolls the per-worker buckets up into the paper's three (Fig. 9) and
+    // prints them. Called by printWorkerTimes, under the per-worker table.
+    void printTimeBreakdown() const;
+
     // Prints the per-worker time breakdown gathered by shutdown().
     void printWorkerTimes() const;
+
+    // The per-worker buckets rolled up into the paper's three (Fig. 9), as
+    // seconds averaged over the workers: communication, computation, other.
+    // Seconds rather than percentages because Fig. 9 normalises each mode
+    // against the slowest one, which only a set of runs can do.
+    void timeBreakdown(double* comm, double* compute, double* other) const;
 
     // What one query of the current batch needs.
     struct QueryState {
