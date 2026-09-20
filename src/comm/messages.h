@@ -32,7 +32,16 @@ const int TAG_PROBES    = 9;   // int[count * nprobe]: every query's clusters,
                                // same way its neighbours in the chain do.
 const int TAG_THRESHOLD = 7;   // float[len]: tau^2 per query, see JOB_THRESH
 const int TAG_STATS     = 10;  // long[bDim]: survivors per chain position
-const int TAG_TIMES     = 12;  // double[6]: where a worker's wall time went
+const int TAG_TIMES     = 12;  // double[WORKER_TIMES]: worker's wall time
+
+// How many numbers a worker reports about where its time went, in this order:
+//
+//   total  idle  recv  compute  send  jobs  setup  poll  count  admin
+//
+// Both ends of TAG_TIMES size their buffer from this, because a mismatch
+// would not fail -- MPI would deliver the shorter count and the master would
+// read whatever was next in the array as a timing.
+const int WORKER_TIMES = 10;
 
 // Partial sums and top-K answers get a tag of their own per in-flight
 // cluster, taken from the master's slot for it.

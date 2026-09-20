@@ -293,8 +293,10 @@ int WorkerNode::run() {
             int waiting = 1;
             if (!pend.empty()) {
                 // MPI: peek rather than block -- there is real work in hand
+                phase.reset();
                 MPI_Iprobe(MASTER_RANK, TAG_JOB, MPI_COMM_WORLD, &waiting,
                            MPI_STATUS_IGNORE);
+                poll_ = poll_ + phase.seconds();
                 if (!waiting) {
                     break;
                 }
@@ -304,8 +306,14 @@ int WorkerNode::run() {
             int job[5];
             MPI_Recv(job, 5, MPI_INT, MASTER_RANK, TAG_JOB,
                      MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            // only a wait with nothing else to do is idleness
-            double waited = pend.empty() ? phase.seconds() : 0.0;
+            // Only a wait with nothing else to do is idleness. With a block
+            // open this receive is still time spent, just not time lost --
+            // it belongs to dispatch, not to waiting.
+            double took = phase.seconds();
+            double waited = pend.empty() ? took : 0.0;
+            if (!pend.empty()) {
+                poll_ = poll_ + took;
+            }
             if (!started) {
                 run.reset();   // the wait for the very first job is setup
                 started = true;
@@ -322,29 +330,30 @@ int WorkerNode::run() {
                 break;
             }
 
-            // The wait for either bookkeeping message is not idle time: the
-            // master is checking answers or printing, not withholding work.
+            // The master measuring, printing or re-planning. Not idleness --
+            // it is not withholding work -- but not free either: with bDim
+            // above 1 the chain reordering collects these every batch, and
+            // that showed up as a quarter of the run going nowhere. Its own
+            // bucket, so the cost of the instrumentation is visible instead
+            // of being either hidden or blamed on the search.
             if (job[0] == JOB_STATS) {
+                admin_ = admin_ + waited;
+                total_ = run.seconds();
                 MPI_Send(aliveAtStage_.data(), bDim_, MPI_LONG, MASTER_RANK,
                          TAG_STATS, MPI_COMM_WORLD);
-                double times[6] = {total_, idle_, recv_, compute_, send_,
-                                   (double)jobs_};
-                MPI_Send(times, 6, MPI_DOUBLE, MASTER_RANK, TAG_TIMES,
-                         MPI_COMM_WORLD);
-                continue;
-            }
-
-            // Thresholds for a run of the batch, refreshed between
-            // partitions. job[1] is where the run starts and job[2] how long.
-            if (job[0] == JOB_THRESH) {
-                MPI_Recv(&thresholds_[job[1]], job[2], MPI_FLOAT, MASTER_RANK,
-                         TAG_THRESHOLD, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                double times[WORKER_TIMES] = {total_, idle_, recv_, compute_,
+                                              send_, (double)jobs_,
+                                              setup_, poll_, count_, admin_};
+                MPI_Send(times, WORKER_TIMES, MPI_DOUBLE, MASTER_RANK,
+                         TAG_TIMES, MPI_COMM_WORLD);
                 continue;
             }
 
             // A new chain table. Safe here and only here: the master sends
             // it between batches, when no block is part-way along a chain.
             if (job[0] == JOB_ORDER) {
+                admin_ = admin_ + waited;
+                total_ = run.seconds();
                 std::vector<int> table(3 * bDim_);
                 MPI_Recv(table.data(), 3 * bDim_, MPI_INT, MASTER_RANK,
                          TAG_ORDER, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -358,11 +367,17 @@ int WorkerNode::run() {
             // before the pass that gets reported, so an earlier --loop pass or
             // an earlier --nprobes value does not leak into these numbers.
             if (job[0] == JOB_RESET) {
+                admin_ = admin_ + waited;
+                total_ = run.seconds();
                 aliveAtStage_.assign(bDim_, 0);
                 idle_ = 0.0;
                 recv_ = 0.0;
                 compute_ = 0.0;
                 send_ = 0.0;
+                setup_ = 0.0;
+                poll_ = 0.0;
+                count_ = 0.0;
+                admin_ = 0.0;
                 jobs_ = 0;
                 total_ = 0.0;
                 run.reset();
@@ -370,6 +385,21 @@ int WorkerNode::run() {
             }
 
             idle_ = idle_ + waited;
+
+            // Thresholds for a run of the batch, refreshed between
+            // partitions. job[1] is where the run starts and job[2] how long.
+            //
+            // Below the idle_ line, unlike the three above it: waiting for a
+            // threshold is waiting for the master to get on with the search,
+            // which is idleness. Those three are the master measuring or
+            // replanning, which is not part of the run being measured. Having
+            // this one above the line left the wait in no bucket at all, and
+            // that gap was most of the unexplained remainder at bDim = 1.
+            if (job[0] == JOB_THRESH) {
+                MPI_Recv(&thresholds_[job[1]], job[2], MPI_FLOAT, MASTER_RANK,
+                         TAG_THRESHOLD, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                continue;
+            }
 
             if (job[0] == JOB_QUERY) {
                 int count = job[1];
@@ -410,6 +440,13 @@ int WorkerNode::run() {
 
             // The layout: each query's run of running totals is its probe
             // list restricted to the clusters this row holds, in probe order.
+            //
+            // This and the buffer below are the setup_ bucket. Not free: the
+            // loop is blockLen * nprobe lookups, and the buffer is one float
+            // per (query, candidate) pair, freshly allocated and zeroed for
+            // every block -- which at bDim = 1, where every block is a chain
+            // head, is every block.
+            phase.reset();
             p.qOff.resize(p.len);
             size_t total = 0;
             for (int j = 0; j < p.len; ++j) {
@@ -432,6 +469,7 @@ int WorkerNode::run() {
                 MPI_Irecv(p.sums.data(), (int)total, MPI_FLOAT, p.prevRank,
                           tagSums(p.slotTag), MPI_COMM_WORLD, &up);
             }
+            setup_ = setup_ + phase.seconds();
             pend.push_back(std::move(p));
             pendReq.push_back(up);
         }
@@ -453,10 +491,12 @@ int WorkerNode::run() {
         }
         if (pick < 0) {
             // MPI: has anyone's upstream landed while we were busy?
+            phase.reset();
             int flag = 0;
             int idx = MPI_UNDEFINED;
             MPI_Testany((int)pendReq.size(), pendReq.data(), &idx, &flag,
                         MPI_STATUS_IGNORE);
+            poll_ = poll_ + phase.seconds();
             if (flag && idx != MPI_UNDEFINED) {
                 pick = idx;
             }
@@ -480,11 +520,18 @@ int WorkerNode::run() {
         compute_ = compute_ + phase.seconds();
         jobs_ = jobs_ + 1;
 
+        // Nothing but a statistic -- it feeds the paper's Table 3 and no
+        // decision. Timed separately because it turned out to be one of the
+        // largest costs in the run: a serial pass over every (query,
+        // candidate) pair, with a dependent counter the compiler cannot
+        // vectorise, on a buffer that at bDim = 8 holds millions of floats.
+        phase.reset();
         for (size_t j = 0; j < total; ++j) {
             if (p.sums[j] < PRUNED) {
                 aliveAtStage_[p.stage] = aliveAtStage_[p.stage] + 1;
             }
         }
+        count_ = count_ + phase.seconds();
 
         // reclaim this slot before overwriting it. A large send_ is back
         // pressure: the next hop is not taking what this worker sends.

@@ -47,6 +47,10 @@ public:
         recv_ = 0.0;
         compute_ = 0.0;
         send_ = 0.0;
+        setup_ = 0.0;
+        poll_ = 0.0;
+        count_ = 0.0;
+        admin_ = 0.0;
         jobs_ = 0;
     }
     ~WorkerNode() override = default;
@@ -134,13 +138,24 @@ private:
     bool useMkl_;   // gemm path enabled (and compiled in)
 
     // Where the run went, in seconds. Reported at shutdown and printed by the
-    // master as one row per worker (paper Fig. 9). The four add up to a little
-    // less than total_; the remainder is bookkeeping between them.
+    // master as one row per worker (paper Fig. 9).
+    //
+    // The six below are meant to add up to total_ with only a little left
+    // over. They did not at first: only compute/idle/recv/send existed and
+    // between 15% and 45% of the run was unaccounted for, which would have
+    // made Fig. 9 mostly one unlabelled block. setup_ and poll_ are that
+    // remainder, and they are named rather than subtracted because the first
+    // of them turned out to be avoidable work rather than measurement noise.
     double total_;     // first job to shutdown
     double idle_;      // blocked waiting for the master to hand over a job
     double recv_;      // blocked receiving partial sums from upstream
     double compute_;   // accumulate(), plus the top-k pick at a chain tail
     double send_;      // blocked reclaiming a send slot
+    double setup_;     // opening a block: its buffer layout and its buffer
+    double poll_;      // asking whether anything has arrived, and taking it
+    double count_;     // counting survivors for the Table 3 pruning ratios
+    double admin_;     // waiting for the master's stats / re-plan messages,
+                       // so mostly master-side serial work between batches
     long jobs_;        // clusters served
 
     // Survivors by position in the chain, not by worker: rotation makes a

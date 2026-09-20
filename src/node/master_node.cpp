@@ -826,14 +826,14 @@ void MasterNode::collectStats() {
 
     // every worker reports its counts per chain position; sum them up
     std::vector<long> perWorker(bDim_);
-    workerTimes_.assign(numWorkers_, std::vector<double>(6, 0.0));
+    workerTimes_.assign(numWorkers_, std::vector<double>(WORKER_TIMES, 0.0));
     for (int w = 1; w <= numWorkers_; ++w) {
         MPI_Recv(perWorker.data(), bDim_, MPI_LONG, w, TAG_STATS,
                  MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         for (int s = 0; s < bDim_; ++s) {
             aliveAfterStage_[s] = aliveAfterStage_[s] + perWorker[s];
         }
-        MPI_Recv(workerTimes_[w - 1].data(), 6, MPI_DOUBLE, w, TAG_TIMES,
+        MPI_Recv(workerTimes_[w - 1].data(), WORKER_TIMES, MPI_DOUBLE, w, TAG_TIMES,
                  MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     }
 }
@@ -856,7 +856,9 @@ void MasterNode::printWorkerTimes() const {
 
     std::cout << "\n===== where each worker's time went =====" << std::endl;
     std::cout << "  worker   grid    jobs     total    compute      idle"
-              << "      recv      send" << std::endl;
+              << "      recv      send     setup      poll     count"
+              << "     admin     other"
+              << std::endl;
 
     // setprecision and fixed stay on the stream, and with --nprobes there is
     // another run's output after this table.
@@ -878,13 +880,19 @@ void MasterNode::printWorkerTimes() const {
                   << std::setw(9) << std::fixed << std::setprecision(2)
                   << t[0] << "s";
 
-        // compute, idle, recv, send -- t[3], t[1], t[2], t[4]
-        int order[4] = {3, 1, 2, 4};
-        for (int i = 0; i < 4; ++i) {
+        // compute, idle, recv, send, setup, poll, count
+        int order[8] = {3, 1, 2, 4, 6, 7, 8, 9};
+        double named = 0.0;
+        for (int i = 0; i < 8; ++i) {
+            named = named + t[order[i]];
             std::cout << std::setw(8) << std::setprecision(1)
                       << (100.0 * t[order[i]] / total) << "%";
         }
-        std::cout << std::endl;
+
+        // Printed rather than left to be worked out, so it is obvious when
+        // the six above stop covering the run.
+        std::cout << std::setw(8) << std::setprecision(1)
+                  << (100.0 * (total - named) / total) << "%" << std::endl;
     }
 
     std::cout.flags(flags);
