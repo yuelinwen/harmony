@@ -66,6 +66,11 @@ public:
     // How many vectors this worker ended up with.
     long vectorCount() const;
 
+    // Bytes the cluster blocks occupy (paper Table 4). What this worker holds
+    // for good, not the per-block scratch, which comes and goes with the
+    // queries rather than with the index.
+    long memoryBytes() const;
+
     // Adds this worker's slice of the distance to what the previous worker
     // accumulated, and drops any candidate whose total has passed its
     // threshold -- partial sums only grow, so one that has passed can never

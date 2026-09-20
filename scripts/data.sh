@@ -10,11 +10,16 @@
 # writes Data/sift_base.bin, Data/sift_query.bin and Data/sift_gt.bin. Pass a
 # second argument to choose it yourself. Run with --data Data/sift.
 #
-# The hdf5 holds four arrays and three of them are used:
+# The hdf5 holds four arrays and all four are used:
 #   train      -> _base.bin    the vectors being searched
 #   test       -> _query.bin   the queries, from different images than train
 #   neighbors  -> _gt.bin      the true top-k of each query, brute-forced
-#   distances  -> unused, since recall only asks whether an id was found
+#   distances  -> _gtd.bin     how far away each of those is, squared
+#
+# The file stores plain Euclidean distance (checked: 232.87 where the squared
+# distance is 54229), and everything in this project is squared L2, so the
+# export squares it. Converting here rather than in the program keeps one
+# convention: every distance in a .bin file is squared.
 #
 # Binary format, little-endian:
 #   int32 n, int32 dim, then n*dim values row-major -- float32 for the
@@ -39,9 +44,16 @@ if [ ! -f "$HDF5" ]; then
     echo "no such file: $HDF5" >&2
     exit 1
 fi
-if [ -f "Data/${NAME}_base.bin" ]; then
+# _gtd.bin was added after the first datasets were converted, so a tree that
+# already has the other three still needs this one. Only that file is written
+# in that case; the rest are left alone.
+if [ -f "Data/${NAME}_base.bin" ] && [ -f "Data/${NAME}_gtd.bin" ]; then
     echo "Data/${NAME}_base.bin already exists - delete it to redo"
     exit 0
+fi
+if [ -f "Data/${NAME}_base.bin" ]; then
+    echo "Data/${NAME}_base.bin exists; adding the missing _gtd.bin only"
+    ONLY_GTD=1
 fi
 
 # Squared L2 is what makes dimension pruning work: every term is non-negative,
@@ -64,7 +76,7 @@ if ! python3 -c "import h5py, numpy" 2>/dev/null; then
     exit 1
 fi
 
-python3 - "$HDF5" "Data/$NAME" <<'PY'
+python3 - "$HDF5" "Data/$NAME" "${ONLY_GTD:-0}" <<'PY'
 import struct
 import sys
 
@@ -72,6 +84,7 @@ import h5py
 import numpy as np
 
 src, prefix = sys.argv[1], sys.argv[2]
+only_gtd = sys.argv[3] == "1"
 
 with h5py.File(src, "r") as f:
     # the name is checked by the shell above; this catches a file whose name
@@ -82,10 +95,17 @@ with h5py.File(src, "r") as f:
     if metric and "euclidean" not in str(metric).lower():
         sys.exit(f"{src} uses {metric} distance; this project is squared L2 only")
 
-    for name, field, dtype in [("base", "train", np.float32),
-                               ("query", "test", np.float32),
-                               ("gt", "neighbors", np.int32)]:
+    wanted = [("base", "train", np.float32),
+              ("query", "test", np.float32),
+              ("gt", "neighbors", np.int32),
+              ("gtd", "distances", np.float32)]
+    if only_gtd:
+        wanted = [w for w in wanted if w[0] == "gtd"]
+
+    for name, field, dtype in wanted:
         a = np.ascontiguousarray(f[field][:], dtype=dtype)
+        if field == "distances":
+            a = a * a        # stored as distance, used as squared distance
         n, dim = a.shape
         with open(f"{prefix}_{name}.bin", "wb") as out:
             out.write(struct.pack("<ii", n, dim))

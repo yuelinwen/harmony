@@ -36,12 +36,12 @@ const int TAG_TIMES     = 12;  // double[WORKER_TIMES]: worker's wall time
 
 // How many numbers a worker reports about where its time went, in this order:
 //
-//   total  idle  recv  compute  send  jobs  setup  poll  admin
+//   total  idle  recv  compute  send  jobs  setup  poll  admin  bytes
 //
 // Both ends of TAG_TIMES size their buffer from this, because a mismatch
 // would not fail -- MPI would deliver the shorter count and the master would
 // read whatever was next in the array as a timing.
-const int WORKER_TIMES = 9;
+const int WORKER_TIMES = 10;
 
 // Partial sums and top-K answers get a tag of their own per in-flight
 // cluster, taken from the master's slot for it.

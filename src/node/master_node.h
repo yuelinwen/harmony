@@ -43,6 +43,22 @@ public:
     // int32 ids. Row q holds the real answer for query q, nearest first.
     bool loadGroundtruth(const std::string& path);
 
+    // Reads how far away those true neighbours are, squared. Optional: the
+    // file was added after the first datasets were converted, and only r2
+    // needs it, so a missing one is reported and nothing else changes.
+    bool loadGroundtruthDistances(const std::string& path);
+
+    // The sample's r2 (utils.h:734): how much further away this result's
+    // neighbours are than the true ones, as a fraction. 0 means it found
+    // distances as good as the groundtruth's. Named r2 because the sample
+    // calls it that; it is not a coefficient of determination.
+    double r2Of(int queryId, const std::vector<Candidate>& got, int k) const;
+
+    // Bytes every worker holds between them, and what one machine would need
+    // for the same index (paper Table 4).
+    long workerMemory() const;
+    long singleMachineMemory() const;
+
     // Share of the true top-k this result actually found (paper Section 6).
     double recallAt(int queryId, const std::vector<Candidate>& got, int k) const;
 
@@ -103,7 +119,7 @@ public:
     // so a long wall time can be told apart from a slow search.
     void writeCsv(int nprobe, int nq, double recall, double seconds,
                   int differing, int ties, double elapsed,
-                  double single, double variance) const;
+                  double single, double variance, double r2) const;
 
     // Rolls the per-worker buckets up into the paper's three (Fig. 9) and
     // prints them. Called by printWorkerTimes, under the per-worker table.
@@ -208,6 +224,7 @@ private:
     IvfIndex index_;  // global clustering: centroids + inverted lists
 
     std::vector<int> gt_;   // gtCount_ rows of gtDim_ ids, row-major
+    std::vector<float> gtd_;   // the same shape, their squared distances
     int gtCount_;
     int gtDim_;
 

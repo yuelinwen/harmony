@@ -92,6 +92,63 @@ bool MasterNode::loadGroundtruth(const std::string& path) {
     return true;
 }
 
+// The distances of the true neighbours. Same file layout as the ids, and the
+// same row count and width, so it is checked against those rather than trusted.
+bool MasterNode::loadGroundtruthDistances(const std::string& path) {
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        std::cout << "no " << path << ", so no r2"
+                  << "   (scripts/data.sh writes it)" << std::endl;
+        return false;
+    }
+
+    int header[2];
+    if (std::fread(header, sizeof(int), 2, file) != 2) {
+        std::cerr << "cannot read header: " << path << std::endl;
+        std::fclose(file);
+        return false;
+    }
+
+    if (header[0] != gtCount_ || header[1] != gtDim_) {
+        std::cerr << path << " is " << header[0] << "x" << header[1]
+                  << " but the ids are " << gtCount_ << "x" << gtDim_
+                  << "; ignoring it" << std::endl;
+        std::fclose(file);
+        return false;
+    }
+
+    gtd_.resize((size_t)gtCount_ * gtDim_);
+    size_t got = std::fread(gtd_.data(), sizeof(float), gtd_.size(), file);
+    std::fclose(file);
+
+    if (got != gtd_.size()) {
+        std::cerr << "short read: " << path << std::endl;
+        gtd_.clear();
+        return false;
+    }
+    return true;
+}
+
+// sum(returned distances) / sum(true distances) - 1, over this query's k.
+// Both lists are nearest first, so they are compared rank against rank: the
+// question is not which ids came back but how much further away they are.
+double MasterNode::r2Of(int queryId, const std::vector<Candidate>& got,
+                        int k) const {
+    if (gtd_.empty() || queryId >= gtCount_ || k <= 0) {
+        return 0.0;
+    }
+    int want = (k < gtDim_) ? k : gtDim_;
+    const float* truth = &gtd_[(size_t)queryId * gtDim_];
+
+    double mine = 0.0;
+    double real = 0.0;
+    for (int i = 0; i < want && i < (int)got.size(); ++i) {
+        mine = mine + got[i].dist;
+        real = real + truth[i];
+    }
+    return (real > 0.0) ? (mine / real - 1.0) : 0.0;
+}
+
 // Counts how many of the true top-k this result found, as a fraction. Order
 // does not matter -- a neighbour found at a different rank is still found.
 double MasterNode::recallAt(int queryId, const std::vector<Candidate>& got, int k) const {
@@ -936,6 +993,27 @@ void MasterNode::timeBreakdown(double* comm, double* compute,
     *other = *other / numWorkers_;
 }
 
+// Table 4's two numbers. Bytes, so the printing decides the unit.
+long MasterNode::workerMemory() const {
+    long b = 0;
+    for (int w = 0; w < (int)workerTimes_.size(); ++w) {
+        b = b + (long)workerTimes_[w][9];
+    }
+    return b;
+}
+
+// The same index on one machine: the vectors, one id per vector in the
+// inverted lists, and the centroids. This is the paper's Faiss column, except
+// that it is this program's own single-machine form rather than another
+// implementation's, so the comparison is only about the partitioning.
+long MasterNode::singleMachineMemory() const {
+    long n = base_.getN();
+    long dim = base_.getDim();
+    return n * dim * (long)sizeof(float)
+         + n * (long)sizeof(int)
+         + (long)index_.getNlist() * dim * (long)sizeof(float);
+}
+
 void MasterNode::printTimeBreakdown() const {
     double comm = 0.0;
     double compute = 0.0;
@@ -1316,6 +1394,7 @@ int MasterNode::run() {
         !loadGroundtruth(cfg_.data + "_gt.bin")) {
         return 1;
     }
+    loadGroundtruthDistances(cfg_.data + "_gtd.bin");
     buildIndex(cfg_.nlist, cfg_.iters);
 
     // The layout has to be settled before any data moves, so the profiling
@@ -1367,6 +1446,7 @@ int MasterNode::run() {
     // uses, and is timed separately.
     double seconds = 0.0;
     double recallSum = 0.0;
+    double r2Sum = 0.0;
 
     // Before the search rather than inside it: the probe lists depend on
     // nprobe but not on anything the search does, so this can be computed
@@ -1392,6 +1472,7 @@ int MasterNode::run() {
     bool last = (pass == passes - 1);
 
     recallSum = 0.0;
+    r2Sum = 0.0;
     differing = 0;
     ties = 0;
 
@@ -1420,6 +1501,7 @@ int MasterNode::run() {
         for (int j = 0; j < count; ++j) {
             int q = start + j;
             recallSum = recallSum + recallAt(q, spread[j], k);
+            r2Sum = r2Sum + r2Of(q, spread[j], k);
 
             // 这个参考对照比它检查的搜索还贵（单机、不剪枝），跑上千条查询时
             // 它就是大部分墙钟时间，所以可以关掉。
@@ -1478,6 +1560,11 @@ int MasterNode::run() {
     std::cout << "  recall@" << k << ": " << (recallSum / nq)
               << "   (" << (k * (1.0 - recallSum / nq))
               << " of " << k << " true neighbours missed per query)" << std::endl;
+    if (!gtd_.empty()) {
+        std::cout << "  r2: " << (r2Sum / nq)
+                  << "   (squared distances this much further than the true"
+                  << " top-" << k << ")" << std::endl;
+    }
 
     std::cout << "\nthroughput" << std::endl;
     std::cout << "  " << nq << " queries in " << seconds << " s" << std::endl;
@@ -1518,6 +1605,21 @@ int MasterNode::run() {
     }
     std::cout << std::endl;
 
+    // Paper Table 4. The interesting number is the ratio: the workers between
+    // them should hold about what one machine would, and whatever they hold
+    // beyond it is what the partitioning costs.
+    long mem = workerMemory();
+    long one = singleMachineMemory();
+    if (mem > 0 && one > 0) {
+        std::cout << "  index memory: " << (mem / 1048576) << " MB over "
+                  << numWorkers_ << " workers ("
+                  << (mem / 1048576 / numWorkers_) << " MB each), vs "
+                  << (one / 1048576) << " MB on one machine" << std::endl;
+        std::cout << "    " << (100.0 * mem / one) << "% of the single-machine"
+                  << " index, so " << (100.0 * (mem - one) / one)
+                  << "% overhead" << std::endl;
+    }
+
     // How much of the base each query actually touched, and how evenly that
     // work fell across the vector partitions. The spread here is what the
     // cost model's I(pi) term estimates in advance.
@@ -1557,7 +1659,7 @@ int MasterNode::run() {
         std::cout << "chain reordered " << reorders_ << " time(s)" << std::endl;
     }
     writeCsv(nprobe, nq, recallSum / nq, seconds, differing, ties,
-             wall_.seconds(), single, variance);
+             wall_.seconds(), single, variance, r2Sum / nq);
     }   // end of the nprobe sweep
 
     shutdown();
@@ -1586,7 +1688,7 @@ std::string MasterNode::pruningLabel() const {
 // be told apart later.
 void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
                           int differing, int ties, double elapsed,
-                          double single, double variance) const {
+                          double single, double variance, double r2) const {
     if (cfg_.csv.empty()) {
         return;
     }
@@ -1612,10 +1714,11 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
         std::fprintf(f, "timestamp,build,host,elapsed,"
                         "data,nlist,iters,trainpoints,workers,bvec,bdim,mode,"
                         "assign,skew,batch,threads,prewarm,prewarmlists,"
-                        "pruning,mkl,loop,nprobe,k,nq,recall,qps,ms_per_query,"
+                        "pruning,mkl,loop,nprobe,k,nq,recall,r2,qps,ms_per_query,"
                         "single_time,speedup,variance,"
                         "comm_time,compute_time,other_time,"
                         "train_time,add_time,distribute_time,"
+                        "mem_mb,mem_pct,"
                         "differing,ties,scanned,work_pct\n");
     }
 
@@ -1634,10 +1737,11 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
     std::fprintf(f,
         "%s,%s,%s,%.1f,"
         "%s,%d,%d,%d,%d,%d,%d,%s,%s,%.3f,%d,%d,%d,%d,%s,%d,%d,"
-        "%d,%d,%d,%.6f,%.3f,%.4f,"
+        "%d,%d,%d,%.6f,%.6f,%.3f,%.4f,"
         "%.4f,%.3f,%.2f,"
         "%.4f,%.4f,%.4f,"
         "%.3f,%.3f,%.3f,"
+        "%ld,%.2f,"
         "%d,%d,%ld,%.4f\n",
         timestampNow().c_str(), HARMONY_COMMIT, hostName().c_str(), elapsed,
         cfg_.data.c_str(), cfg_.nlist, cfg_.iters, cfg_.trainPoints,
@@ -1645,10 +1749,13 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
         cfg_.assign.c_str(), cfg_.skew,
         cfg_.batch, cfg_.threads, cfg_.prewarm, cfg_.prewarmLists,
         pruningLabel().c_str(), cfg_.mkl ? 1 : 0, cfg_.loop,
-        nprobe, cfg_.k, nq, recall, nq / seconds, 1000.0 * seconds / nq,
+        nprobe, cfg_.k, nq, recall, r2, nq / seconds, 1000.0 * seconds / nq,
         single, (single > 0.0) ? (single / seconds) : 0.0, variance,
         comm, compute, other,
         index_.trainSeconds(), index_.addSeconds(), distributeSeconds_,
+        workerMemory() / 1048576,
+        (singleMachineMemory() > 0)
+            ? (100.0 * workerMemory() / singleMachineMemory()) : 0.0,
         differing, ties, scanned_, work);
 
     std::fclose(f);

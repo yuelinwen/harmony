@@ -52,6 +52,25 @@ long WorkerNode::vectorCount() const {
     return n;
 }
 
+// What a worker holds for the duration: its slice of the vectors, the global
+// ids that go with them, and the norms the gemm path needs.
+//
+// ids and norm are what makes a dimension-sliced layout cost more than a
+// vector-sliced one. Every worker in a row holds the same clusters and so the
+// same id list, cut only across dimensions, so the ids are stored bDim times
+// over; and norm is one float per vector per slice, which a single machine
+// does not keep at all.
+long WorkerNode::memoryBytes() const {
+    long b = 0;
+    for (size_t i = 0; i < blocks_.size(); ++i) {
+        const ClusterBlock& cb = blocks_[i];
+        b = b + (long)(cb.ids.size() * sizeof(int));
+        b = b + (long)(cb.data.size() * sizeof(float));
+        b = b + (long)(cb.norm.size() * sizeof(float));
+    }
+    return b + (long)(where_.size() * sizeof(int));
+}
+
 // Head of the chain: sums are all zero and nothing is pruned, so every
 // (query, candidate) pair has to be computed. Regrouping those pairs by
 // cluster turns them into one dense matrix multiply per cluster --
@@ -361,7 +380,8 @@ int WorkerNode::run() {
                          TAG_STATS, MPI_COMM_WORLD);
                 double times[WORKER_TIMES] = {total_, idle_, recv_, compute_,
                                               send_, (double)jobs_,
-                                              setup_, poll_, admin_};
+                                              setup_, poll_, admin_,
+                                              (double)memoryBytes()};
                 MPI_Send(times, WORKER_TIMES, MPI_DOUBLE, MASTER_RANK,
                          TAG_TIMES, MPI_COMM_WORLD);
                 admin_ = admin_ + adminWatch.seconds();
