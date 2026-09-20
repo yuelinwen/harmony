@@ -1188,9 +1188,20 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
     std::vector<int> inFlight(bVec_, 0);
     int free = 0;
 
+    // Blocks dispatched and not yet reported, against the most that may be.
+    // --disablepipeline sets the cap to one, which is Fig. 10's arm without
+    // the overlap; otherwise the cap cannot bind, since the slot count is
+    // already a block more than every group can have out.
+    //
+    // The cap has to be a counter rather than a smaller maxInFlight: the
+    // search for a free slot below spins until it finds one, so a pool of one
+    // would never terminate.
+    int outstanding = 0;
+    int inFlightCap = cfg_.pipeline ? maxInFlight : 1;
+
     while (true) {
-        for (int g = 0; g < bVec_; ++g) {
-            while (stage[g] < bVec_) {
+        for (int g = 0; g < bVec_ && outstanding < inFlightCap; ++g) {
+            while (stage[g] < bVec_ && outstanding < inFlightCap) {
                 int r = groupOrder_.chain(g)[stage[g]];
 
                 if (pos[g] >= blocks) {
@@ -1267,6 +1278,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
                           MPI_BYTE, lastRankOf(r, item), tagTopk(free),
                           MPI_COMM_WORLD, &req[free]);
                 inFlight[g] = inFlight[g] + 1;
+                outstanding = outstanding + 1;
             }
         }
 
@@ -1295,6 +1307,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
             scannedRow_[s.row] + blockLoad(s.row, s.firstQ, s.len, batch);
 
         inFlight[s.group] = inFlight[s.group] - 1;
+        outstanding = outstanding - 1;
     }
 }
 
@@ -1550,6 +1563,11 @@ int MasterNode::run() {
               << bVec_ << " x " << bDim_ << ", nlist " << index_.getNlist()
               << ", nprobe " << nprobe << ", k " << k
               << ", batch " << cfg_.batch << std::endl;
+    std::cout << "arms: pruning " << pruningLabel()
+              << ", assign " << cfg_.assign
+              << ", pipeline " << (cfg_.pipeline ? "on" : "OFF")
+              << ", blocksend " << (cfg_.blockSend ? "ON" : "off")
+              << std::endl;
 
     // Is the distributed answer the same as one machine's? This is the check
     // that has to pass; everything below it is a measurement, not a verdict.
@@ -1713,7 +1731,8 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
     if (isNew) {
         std::fprintf(f, "timestamp,build,host,elapsed,"
                         "data,nlist,iters,trainpoints,workers,bvec,bdim,mode,"
-                        "assign,skew,batch,threads,prewarm,prewarmlists,"
+                        "assign,skew,batch,block,blocksend,pipeline,"
+                        "threads,prewarm,prewarmlists,"
                         "pruning,mkl,loop,nprobe,k,nq,recall,r2,qps,ms_per_query,"
                         "single_time,speedup,variance,"
                         "comm_time,compute_time,other_time,"
@@ -1736,7 +1755,7 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
 
     std::fprintf(f,
         "%s,%s,%s,%.1f,"
-        "%s,%d,%d,%d,%d,%d,%d,%s,%s,%.3f,%d,%d,%d,%d,%s,%d,%d,"
+        "%s,%d,%d,%d,%d,%d,%d,%s,%s,%.3f,%d,%d,%d,%d,%d,%d,%d,%s,%d,%d,"
         "%d,%d,%d,%.6f,%.6f,%.3f,%.4f,"
         "%.4f,%.3f,%.2f,"
         "%.4f,%.4f,%.4f,"
@@ -1747,7 +1766,8 @@ void MasterNode::writeCsv(int nprobe, int nq, double recall, double seconds,
         cfg_.data.c_str(), cfg_.nlist, cfg_.iters, cfg_.trainPoints,
         numWorkers_, bVec_, bDim_, cfg_.mode.c_str(),
         cfg_.assign.c_str(), cfg_.skew,
-        cfg_.batch, cfg_.threads, cfg_.prewarm, cfg_.prewarmLists,
+        cfg_.batch, cfg_.block, cfg_.blockSend ? 1 : 0, cfg_.pipeline ? 1 : 0,
+        cfg_.threads, cfg_.prewarm, cfg_.prewarmLists,
         pruningLabel().c_str(), cfg_.mkl ? 1 : 0, cfg_.loop,
         nprobe, cfg_.k, nq, recall, r2, nq / seconds, 1000.0 * seconds / nq,
         single, (single > 0.0) ? (single / seconds) : 0.0, variance,

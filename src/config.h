@@ -85,6 +85,17 @@ struct Config {
     // running total per (query, candidate) pair of every open block -- and
     // reads thresholds a little earlier, so it prunes slightly less.
     int block = 4;
+
+    // Hand out one block at a time, waiting for it to come back before
+    // dispatching the next: the arm Fig. 10 calls "without pipeline and
+    // asynchronous execution". Blocks still travel a chain and the forwards
+    // are still non-blocking -- this only stops several being out at once, so
+    // what it measures is the overlap and nothing else.
+    //
+    // Named like --disablepruning: the switch is present or absent, never
+    // takes a value, so it cannot quietly change meaning later.
+    bool pipeline = true;
+
     bool check = true;    // re-run each query on one machine and compare
 
     // Time that single-machine pass and report the speedup over it (paper
@@ -157,6 +168,7 @@ inline void printUsage(const char* prog) {
         << "                     measured no faster here, see config.h\n"
         << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
         << "  --block <int>      query blocks per group               (4)\n"
+        << "  --disablepipeline  one block out at a time, no overlap\n"
         << "                     all of a partition's blocks fly at once\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
         << "                     costs more than the search it checks\n"
@@ -262,6 +274,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             if (cfg.block < 1) {
                 cfg.block = 1;
             }
+        } else if (opt == "--disablepipeline") {
+            cfg.pipeline = false;
         } else if (opt == "--blocksend" && hasValue) {
             cfg.blockSend = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--alpha" && hasValue) {
