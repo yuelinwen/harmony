@@ -1071,7 +1071,6 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
 }
 
 int MasterNode::run() {
-    running_ = true;
     wall_.reset();
 
     // Printed before anything can go wrong, so a run that dies half way still

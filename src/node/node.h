@@ -9,7 +9,6 @@ class Node {
 public:
     Node(int id) {
         id_ = id;
-        running_ = false;
     }
 
     virtual ~Node() {
@@ -18,17 +17,10 @@ public:
     // Pure virtual function. Each subclass writes its own run().
     virtual int run() = 0;
 
-    int getId() {
-        return id_;
-    }
-
-    bool isMaster() {
-        return id_ == 0;
-    }
-
 protected:
-    int id_;        // 0 = master, 1,2,3... = worker
-    bool running_;  // main loop flag
+    // 0 = master, 1,2,3... = worker. A worker derives its column and the rank
+    // of its row's first worker from it.
+    int id_;
 };
 
 }  // namespace harmony

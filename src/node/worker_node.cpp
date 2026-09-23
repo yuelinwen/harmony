@@ -273,7 +273,6 @@ void WorkerNode::receiveSetup() {
 }
 
 int WorkerNode::run() {
-    running_ = true;
 
 #ifdef _OPENMP
     omp_set_num_threads(cfg_.threads);   // OpenMP: --threads takes effect here
