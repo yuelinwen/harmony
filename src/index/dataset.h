@@ -6,7 +6,7 @@
 
 // Dataset: holds a set of vectors loaded from a flat binary file.
 //
-// File format (produced by util/convert_hdf5.py):
+// File format (produced by scripts/data.sh):
 //     int32 n        number of vectors
 //     int32 dim      dimension of each vector
 //     float32 data[n * dim]   row-major

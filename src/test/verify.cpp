@@ -137,11 +137,23 @@ double referencePass(IvfIndex& index, const Dataset& base, const Dataset& query,
 
 void compare(const std::vector<Candidate>& got,
              const std::vector<Candidate>& reference, int k, Agreement* into) {
+    // Both sides can be shorter than k: a heap returns only as many as it was
+    // offered, and the clusters one query probes can hold fewer than k vectors
+    // between them -- `--nprobe 1 --k 5000` on sift1M is enough to do it.
+    // Reading to k regardless segfaulted.
+    int m = k;
+    if ((int)got.size() < m) {
+        m = (int)got.size();
+    }
+    if ((int)reference.size() < m) {
+        m = (int)reference.size();
+    }
+
     std::vector<int> a;
     std::vector<int> b;
     std::vector<float> da;
     std::vector<float> db;
-    for (int i = 0; i < k; ++i) {
+    for (int i = 0; i < m; ++i) {
         a.push_back(got[i].id);
         b.push_back(reference[i].id);
         da.push_back(got[i].dist);

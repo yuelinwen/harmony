@@ -9,8 +9,11 @@
 namespace harmony {
 
 struct SlicePlan {
-    int dim;
-    int nSlices;
+    // Given values, so a default-constructed plan is harmless rather than
+    // indeterminate: nSlices of 0 would divide by zero in both accessors.
+    // The master overwrites both in splitGrid() before anything reads them.
+    int dim = 0;
+    int nSlices = 1;
 
     int begin(int s) const {
         return s * dim / nSlices;

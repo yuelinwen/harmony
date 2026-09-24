@@ -305,6 +305,43 @@ inline bool resolveGrid(Config& cfg, int numWorkers) {
         return false;
     }
 
+    // Counts that must be at least one. Every one of these was reachable and
+    // every one of them failed badly rather than loudly: --nprobe 0, --k 0 and
+    // --nlist 0 each segfaulted (an empty TopKHeap's push reads heap_.top(),
+    // an empty centroid array gets indexed), and --batch 0 turned the batch
+    // loop into `start += 0` and hung looking like it was computing.
+    //
+    // Checked here rather than in parseArgs so one place covers them all, and
+    // so the message names the flag the way the user typed it.
+    struct Least { const char* flag; int value; };
+    Least least[] = {
+        {"--nlist", cfg.nlist},
+        {"--nprobe", cfg.nprobe},
+        {"--k", cfg.k},
+        {"--nq", cfg.nq},
+        {"--batch", cfg.batch},
+        {"--block", cfg.block},
+        {"--iters", cfg.iters},
+        {"--loop", cfg.loop},
+        {"--threads", cfg.threads},
+    };
+    for (size_t i = 0; i < sizeof(least) / sizeof(least[0]); ++i) {
+        if (least[i].value < 1) {
+            std::cerr << least[i].flag << " must be at least 1, got "
+                      << least[i].value << std::endl;
+            return false;
+        }
+    }
+
+    // --nprobe takes several values; cfg.nprobe above is only the first.
+    for (size_t i = 0; i < cfg.nprobes.size(); ++i) {
+        if (cfg.nprobes[i] < 1) {
+            std::cerr << "--nprobe must be at least 1, got "
+                      << cfg.nprobes[i] << std::endl;
+            return false;
+        }
+    }
+
     if (cfg.bVec > 0 || cfg.bDim > 0) {
         if (cfg.bVec <= 0) {
             cfg.bVec = (cfg.bDim > 0) ? numWorkers / cfg.bDim : 0;

@@ -15,7 +15,8 @@ namespace harmony {
 const int MASTER_RANK = 0;
 
 // startup
-const int TAG_SETUP   = 1;   // int[3]: myDim, nClusters (this row), bDim
+const int TAG_SETUP   = 1;   // int[4]: myDim, nClusters (this row), bDim,
+                             // batch
 const int TAG_CLUSTER = 2;   // int[2]: clusterId, nIds
 const int TAG_IDS     = 3;   // int[nIds]
 const int TAG_DATA    = 4;   // float[nIds * myDim]

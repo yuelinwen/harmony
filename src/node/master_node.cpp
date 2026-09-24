@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
@@ -783,9 +782,11 @@ long MasterNode::blockLoad(int row, int firstQ, int len,
 // The workers of a row then run one after another, not in parallel: in
 // parallel every slice would be computed in full and nothing saved (§3.2).
 //
-// Two small messages rather than three. The worker already has the batch's
-// probe lists, so it works out for itself which of this block's queries want
-// which of its clusters -- there is no list of participants to send.
+// One small message per worker. The worker already has the batch's probe
+// lists, so it works out for itself which of this block's queries want which
+// of its clusters -- there is no list of participants to send, and the
+// thresholds travel separately (JOB_THRESH) once per partition rather than
+// with every block.
 void MasterNode::dispatchBlock(int row, int firstQ, int len, int item, int slot) {
     for (int col = 0; col < bDim_; ++col) {
         int w = row * bDim_ + col + 1;

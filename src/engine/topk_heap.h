@@ -88,10 +88,6 @@ public:
         return out;
     }
 
-    int size() const {
-        return (int)heap_.size();
-    }
-
     int capacity() const {
         return k_;
     }
