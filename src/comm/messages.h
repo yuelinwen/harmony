@@ -15,8 +15,22 @@ namespace harmony {
 const int MASTER_RANK = 0;
 
 // startup
-const int TAG_SETUP   = 1;   // int[4]: myDim, nClusters (this row), bDim,
-                             // batch
+// int[5]: myDim, nClusters (this row), bDim, batch, sendSlots.
+//
+// sendSlots is how many blocks the master can have in flight, and the worker
+// sizes its outgoing buffer pool from it. That is an invariant, not a
+// convenience: a worker must wait for a buffer's send to complete before
+// reusing it, blocks enter a row at rotating columns so two workers can be
+// sending to each other, and a worker that has run out of buffers has not yet
+// drained its job queue to post the matching receive. Two workers in that
+// state wait for each other forever.
+//
+// The pool used to be sized locally as 2 * bDim + 2, which was >= the master's
+// in-flight count only because --block defaulted to 4. Raising that default
+// made the pool too small and about one run in six deadlocked, at 100% CPU on
+// both sides because MPI busy-waits -- it looked like a slow run, not a hang.
+// One formula, on the master (maxBlocksInFlight()), shipped here.
+const int TAG_SETUP   = 1;
 const int TAG_CLUSTER = 2;   // int[2]: clusterId, nIds
 const int TAG_IDS     = 3;   // int[nIds]
 const int TAG_DATA    = 4;   // float[nIds * myDim]

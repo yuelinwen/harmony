@@ -57,6 +57,17 @@ public:
     // Cuts every cluster into per-worker slices and sends them out.
     void distributeData();
 
+    // The most blocks one query batch can have in flight at once.
+    //
+    // The only place this is worked out. A worker sizes its outgoing buffer
+    // pool from the value it is told at setup, because the two numbers have to
+    // satisfy pool >= in-flight or the wait before reusing a buffer can
+    // deadlock against a neighbour in the same row -- see TAG_SETUP in
+    // comm/messages.h. They used to be two independent formulas that happened
+    // to agree at the old --block default, and stopped agreeing when that
+    // default changed.
+    int maxBlocksInFlight() const;
+
     // One column's rows of the chain table, as the worker expects them.
     std::vector<int> chainTableFor(int col) const;
 

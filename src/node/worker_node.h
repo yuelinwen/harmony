@@ -40,6 +40,7 @@ public:
         myCol_ = 0;
         rowBase_ = id;
         batch_ = 1;
+        sendSlots_ = 1;
         k_ = cfg.k;
         useMkl_ = false;
         total_ = 0.0;
@@ -145,6 +146,7 @@ private:
     }
     int rowBase_;   // rank of column 0 in this row
     int batch_;     // queries the master sends slices for
+    int sendSlots_; // outgoing buffers to rotate through, from the master
     int k_;         // neighbours to keep when this worker ends a chain
     bool useMkl_;   // gemm path enabled (and compiled in)
 

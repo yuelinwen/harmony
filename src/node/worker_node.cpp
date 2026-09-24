@@ -213,14 +213,18 @@ long WorkerNode::accumulate(int firstQ, int len,
 }
 
 void WorkerNode::receiveSetup() {
-    int setup[4];
-    MPI_Recv(setup, 4, MPI_INT, MASTER_RANK, TAG_SETUP,
+    int setup[5];
+    MPI_Recv(setup, 5, MPI_INT, MASTER_RANK, TAG_SETUP,
              MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
     myDim_ = setup[0];
     int nClusters = setup[1];   // only the clusters of this worker's row
     bDim_ = setup[2];
     batch_ = setup[3];
+    sendSlots_ = setup[4];
+    if (sendSlots_ < 1) {
+        sendSlots_ = 1;
+    }
 
     // Where this worker sits in its row. Which end of a chain it is depends
     // on the job, since clusters start at different columns.
@@ -294,7 +298,18 @@ int WorkerNode::run() {
     //
     // An outgoing buffer must stay untouched until its send completes, so
     // sends go out of a rotating pool.
-    int slots = 2 * bDim_ + 2;
+    //
+    // As many slots as the master can have blocks in flight, which it works
+    // out and sends at setup. Anything smaller and this worker can run out
+    // while a neighbour in the same row has also run out, each waiting for the
+    // other to take what it sent -- see TAG_SETUP in comm/messages.h. The pool
+    // used to be 2 * bDim + 2, which happened to be enough while --block
+    // defaulted to 4 and deadlocked about one run in six once it did not.
+    //
+    // Costs a vector header per slot; the buffers themselves arrive by move
+    // when a block is forwarded, so only the ones actually in flight hold
+    // memory.
+    int slots = sendSlots_;
     std::vector<std::vector<float>> outSums(slots);       // mid-chain: totals
     std::vector<std::vector<Candidate>> outTop(slots);    // chain tail: top-k
     std::vector<MPI_Request> reqSums(slots, MPI_REQUEST_NULL);

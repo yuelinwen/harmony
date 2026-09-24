@@ -672,6 +672,15 @@ void MasterNode::reorderChains() {
     reorders_ = reorders_ + 1;
 }
 
+// Every group can have all of its blocks out at once, and without the
+// vector-level barrier a group holds every partition at once rather than one,
+// which squares the budget. The spare is so the search for a free slot below
+// cannot spin forever.
+int MasterNode::maxBlocksInFlight() const {
+    int perGroup = cfg_.pruneVector ? cfg_.block : (bVec_ * cfg_.block);
+    return bVec_ * perGroup + 1;
+}
+
 void MasterNode::distributeData() {
     std::cout << "\n===== 4. distribute =====" << std::endl;
     Stopwatch watch;
@@ -685,13 +694,14 @@ void MasterNode::distributeData() {
     for (int w = 1; w <= numWorkers_; ++w) {
         int row = (w - 1) / bDim_;
         int col = (w - 1) % bDim_;
-        int setup[4];
+        int setup[5];
         setup[0] = plan_.end(col) - plan_.begin(col);
         setup[1] = rowClusters[row];
         setup[2] = bDim_;
         setup[3] = cfg_.batch;
+        setup[4] = maxBlocksInFlight();
         // MPI: blocking is fine for startup -- the order is fixed and nobody waits
-        MPI_Send(setup, 4, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
+        MPI_Send(setup, 5, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
 
         std::vector<int> table = chainTableFor(col);
         MPI_Send(table.data(), (int)table.size(), MPI_INT, w, TAG_ORDER,
@@ -927,8 +937,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
     // plus a spare so the search for a free one below cannot spin forever.
     // Without the vector-level barrier a group holds every partition at once
     // rather than one, so the budget is squared.
-    int perGroup = cfg_.pruneVector ? blocks : (bVec_ * blocks);
-    int maxInFlight = bVec_ * perGroup + 1;
+    int maxInFlight = maxBlocksInFlight();
     if (!tagsFitMpi(maxInFlight)) {
         std::cerr << "chain tags exceed this MPI's maximum at "
                   << maxInFlight << " slots; lower --block" << std::endl;
