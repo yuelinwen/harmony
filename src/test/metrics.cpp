@@ -348,7 +348,7 @@ void Metrics::writeCsv() const {
                         "data,nlist,iters,trainpoints,workers,bvec,bdim,mode,"
                         "assign,skew,indexskew,skewshift,batch,block,blocksend,pipeline,"
                         "threads,prewarm,prewarmlists,"
-                        "pruning,mkl,loop,nprobe,k,nq,recall,r2,qps,ms_per_query,"
+                        "pruning,loop,nprobe,k,nq,recall,r2,qps,ms_per_query,"
                         "single_time,speedup,variance,"
                         "comm_time,compute_time,other_time,"
                         "train_time,add_time,distribute_time,"
@@ -363,7 +363,7 @@ void Metrics::writeCsv() const {
 
     std::fprintf(f,
         "%s,%s,%s,%.1f,"
-        "%s,%d,%d,%d,%d,%d,%d,%s,%s,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%s,%d,%d,"
+        "%s,%d,%d,%d,%d,%d,%d,%s,%s,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%s,%d,"
         "%d,%d,%d,%.6f,%.6f,%.3f,%.4f,"
         "%.4f,%.3f,%.2f,"
         "%.4f,%.4f,%.4f,"
@@ -376,7 +376,7 @@ void Metrics::writeCsv() const {
         cfg.assign.c_str(), cfg.skew, cfg.indexSkew, cfg.skewShift,
         cfg.batch, cfg.block, cfg.blockSend ? 1 : 0, cfg.pipeline ? 1 : 0,
         cfg.threads, cfg.prewarm, cfg.prewarmLists,
-        pruningLabel().c_str(), cfg.mkl ? 1 : 0, cfg.loop,
+        pruningLabel().c_str(), cfg.loop,
         nprobe, k, nq, recall, r2, nq / seconds, 1000.0 * seconds / nq,
         single, (single > 0.0) ? (single / seconds) : 0.0, variance,
         comm, compute, other,

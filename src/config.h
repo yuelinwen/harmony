@@ -68,12 +68,6 @@ struct Config {
     // partitions, nothing reads it, and the pipeline is otherwise untouched.
     bool pruneDim = true;
     bool pruneVector = true;
-    // MKL gemm at the head of a chain, where nothing is pruned yet. Measured
-    // no faster than the scalar loop on Sapphire Rapids -- the loop is already
-    // vectorised by -O3 -march=native -fassociative-math, so there is no naive
-    // implementation left for MKL to beat. Kept because §5 calls for it and as
-    // something to compare against.
-    bool mkl = true;
     // Wait for each forward to land before starting the next cluster, which
     // is the blocking arm of the paper's Fig. 2(b) comparison.
     bool blockSend = false;
@@ -199,16 +193,15 @@ inline void printUsage(const char* prog) {
         << "  --disablepruning   turn off dimension-level pruning\n"
         << "                     (drop a candidate past the threshold)\n"
         << "  --disablevectorpruning  turn off vector-level pruning\n"
-        << "                     (tighten the threshold between partitions)\n"
-        << "  --mkl <0|1>        gemm at the head of a chain        (1)\n"
-        << "                     measured no faster here, see config.h\n"
-        << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
+        << "                     (tighten the threshold between partitions)\n"        << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
         << "  --block <int>      query blocks per group        (from bDim)\n"
         << "                     default keeps about 256/bDim^2 queries in a\n"
         << "                     block: 4 at 8x1, 16 at 4x2, 64 at 2x4,\n"
         << "                     128 at 1x8, which is what measured fastest\n"
+        << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
         << "  --disablepipeline  one block out at a time, no overlap\n"
-        << "                     all of a partition's blocks fly at once\n"
+        << "                     otherwise all of a partition's blocks fly\n"
+        << "                     at once\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
         << "                     costs more than the search it checks\n"
         << "  --baseline <0|1>   time that pass, report the speedup  (1)\n"
@@ -314,8 +307,6 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.pruneDim = false;
         } else if (opt == "--disablevectorpruning") {
             cfg.pruneVector = false;
-        } else if (opt == "--mkl" && hasValue) {
-            cfg.mkl = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--loop" && hasValue) {
             cfg.loop = std::atoi(argv[++i]);
             if (cfg.loop < 1) {

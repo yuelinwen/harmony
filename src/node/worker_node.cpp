@@ -165,8 +165,7 @@ long WorkerNode::accumulate(int firstQ, int len,
                             const std::vector<size_t>& qOff,
                             std::vector<float>& sums, bool first) {
     long survivors = 0;
-    if (first && useMkl_ &&
-        accumulateGemm(firstQ, len, qOff, sums, &survivors)) {
+    if (first && accumulateGemm(firstQ, len, qOff, sums, &survivors)) {
         return survivors;
     }
 
@@ -267,9 +266,7 @@ void WorkerNode::receiveSetup() {
 #endif
     const char* kernel = "loop";
 #ifdef HARMONY_USE_MKL
-    if (useMkl_) {
-        kernel = "loop+mkl";
-    }
+    kernel = "loop+mkl";
 #endif
     std::cout << "worker " << id_ << " ready: " << vectorCount()
               << " vectors x " << myDim_ << " dims, "

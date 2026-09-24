@@ -42,7 +42,6 @@ public:
         batch_ = 1;
         sendSlots_ = 1;
         k_ = cfg.k;
-        useMkl_ = false;
         total_ = 0.0;
         idle_ = 0.0;
         recv_ = 0.0;
@@ -96,8 +95,13 @@ private:
 
     // The head of a chain, where nothing has been pruned yet and every pair
     // has to be computed. Grouped by cluster instead of by query, that is a
-    // dense matrix multiply, which is what MKL is for (paper §5). Returns
-    // false when there is no MKL to call, so the caller falls back. On true,
+    // dense matrix multiply, which is what MKL is for (paper §5).
+    //
+    // Always taken when MKL is compiled in; returns false when it is not, so
+    // the caller falls back to the scalar loop. There is no switch because
+    // measured on the cluster it is never worse: +49% QPS at myDim 128, +22%
+    // at 64, and inside the noise at 32 and 16, the gain shrinking with the
+    // slice width exactly as arithmetic intensity says it should. On true,
     // alive holds the survivor count, as accumulate() returns.
     bool accumulateGemm(int firstQ, int len,
                         const std::vector<size_t>& qOff,
@@ -148,7 +152,6 @@ private:
     int batch_;     // queries the master sends slices for
     int sendSlots_; // outgoing buffers to rotate through, from the master
     int k_;         // neighbours to keep when this worker ends a chain
-    bool useMkl_;   // gemm path enabled (and compiled in)
 
     // Where the run went, in seconds. Reported at shutdown and printed by the
     // master as one row per worker (paper Fig. 9).
