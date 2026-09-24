@@ -120,6 +120,52 @@ void MasterNode::buildSizePrefix() {
     for (size_t i = 0; i < hotIds_.size(); ++i) {
         hotPrefix_[i + 1] = hotPrefix_[i] + (double)index_.clusterSize(hotIds_[i]);
     }
+
+    // The test workload's hot set. Keeps the first (1 - shift) of the layout's
+    // hot clusters and draws the rest from outside it, size-weighted like the
+    // original so the candidate count stays comparable.
+    //
+    // A prefix of hotIds_ is kept rather than a random subset because the list
+    // came out of a weighted draw already, so its order carries no meaning
+    // worth preserving and a prefix makes the overlap exactly countable.
+    testHotIds_.assign(hotIds_.begin(), hotIds_.end());
+    int move = (int)(cfg_.skewShift * hot + 0.5);
+    if (move > 0) {
+        // A seed of its own, so which clusters move does not depend on the
+        // shift being used -- raising --skewshift only ever moves more of
+        // them, it does not reshuffle the ones already moved.
+        unsigned int shiftState = 192837465u;
+        for (int i = hot - move; i < hot; ++i) {
+            int c = -1;
+            for (int tries = 0; tries < 64 * nlist; ++tries) {
+                int pick = drawWeighted(allIds_, allPrefix_, shiftState);
+                if (!taken[pick]) {
+                    c = pick;
+                    break;
+                }
+            }
+            if (c < 0) {
+                // the pool is exhausted: fall back to a linear scan
+                for (int pick = 0; pick < nlist; ++pick) {
+                    if (!taken[pick]) {
+                        c = pick;
+                        break;
+                    }
+                }
+            }
+            if (c < 0) {
+                break;      // every cluster is taken; nothing left to move to
+            }
+            taken[c] = 1;
+            testHotIds_[i] = c;
+        }
+    }
+
+    testHotPrefix_.assign(testHotIds_.size() + 1, 0.0);
+    for (size_t i = 0; i < testHotIds_.size(); ++i) {
+        testHotPrefix_[i + 1] =
+            testHotPrefix_[i] + (double)index_.clusterSize(testHotIds_[i]);
+    }
 }
 
 // One cluster out of a pool, with probability proportional to how many vectors
@@ -165,7 +211,9 @@ int MasterNode::drawWeighted(const std::vector<int>& ids,
 // distributed path, so recall there is meaningless and nothing checks the
 // answer at all.)
 std::vector<int> MasterNode::probesFor(int queryId, int nprobe,
-                                      double skew) const {
+                                      Workload which) const {
+    bool test = (which == kTestWorkload);
+    double skew = test ? cfg_.skew : cfg_.indexSkew;
     if (skew <= 0.0) {
         return index_.nearestClusters(query_.vec(queryId), nprobe);
     }
@@ -174,7 +222,9 @@ std::vector<int> MasterNode::probesFor(int queryId, int nprobe,
     if (nprobe > nlist) {
         nprobe = nlist;
     }
-    int hot = (int)hotIds_.size();
+    const std::vector<int>& hotPool = test ? testHotIds_ : hotIds_;
+    const std::vector<double>& hotPoolPrefix = test ? testHotPrefix_ : hotPrefix_;
+    int hot = (int)hotPool.size();
 
     int wanted = (int)(skew * nprobe + 0.5);   // probes aimed at the hot set
     if (wanted > hot) {
@@ -190,8 +240,8 @@ std::vector<int> MasterNode::probesFor(int queryId, int nprobe,
 
     for (int pass = 0; pass < 2; ++pass) {
         int want = (pass == 0) ? wanted : nprobe;
-        const std::vector<int>& pool = (pass == 0) ? hotIds_ : allIds_;
-        const std::vector<double>& prefix = (pass == 0) ? hotPrefix_ : allPrefix_;
+        const std::vector<int>& pool = (pass == 0) ? hotPool : allIds_;
+        const std::vector<double>& prefix = (pass == 0) ? hotPoolPrefix : allPrefix_;
 
         // Rejection sampling, then a linear walk over the pool, so a pool that
         // is nearly exhausted still terminates rather than spinning.
@@ -225,7 +275,7 @@ void MasterNode::warmupPlan(int queries, int nprobe) {
     }
     std::vector<std::vector<int>> probes(n);
     for (int q = 0; q < n; ++q) {
-        probes[q] = probesFor(q, nprobe, cfg_.indexSkew);
+        probes[q] = probesFor(q, nprobe, kIndexWorkload);
         for (int i = 0; i < (int)probes[q].size(); ++i) {
             clusterHits_[probes[q][i]] = clusterHits_[probes[q][i]] + 1;
         }
@@ -254,10 +304,26 @@ void MasterNode::warmupPlan(int queries, int nprobe) {
         std::cout << "SYNTHETIC WORKLOAD (--indexskew " << cfg_.indexSkew
                   << " --skew " << cfg_.skew << "): probe lists are made up,"
                   << " recall is not meaningful" << std::endl;
-        if (cfg_.indexSkew == cfg_.skew) {
-            std::cout << "  the layout is built from the same distribution it"
-                      << " is measured on, so nothing here can mismatch"
-                      << " -- Fig. 8 needs the two to differ" << std::endl;
+        // How much of the layout's hot set the test workload still wants.
+        // Printed rather than inferred from --skewshift, because it is the
+        // number that decides whether anything can mismatch at all.
+        int shared = 0;
+        for (size_t i = 0; i < testHotIds_.size(); ++i) {
+            for (size_t j = 0; j < hotIds_.size(); ++j) {
+                if (testHotIds_[i] == hotIds_[j]) {
+                    shared = shared + 1;
+                    break;
+                }
+            }
+        }
+        std::cout << "  hot set: " << hotIds_.size() << " clusters, "
+                  << shared << " of them still hot at test time"
+                  << " (--skewshift " << cfg_.skewShift << ")" << std::endl;
+        if (shared == (int)hotIds_.size()) {
+            std::cout << "  the layout is built for exactly the clusters the"
+                      << " queries want, and LPT spreads them, so the load"
+                      << " stays balanced -- Fig. 8 needs --skewshift above 0"
+                      << std::endl;
         }
     }
 }
@@ -1009,7 +1075,7 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
     for (int q = 0; q < count; ++q) {
         const float* qv = query_.vec(firstQuery + q);
         batch[q].id = firstQuery + q;
-        batch[q].clusters = probesFor(batch[q].id, nprobe, cfg_.skew);
+        batch[q].clusters = probesFor(batch[q].id, nprobe, kTestWorkload);
         prewarmHeap(qv, batch[q], heaps[q]);
     }
 
@@ -1153,7 +1219,7 @@ int MasterNode::run() {
     // workload.
     std::vector<std::vector<int>> probes(nq);
     for (int q = 0; q < nq; ++q) {
-        probes[q] = probesFor(q, nprobe, cfg_.skew);
+        probes[q] = probesFor(q, nprobe, kTestWorkload);
     }
 
     // Before the search rather than inside it: the probe lists depend on

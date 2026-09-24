@@ -130,6 +130,23 @@ struct Config {
     // mismatched case and change what the old numbers meant.
     double indexSkew = -1.0;
 
+    // How much of the test workload's hot set is somewhere else than the one
+    // the layout was built for. 0 means the same clusters are hot in both.
+    //
+    // This is the knob Fig. 8 actually turns, and it took a measurement to
+    // find that out. Concentration alone changes nothing, because LPT hands
+    // the heaviest clusters to the lightest partitions and so spreads the hot
+    // set one per partition -- making the same clusters hotter keeps the load
+    // balanced (measured: shares stay within 11.1-13.6% at skew 0.8, while
+    // --assign roundrobin goes 2.4-19.8% on the same workload). What hurts a
+    // vector-only layout is the clusters it optimised for not being the ones
+    // the queries ask for.
+    //
+    // The replacements are drawn size-weighted from outside the hot set, like
+    // the hot set itself, so the candidate count stays comparable and the
+    // change is in the shape rather than the weight.
+    double skewShift = 0.0;
+
     // How clusters are handed to vector partitions. "lpt" gives the heaviest
     // to whichever partition is lightest so far; "roundrobin" is c % bVec,
     // which is what this used to do and what the sample still does (as
@@ -201,9 +218,10 @@ inline void printUsage(const char* prog) {
         << "                     are synthetic, so recall stops meaning anything\n"
         << "                     while differing still does\n"
         << "  --indexskew <f>    the skew the layout is built from (--skew)\n"
-        << "                     give it a different value from --skew to make\n"
-        << "                     the layout mismatch the workload, which is\n"
-        << "                     what Fig. 8 measures\n"
+        << "  --skewshift <f>    share of the test hot set that moved     (0)\n"
+        << "                     0 = the same clusters are hot in both, which\n"
+        << "                     LPT absorbs; raise it to make the layout miss\n"
+        << "                     the clusters the queries want (Fig. 8)\n"
         << "\n"
         << "cost model, only read when --mode harmony\n"
         << "  --commcost <float> a transferred byte, in multiply-adds (100)\n"
@@ -261,6 +279,14 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             }
             if (cfg.skew > 1.0) {
                 cfg.skew = 1.0;
+            }
+        } else if (opt == "--skewshift" && hasValue) {
+            cfg.skewShift = std::atof(argv[++i]);
+            if (cfg.skewShift < 0.0) {
+                cfg.skewShift = 0.0;
+            }
+            if (cfg.skewShift > 1.0) {
+                cfg.skewShift = 1.0;
             }
         } else if (opt == "--indexskew" && hasValue) {
             cfg.indexSkew = std::atof(argv[++i]);

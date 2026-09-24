@@ -131,17 +131,20 @@ public:
 
     // ---- cost model, paper Section 4.2.1 ----
 
+    // Which of the two workloads a probe list belongs to. One parameter rather
+    // than a skew and a hot set, because the two always go together: using the
+    // profiling skew with the test hot set, or the other way round, would be a
+    // silent bug and this makes it unspellable.
+    enum Workload {
+        kIndexWorkload,   // what the layout was built from (--indexskew)
+        kTestWorkload     // what it is then measured on (--skew, --skewshift)
+    };
+
     // The clusters one query visits. The only place probe lists come from --
     // the profiling pass, the search, and the single-machine reference all go
     // through it, so a synthetic workload stays consistent between them and
     // differing keeps its meaning.
-    //
-    // `skew` is a parameter rather than read from cfg_ because the two callers
-    // want different values: the profiling pass builds the layout from
-    // cfg_.indexSkew, the search and the reference run cfg_.skew. Equal values
-    // mean the layout always fits the workload, which is the one case Fig. 8
-    // cannot show anything in.
-    std::vector<int> probesFor(int queryId, int nprobe, double skew) const;
+    std::vector<int> probesFor(int queryId, int nprobe, Workload which) const;
 
     // Learns which clusters the workload favours, by centroid assignment only,
     // before the layout is fixed (the paper's pre-query phase).
@@ -191,6 +194,12 @@ private:
     std::vector<double> allPrefix_;
     std::vector<int> hotIds_;
     std::vector<double> hotPrefix_;
+
+    // The test workload's hot set: hotIds_ with --skewshift of its members
+    // replaced by clusters from outside it. Equal to hotIds_ when the shift is
+    // 0, which is why the layout absorbs the skew in that case.
+    std::vector<int> testHotIds_;
+    std::vector<double> testHotPrefix_;
 
     // Draws one cluster from a pool with probability proportional to size,
     // advancing the caller's generator state.
