@@ -205,7 +205,8 @@ void Metrics::print() const {
     std::cout << "setup: " << workers << " workers, grid "
               << bVec << " x " << bDim << ", nlist " << nlist
               << ", nprobe " << nprobe << ", k " << k
-              << ", batch " << cfg.batch << std::endl;
+              << ", batch " << cfg.batch
+              << ", block " << cfg.block << std::endl;
     std::cout << "arms: pruning " << pruningLabel()
               << ", assign " << cfg.assign
               << ", pipeline " << (cfg.pipeline ? "on" : "OFF")

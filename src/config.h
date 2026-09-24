@@ -84,7 +84,10 @@ struct Config {
     // use four to eight. More blocks costs memory -- a worker holds one
     // running total per (query, candidate) pair of every open block -- and
     // reads thresholds a little earlier, so it prunes slightly less.
-    int block = 4;
+    // 0 means "not given": resolveGrid() works it out from the grid, because
+    // the right value depends on bDim and a single default is wrong for every
+    // layout but one. An explicit --block always wins.
+    int block = 0;
 
     // Hand out one block at a time, waiting for it to come back before
     // dispatching the next: the arm Fig. 10 calls "without pipeline and
@@ -200,7 +203,10 @@ inline void printUsage(const char* prog) {
         << "  --mkl <0|1>        gemm at the head of a chain        (1)\n"
         << "                     measured no faster here, see config.h\n"
         << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
-        << "  --block <int>      query blocks per group               (4)\n"
+        << "  --block <int>      query blocks per group        (from bDim)\n"
+        << "                     default keeps about 256/bDim^2 queries in a\n"
+        << "                     block: 4 at 8x1, 16 at 4x2, 64 at 2x4,\n"
+        << "                     128 at 1x8, which is what measured fastest\n"
         << "  --disablepipeline  one block out at a time, no overlap\n"
         << "                     all of a partition's blocks fly at once\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
@@ -374,7 +380,6 @@ inline bool resolveGrid(Config& cfg, int numWorkers) {
         {"--k", cfg.k},
         {"--nq", cfg.nq},
         {"--batch", cfg.batch},
-        {"--block", cfg.block},
         {"--iters", cfg.iters},
         {"--loop", cfg.loop},
         {"--threads", cfg.threads},
@@ -432,6 +437,37 @@ inline bool resolveGrid(Config& cfg, int numWorkers) {
                   << " does not match " << numWorkers << " workers" << std::endl;
         return false;
     }
+
+    // --block, once the grid is known. One default cannot fit every layout:
+    // measured at nq 1024, the best value is 4 at 8x1 but 128 at 1x8, and
+    // using 4 everywhere -- which is what this did -- costs 44% at 2x4 and
+    // 75% at 1x8.
+    //
+    // What holds steady across the four is the number of queries in a block,
+    // not the number of blocks: 256, 64, 16, 8 as bDim goes 1, 2, 4, 8. A
+    // block's running totals are (queries x candidates) and that buffer has to
+    // travel bDim hops, so a deeper chain needs a smaller block to keep the
+    // pipeline moving. 256/bDim^2 reproduces all four measured optima; the
+    // floor of 8 is where 1x8 stopped improving (block 256 measured slower
+    // than 128).
+    if (cfg.block <= 0) {
+        int perBlock = 256 / (cfg.bDim * cfg.bDim);
+        if (perBlock < 8) {
+            perBlock = 8;
+        }
+
+        // min(batch, nq), not batch: a batch holds whatever is left of the
+        // query set, so --nq 256 with the default --batch 1024 runs batches of
+        // 256. Dividing the configured batch instead gave 128 blocks of two
+        // queries each at 1x8 -- 458 QPS where 32 blocks measured 651.
+        int perBatch = (cfg.batch < cfg.nq) ? cfg.batch : cfg.nq;
+
+        cfg.block = perBatch / perBlock;
+        if (cfg.block < 1) {
+            cfg.block = 1;      // a batch smaller than one block's worth
+        }
+    }
+
     return true;
 }
 
