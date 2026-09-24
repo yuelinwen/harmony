@@ -164,8 +164,9 @@ int MasterNode::drawWeighted(const std::vector<int>& ids,
 // (The sample fakes its listidqueries the same way, but only in the
 // distributed path, so recall there is meaningless and nothing checks the
 // answer at all.)
-std::vector<int> MasterNode::probesFor(int queryId, int nprobe) const {
-    if (cfg_.skew <= 0.0) {
+std::vector<int> MasterNode::probesFor(int queryId, int nprobe,
+                                      double skew) const {
+    if (skew <= 0.0) {
         return index_.nearestClusters(query_.vec(queryId), nprobe);
     }
 
@@ -175,7 +176,7 @@ std::vector<int> MasterNode::probesFor(int queryId, int nprobe) const {
     }
     int hot = (int)hotIds_.size();
 
-    int wanted = (int)(cfg_.skew * nprobe + 0.5);   // probes aimed at the hot set
+    int wanted = (int)(skew * nprobe + 0.5);   // probes aimed at the hot set
     if (wanted > hot) {
         wanted = hot;      // cannot take more distinct clusters than there are
     }
@@ -224,7 +225,7 @@ void MasterNode::warmupPlan(int queries, int nprobe) {
     }
     std::vector<std::vector<int>> probes(n);
     for (int q = 0; q < n; ++q) {
-        probes[q] = probesFor(q, nprobe);
+        probes[q] = probesFor(q, nprobe, cfg_.indexSkew);
         for (int i = 0; i < (int)probes[q].size(); ++i) {
             clusterHits_[probes[q][i]] = clusterHits_[probes[q][i]] + 1;
         }
@@ -245,12 +246,19 @@ void MasterNode::warmupPlan(int queries, int nprobe) {
     double mean = (double)n * nprobe / index_.getNlist();
     double var = workloadVariance(probes, index_.getNlist());
 
-    std::cout << "warmup: " << n << " queries profiled, cluster probe counts"
+    std::cout << "warmup: " << n << " queries profiled at skew "
+              << cfg_.indexSkew << ", cluster probe counts"
               << " mean " << mean << " variance " << var
               << " (" << (mean > 0.0 ? var / mean : 0.0) << " x mean)" << std::endl;
-    if (cfg_.skew > 0.0) {
-        std::cout << "SKEWED WORKLOAD (--skew " << cfg_.skew << "): probe lists"
-                  << " are synthetic, recall is not meaningful" << std::endl;
+    if (cfg_.skew > 0.0 || cfg_.indexSkew > 0.0) {
+        std::cout << "SYNTHETIC WORKLOAD (--indexskew " << cfg_.indexSkew
+                  << " --skew " << cfg_.skew << "): probe lists are made up,"
+                  << " recall is not meaningful" << std::endl;
+        if (cfg_.indexSkew == cfg_.skew) {
+            std::cout << "  the layout is built from the same distribution it"
+                      << " is measured on, so nothing here can mismatch"
+                      << " -- Fig. 8 needs the two to differ" << std::endl;
+        }
     }
 }
 
@@ -1001,7 +1009,7 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
     for (int q = 0; q < count; ++q) {
         const float* qv = query_.vec(firstQuery + q);
         batch[q].id = firstQuery + q;
-        batch[q].clusters = probesFor(batch[q].id, nprobe);
+        batch[q].clusters = probesFor(batch[q].id, nprobe, cfg_.skew);
         prewarmHeap(qv, batch[q], heaps[q]);
     }
 
@@ -1145,7 +1153,7 @@ int MasterNode::run() {
     // workload.
     std::vector<std::vector<int>> probes(nq);
     for (int q = 0; q < nq; ++q) {
-        probes[q] = probesFor(q, nprobe);
+        probes[q] = probesFor(q, nprobe, cfg_.skew);
     }
 
     // Before the search rather than inside it: the probe lists depend on

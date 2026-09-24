@@ -135,7 +135,13 @@ public:
     // the profiling pass, the search, and the single-machine reference all go
     // through it, so a synthetic workload stays consistent between them and
     // differing keeps its meaning.
-    std::vector<int> probesFor(int queryId, int nprobe) const;
+    //
+    // `skew` is a parameter rather than read from cfg_ because the two callers
+    // want different values: the profiling pass builds the layout from
+    // cfg_.indexSkew, the search and the reference run cfg_.skew. Equal values
+    // mean the layout always fits the workload, which is the one case Fig. 8
+    // cannot show anything in.
+    std::vector<int> probesFor(int queryId, int nprobe, double skew) const;
 
     // Learns which clusters the workload favours, by centroid assignment only,
     // before the layout is fixed (the paper's pre-query phase).

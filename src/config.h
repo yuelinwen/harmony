@@ -114,6 +114,22 @@ struct Config {
     // touching the index or the layout.
     double skew = 0.0;
 
+    // The skew of the workload the layout is built from, which is a separate
+    // thing from the skew of the workload it is then measured on.
+    //
+    // Paper §6.2.2 and the cost-model evaluation both build the index from a
+    // historical workload at variance 500 and then test at a different
+    // variance: what degrades a vector-only layout is the *mismatch* between
+    // the distribution the clusters were assigned for and the one that
+    // arrives. With one knob for both there is never any mismatch, the layout
+    // always fits, and measured QPS went up with skew rather than down --
+    // the opposite of Fig. 8.
+    //
+    // -1 means "follow --skew", resolved in resolveGrid(). Defaulting to 0
+    // instead would silently turn every existing --skew run into the
+    // mismatched case and change what the old numbers meant.
+    double indexSkew = -1.0;
+
     // How clusters are handed to vector partitions. "lpt" gives the heaviest
     // to whichever partition is lightest so far; "roundrobin" is c % bVec,
     // which is what this used to do and what the sample still does (as
@@ -184,6 +200,10 @@ inline void printUsage(const char* prog) {
         << "                     0 searches for real; above it the probe lists\n"
         << "                     are synthetic, so recall stops meaning anything\n"
         << "                     while differing still does\n"
+        << "  --indexskew <f>    the skew the layout is built from (--skew)\n"
+        << "                     give it a different value from --skew to make\n"
+        << "                     the layout mismatch the workload, which is\n"
+        << "                     what Fig. 8 measures\n"
         << "\n"
         << "cost model, only read when --mode harmony\n"
         << "  --commcost <float> a transferred byte, in multiply-adds (100)\n"
@@ -241,6 +261,14 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             }
             if (cfg.skew > 1.0) {
                 cfg.skew = 1.0;
+            }
+        } else if (opt == "--indexskew" && hasValue) {
+            cfg.indexSkew = std::atof(argv[++i]);
+            if (cfg.indexSkew < 0.0) {
+                cfg.indexSkew = 0.0;
+            }
+            if (cfg.indexSkew > 1.0) {
+                cfg.indexSkew = 1.0;
             }
         } else if (opt == "--k" && hasValue) {
             cfg.k = std::atoi(argv[++i]);
@@ -331,6 +359,12 @@ inline bool resolveGrid(Config& cfg, int numWorkers) {
                       << least[i].value << std::endl;
             return false;
         }
+    }
+
+    // Not given: the layout is built from the same workload it is measured
+    // on, which is what this did when there was only one knob.
+    if (cfg.indexSkew < 0.0) {
+        cfg.indexSkew = cfg.skew;
     }
 
     // --nprobe takes several values; cfg.nprobe above is only the first.
