@@ -8,7 +8,7 @@
 #include "src/node/worker_node.h"
 
 // Build and run (from the project root, so Data/ resolves):
-//   ./build.sh
+//   scripts/build.sh
 //   mpirun -n 5 ./main                 1 master + 4 workers
 //   mpirun -n 5 ./main --mode auto     let the cost model pick the layout
 //   ./main --help-ish                  any bad option prints the full list

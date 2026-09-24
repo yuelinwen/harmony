@@ -7,7 +7,9 @@
 #include <vector>
 
 // Run-time settings, so an experiment does not need a recompile.
-// Measurements behind the defaults are in README.md.
+//
+// The measurement behind a default is in the commit that set it, and in the
+// comment next to it when it is short enough to be worth repeating.
 
 namespace harmony {
 
@@ -82,6 +84,11 @@ struct Config {
     // the right value depends on bDim and a single default is wrong for every
     // layout but one. An explicit --block always wins.
     int block = 0;
+    // Whether --block was given. The default depends on the grid, and under
+    // --mode harmony the grid is not final until choosePlan() has run, so the
+    // default has to be worked out twice -- and only when the user left it to
+    // us.
+    bool blockGiven = false;
 
     // Hand out one block at a time, waiting for it to come back before
     // dispatching the next: the arm Fig. 10 calls "without pipeline and
@@ -325,6 +332,7 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             if (cfg.block < 1) {
                 cfg.block = 1;
             }
+            cfg.blockGiven = true;
         } else if (opt == "--disablepipeline") {
             cfg.pipeline = false;
         } else if (opt == "--blocksend" && hasValue) {
@@ -344,12 +352,35 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
     return true;
 }
 
+// The default --block for a given grid.
+//
+// One value cannot fit every layout: measured at nq 1024, the best is 4 at 8x1
+// but 128 at 1x8, and using 4 everywhere -- which this did once -- costs 44% at
+// 2x4 and 75% at 1x8. What holds steady across the four is the number of
+// queries in a block, not the number of blocks: 256, 64, 16, 8 as bDim goes
+// 1, 2, 4, 8. A block's running totals are (queries x candidates) and that
+// buffer travels bDim hops, so a deeper chain needs a smaller block to keep
+// the pipeline moving. 256/bDim^2 reproduces all four measured optima; the
+// floor of 8 is where 1x8 stopped improving.
+//
+// min(batch, nq), not batch: a batch holds whatever is left of the query set,
+// so --nq 256 with the default --batch 1024 runs batches of 256.
+inline int defaultBlock(const Config& cfg, int bDim) {
+    int perBlock = 256 / (bDim * bDim);
+    if (perBlock < 8) {
+        perBlock = 8;
+    }
+    int perBatch = (cfg.batch < cfg.nq) ? cfg.batch : cfg.nq;
+    int block = perBatch / perBlock;
+    return (block < 1) ? 1 : block;
+}
+
 // Turns --mode into a grid, unless --bvec/--bdim were given. bVec * bDim has
 // to come out equal to the worker count.
 inline bool resolveGrid(Config& cfg, int numWorkers) {
 
-    // -n 1 留不下 worker，下面每种布局都会除以零。放在这里是因为
-    // master 和 worker 都要经过这个函数。
+    // -n 1 leaves no worker, and every layout below would then divide by
+    // zero. Here rather than in main because both nodes pass through it.
     if (numWorkers < 1) {
         std::cerr << "no workers: -n is workers plus one, so it needs to be "
                   << "at least 2\n" << std::endl;
@@ -429,36 +460,13 @@ inline bool resolveGrid(Config& cfg, int numWorkers) {
         return false;
     }
 
-    // --block, once the grid is known. One default cannot fit every layout:
-    // measured at nq 1024, the best value is 4 at 8x1 but 128 at 1x8, and
-    // using 4 everywhere -- which is what this did -- costs 44% at 2x4 and
-    // 75% at 1x8.
-    //
-    // What holds steady across the four is the number of queries in a block,
-    // not the number of blocks: 256, 64, 16, 8 as bDim goes 1, 2, 4, 8. A
-    // block's running totals are (queries x candidates) and that buffer has to
-    // travel bDim hops, so a deeper chain needs a smaller block to keep the
-    // pipeline moving. 256/bDim^2 reproduces all four measured optima; the
-    // floor of 8 is where 1x8 stopped improving (block 256 measured slower
-    // than 128).
-    if (cfg.block <= 0) {
-        int perBlock = 256 / (cfg.bDim * cfg.bDim);
-        if (perBlock < 8) {
-            perBlock = 8;
-        }
-
-        // min(batch, nq), not batch: a batch holds whatever is left of the
-        // query set, so --nq 256 with the default --batch 1024 runs batches of
-        // 256. Dividing the configured batch instead gave 128 blocks of two
-        // queries each at 1x8 -- 458 QPS where 32 blocks measured 651.
-        int perBatch = (cfg.batch < cfg.nq) ? cfg.batch : cfg.nq;
-
-        cfg.block = perBatch / perBlock;
-        if (cfg.block < 1) {
-            cfg.block = 1;      // a batch smaller than one block's worth
-        }
+    // --block, once the grid is known. Under --mode harmony this grid is only
+    // a starting point and choosePlan() will replace it, so the master works
+    // the default out again there; this value is what the other modes use and
+    // what a worker would see.
+    if (!cfg.blockGiven) {
+        cfg.block = defaultBlock(cfg, cfg.bDim);
     }
-
     return true;
 }
 

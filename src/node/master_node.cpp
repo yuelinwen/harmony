@@ -338,6 +338,11 @@ void MasterNode::warmupPlan(int queries, int nprobe) {
 //
 // A cluster's weight is how often it is probed times how many vectors it
 // holds, which is the number of distance computations it brings.
+long MasterNode::clusterHitsOf(int c) const {
+    long hits = clusterHits_.empty() ? 1 : clusterHits_[c];
+    return (hits < 1) ? 1 : hits;
+}
+
 std::vector<double> MasterNode::partitionLoads(int bVec,
                                                std::vector<int>* owner) const {
     int nlist = index_.getNlist();
@@ -347,8 +352,7 @@ std::vector<double> MasterNode::partitionLoads(int bVec,
 
     std::vector<std::pair<double, int> > order(nlist);
     for (int c = 0; c < nlist; ++c) {
-        long hits = clusterHits_.empty() ? 1 : clusterHits_[c];
-        order[c] = std::make_pair((double)hits * index_.clusterSize(c), c);
+        order[c] = std::make_pair((double)clusterHitsOf(c) * index_.clusterSize(c), c);
     }
 
     // The arm to measure the greedy against: deal the clusters out in id
@@ -414,9 +418,13 @@ double MasterNode::imbalanceOf(int bVec, int bDim) const {
 // Measured on Sift1M, nprobe=32, k=100. Between the tabulated points the
 // value is interpolated; past the last one it is held flat.
 double MasterNode::pruneFactor(int bDim) const {
-    static const int slices[] = {1, 2, 4};
-    static const double work[] = {1.00, 0.62, 0.51};
-    int n = 3;
+    // Measured on the cluster (Sift1M, nlist 256 / nprobe 32, gemm on), as
+    // the "distance work vs no pruning" line reports it. Not monotonic: at
+    // eight slices each one is only 16 dimensions wide, too little distance
+    // per check to beat four.
+    static const int slices[] = {1, 2, 4, 8};
+    static const double work[] = {1.00, 0.76, 0.67, 0.69};
+    int n = 4;
 
     if (bDim <= slices[0]) {
         return work[0];
@@ -435,8 +443,7 @@ double MasterNode::estimateCost(int bVec, int bDim) const {
     double bytes = 0.0;
 
     for (int c = 0; c < index_.getNlist(); ++c) {
-        long hits = clusterHits_.empty() ? 1 : clusterHits_[c];
-        double candidates = (double)hits * (double)index_.clusterIds(c).size();
+        double candidates = (double)clusterHitsOf(c) * index_.clusterSize(c);
 
         totalWork = totalWork + candidates * base_.getDim();
 
@@ -482,6 +489,13 @@ void MasterNode::choosePlan() {
     std::cout << "chosen grid: " << bestVec << " x " << bestDim << std::endl;
     cfg_.bVec = bestVec;
     cfg_.bDim = bestDim;
+
+    // The grid resolveGrid() derived --block from was only a starting point,
+    // so derive it again now that this one is final. Skipped when the user
+    // gave the flag, and a no-op when the cost model kept the starting grid.
+    if (!cfg_.blockGiven) {
+        cfg_.block = defaultBlock(cfg_, bestDim);
+    }
 }
 
 // The worker with rank w sits at row (w-1)/bDim, column (w-1)%bDim of the
@@ -927,6 +941,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
         int row;
         int firstQ;
         int len;
+        long load;                    // candidates this block offers, counted once
         std::vector<Candidate> top;   // len rows of k, nearest first, padded
     };
 
@@ -1009,9 +1024,13 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
                     continue;
                 }
 
-                // Nothing of this partition to do for these queries.
-                if (blockLoad(r, firstQ, len, batch) == 0) {
-                    continue;
+                // Walking the queries and their probe lists is not free, so
+                // it happens once here and the result rides along in the slot
+                // -- the counters below used to call it twice more with the
+                // same arguments, on the path that merges every result.
+                long load = blockLoad(r, firstQ, len, batch);
+                if (load == 0) {
+                    continue;   // nothing of this partition for these queries
                 }
 
                 // The slot is picked first because its number is what tags
@@ -1030,6 +1049,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
                 slot[free].row = r;
                 slot[free].firstQ = firstQ;
                 slot[free].len = len;
+                slot[free].load = load;
                 slot[free].top.assign((size_t)len * k, Candidate{-1, PRUNED});
 
                 // MPI: non-blocking, so the next block can be dispatched
@@ -1065,9 +1085,8 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
             }
         }
 
-        scanned_ = scanned_ + blockLoad(s.row, s.firstQ, s.len, batch);
-        scannedRow_[s.row] =
-            scannedRow_[s.row] + blockLoad(s.row, s.firstQ, s.len, batch);
+        scanned_ = scanned_ + s.load;
+        scannedRow_[s.row] = scannedRow_[s.row] + s.load;
 
         inFlight[s.group] = inFlight[s.group] - 1;
         outstanding = outstanding - 1;
@@ -1286,8 +1305,9 @@ int MasterNode::run() {
             recallSum = recallSum + truth_.recallAt(q, spread[j], k);
             r2Sum = r2Sum + truth_.r2Of(q, spread[j], k);
 
-            // 这个参考对照比它检查的搜索还贵（单机、不剪枝），跑上千条查询时
-            // 它就是大部分墙钟时间，所以可以关掉。
+            // This reference costs more than the search it checks (one
+            // machine, no pruning), and over a thousand queries it is most of
+            // the wall clock, which is why it can be turned off.
             if (!cfg_.check) {
                 continue;
             }

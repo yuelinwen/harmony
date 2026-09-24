@@ -41,6 +41,7 @@ public:
         rowBase_ = id;
         batch_ = 1;
         sendSlots_ = 1;
+        nprobe_ = 0;
         k_ = cfg.k;
         total_ = 0.0;
         idle_ = 0.0;

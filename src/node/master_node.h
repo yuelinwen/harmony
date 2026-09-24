@@ -167,6 +167,16 @@ public:
     // exists, to tell the cost model what a given bVec would cost.
     std::vector<double> partitionLoads(int bVec, std::vector<int>* owner) const;
 
+    // How often a cluster was probed in the profiling pass, never below one.
+    //
+    // The floor matters: with --warmup 0 nothing is profiled, every count is
+    // zero, and a weight of zero makes partitionLoads() find no lightest
+    // partition at all -- measured, every cluster went to the first one
+    // (100% / 0% / ... / 0%) at a quarter of the throughput. Treating an
+    // unprofiled workload as "all clusters equally likely" degrades to plain
+    // size-weighted LPT, which is the sensible reading of "do not profile".
+    long clusterHitsOf(int c) const;
+
     // I(pi): the spread of computation across the vector partitions, from how
     // often each cluster was probed and how big it is.
     double imbalanceOf(int bVec, int bDim) const;
