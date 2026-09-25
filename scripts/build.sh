@@ -1,7 +1,6 @@
 #!/bin/bash
 #
-# Builds ./main, and copies it to the other machines when run on the cluster
-# master. Works out the platform itself.
+# Builds ./main on the cluster master, and copies it to the other machines.
 #
 #   scripts/build.sh
 #
@@ -10,24 +9,16 @@
 # lives here rather than in a script of its own. The data files are not
 # copied: only rank 0 opens a file, and the workers get their blocks over MPI.
 #
-# Two platforms are in play and they need different OpenMP flags:
-#
-#   macOS (the laptop)   Apple's clang has no OpenMP of its own, so the flags
-#                        have to point at Homebrew's libomp. Install it with
-#                        `brew install libomp` if the build says it is missing.
-#
-#   Linux (the VMs)      GCC ships OpenMP, so -fopenmp is all it takes.
-#
-# Everything else is identical on both, and the binary produced on one Linux
-# VM runs on all of them -- same distro, same architecture -- so it is enough
-# to build on the master and scp ./main to the others.
+# The cluster machines are one distro on one architecture, so a binary built
+# on the master runs on all of them and one build is enough. This is the only
+# supported place to build: MKL and GCC's OpenMP are both required.
 
 set -e
 
 # run from the project root whichever directory this was called from
 cd "$(dirname "$0")/.."
 
-# ---- flags used on both platforms --------------------------------------
+# ---- compiler flags ----------------------------------------------------
 #
 # -fassociative-math is what makes the distance loop fast. Without it the
 # compiler has to keep the additions in source order, so each one waits on the
@@ -57,51 +48,36 @@ FLAGS="$FLAGS -fassociative-math -fno-signed-zeros -fno-trapping-math"
 # committed -- so the hash would label a week of different runs identically.
 # The digest of the sources actually handed to the compiler cannot.
 
-if command -v sha1sum > /dev/null 2>&1; then SHA=sha1sum; else SHA=shasum; fi
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
-SRC=$(cat main.cpp src/*.h src/*/*.h src/*/*.cpp | $SHA | cut -c1-8)
+SRC=$(cat main.cpp src/*.h src/*/*.h src/*/*.cpp | sha1sum | cut -c1-8)
 FLAGS="$FLAGS -DHARMONY_COMMIT=\"$COMMIT+$SRC\""
 echo "build $COMMIT+$SRC"
 
-# ---- OpenMP, which is where the platforms differ -----------------------
+# GCC ships OpenMP, so this is all it takes.
+FLAGS="$FLAGS -fopenmp"
 
-if [ "$(uname)" = "Darwin" ] && [ -d "$(brew --prefix libomp 2>/dev/null)" ]; then
-    # macOS: clang needs -Xpreprocessor to accept -fopenmp, and libomp has to
-    # be found and linked by hand.
-    OMP_PREFIX=$(brew --prefix libomp)
-    FLAGS="$FLAGS -Xpreprocessor -fopenmp -I$OMP_PREFIX/include -L$OMP_PREFIX/lib -lomp"
-    echo "macOS build (libomp at $OMP_PREFIX)"
-else
-    # Linux: GCC handles it on its own.
-    FLAGS="$FLAGS -fopenmp"
-    echo "Linux build (-fopenmp)"
-fi
-
-# ---- MKL, if it is installed -------------------------------------------
+# ---- MKL, which is required --------------------------------------------
 #
 # Used for one thing: the first dimension slice of a batch, where nothing can
 # be pruned yet and the whole block has to be computed regardless. That case
-# is a dense matrix multiply, which is what MKL is good at -- measured 3.16x
-# over the scalar loop at batch 32, but 0.64x at batch 1, so it only pays off
-# because queries are batched.
+# is a dense matrix multiply, which is what MKL is good at -- measured up to
+# 1.49x end to end on this cluster, the gain falling as the slices get
+# narrower.
 #
 # Later slices never take this path: their purpose is to skip most candidates,
 # which a dense multiply cannot do.
 #
-# x86 only, so a macOS/ARM build simply goes without it.
+# There is no fallback. There used to be one, for building on a laptop, and it
+# hid a real bug for a day: the gemm path was switched off in the code and the
+# scalar numbers looked like MKL simply not helping.
 
-if [ -f /usr/include/mkl/mkl.h ]; then
-    FLAGS="$FLAGS -DHARMONY_USE_MKL -I/usr/include/mkl"
-    LIBS="-lmkl_intel_lp64 -lmkl_sequential -lmkl_core -lpthread -lm"
-    echo "  with MKL (gemm for the first slice)"
-elif [ -n "$MKLROOT" ] && [ -f "$MKLROOT/include/mkl.h" ]; then
-    FLAGS="$FLAGS -DHARMONY_USE_MKL -I$MKLROOT/include -L$MKLROOT/lib/intel64"
-    LIBS="-lmkl_intel_lp64 -lmkl_sequential -lmkl_core -lpthread -lm"
-    echo "  with MKL from \$MKLROOT"
-else
-    LIBS=""
-    echo "  without MKL (scalar loop everywhere)"
+if [ ! -f /usr/include/mkl/mkl.h ]; then
+    echo "MKL is required and /usr/include/mkl/mkl.h is missing." >&2
+    echo "  sudo apt-get install libmkl-dev" >&2
+    exit 1
 fi
+FLAGS="$FLAGS -I/usr/include/mkl"
+LIBS="-lmkl_intel_lp64 -lmkl_sequential -lmkl_core -lpthread -lm"
 
 # mpicxx is a wrapper around the system compiler that adds the MPI include and
 # library paths, so no MPI flags are needed here.
@@ -111,8 +87,6 @@ echo "built ./main"
 # ---- copy to the workers, if this is the master ------------------------
 #
 # The test is whether one of this machine's own addresses is in hosts.txt.
-# On the laptop none of them are, so the build simply stops here even though
-# the file exists.
 #
 # What does *not* travel with the binary are its shared libraries. Linking
 # something new means installing it on the workers too, or they fail at

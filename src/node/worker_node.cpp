@@ -8,9 +8,7 @@
 #include <omp.h>
 #endif
 
-#ifdef HARMONY_USE_MKL
 #include <mkl.h>
-#endif
 
 #include "../comm/messages.h"
 #include "../engine/stopwatch.h"
@@ -87,10 +85,6 @@ long WorkerNode::memoryBytes() const {
 bool WorkerNode::accumulateGemm(int firstQ, int len,
                                 const std::vector<size_t>& qOff,
                                 std::vector<float>& sums, long* alive) {
-#ifndef HARMONY_USE_MKL
-    (void)firstQ; (void)len; (void)qOff; (void)sums; (void)alive;
-    return false;
-#else
     // Which of this block's queries probe each cluster, and where each one's
     // run of totals starts. This is the same walk accumulate() does, read by
     // cluster instead of by query.
@@ -158,7 +152,6 @@ bool WorkerNode::accumulateGemm(int firstQ, int len,
 
     *alive = survivors;
     return true;
-#endif
 }
 
 long WorkerNode::accumulate(int firstQ, int len,
@@ -264,13 +257,9 @@ void WorkerNode::receiveSetup() {
 #ifdef _OPENMP
     threads = omp_get_max_threads();
 #endif
-    const char* kernel = "loop";
-#ifdef HARMONY_USE_MKL
-    kernel = "loop+mkl";
-#endif
     std::cout << "worker " << id_ << " ready: " << vectorCount()
               << " vectors x " << myDim_ << " dims, "
-              << threads << " thread(s), " << kernel << std::endl;
+              << threads << " thread(s), loop+mkl" << std::endl;
 }
 
 int WorkerNode::run() {

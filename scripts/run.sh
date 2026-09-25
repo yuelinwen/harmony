@@ -11,8 +11,8 @@
 #
 # There is no separate command for the master and the workers. mpirun starts
 # every process itself: rank 0 becomes the master, the rest become workers.
-# On a cluster it ssh's into the machines in scripts/hosts.txt to do it, which
-# is why they need passwordless ssh between them.
+# It ssh's into the machines in scripts/hosts.txt to do it, which is why they
+# need passwordless ssh between them.
 
 set -e
 
@@ -35,25 +35,21 @@ fi
 # cores and pack eight processes onto the first one before touching the
 # second. -N 1 also refuses to start if more processes are asked for than
 # there are machines, rather than quietly wrapping round.
-#
-# Locally the processes already share the cores, so one thread each stops them
-# fighting over them.
 HOSTS=scripts/hosts.txt
 
-if [ -f "$HOSTS" ]; then
-    MACHINES=$(grep -c '[^[:space:]]' "$HOSTS")
-    if [ $((WORKERS + 1)) -gt "$MACHINES" ]; then
-        echo "$WORKERS workers needs $((WORKERS + 1)) machines, $HOSTS has $MACHINES" >&2
-        exit 1
-    fi
-    THREADS=$(nproc 2>/dev/null || echo 1)
-    PLACEMENT="--hostfile $HOSTS -N 1"
-    echo "cluster: $WORKERS workers, $THREADS threads each"
-else
-    THREADS=1
-    PLACEMENT="--oversubscribe"
-    echo "local: $WORKERS workers on this machine"
+if [ ! -f "$HOSTS" ]; then
+    echo "$HOSTS is missing - run scripts/setup_cluster.sh first" >&2
+    exit 1
 fi
 
+MACHINES=$(grep -c '[^[:space:]]' "$HOSTS")
+if [ $((WORKERS + 1)) -gt "$MACHINES" ]; then
+    echo "$WORKERS workers needs $((WORKERS + 1)) machines, $HOSTS has $MACHINES" >&2
+    exit 1
+fi
+
+THREADS=$(nproc)
+echo "cluster: $WORKERS workers, $THREADS threads each"
+
 set -x
-mpirun -n $((WORKERS + 1)) $PLACEMENT ./main --threads $THREADS "$@"
+mpirun -n $((WORKERS + 1)) --hostfile "$HOSTS" -N 1 ./main --threads $THREADS "$@"

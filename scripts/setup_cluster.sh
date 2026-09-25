@@ -13,8 +13,8 @@
 # What it does, per machine:
 #   - adds this machine's public key to authorized_keys, because mpirun
 #     starts remote processes over ssh and cannot answer a password prompt
-#   - installs OpenMPI, and MKL if this machine has it, since a binary built
-#     here will expect the same libraries there
+#   - installs OpenMPI and MKL, since the binary is built on the master and
+#     copied over, so it expects the same libraries there
 #   - writes scripts/hosts.txt, one address per line with this machine first
 #
 # The file holds addresses and nothing else. How many processes go on each
@@ -36,8 +36,7 @@ SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -C harmony-mpi >/dev/null
 PUB=$(cat ~/.ssh/id_ed25519.pub)
 
-WANT="libopenmpi-dev openmpi-bin"
-[ -f /usr/include/mkl/mkl.h ] && WANT="$WANT libmkl-dev"
+WANT="libopenmpi-dev openmpi-bin libmkl-dev"
 
 for ip in "$@"; do
     echo "== $ip =="
