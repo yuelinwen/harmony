@@ -316,9 +316,6 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.pruneVector = false;
         } else if (opt == "--loop" && hasValue) {
             cfg.loop = std::atoi(argv[++i]);
-            if (cfg.loop < 1) {
-                cfg.loop = 1;
-            }
         } else if (opt == "--check" && hasValue) {
             cfg.check = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--baseline" && hasValue) {
@@ -387,29 +384,38 @@ inline bool resolveGrid(Config& cfg, int numWorkers) {
         return false;
     }
 
-    // Counts that must be at least one. Every one of these was reachable and
-    // every one of them failed badly rather than loudly: --nprobe 0, --k 0 and
-    // --nlist 0 each segfaulted (an empty TopKHeap's push reads heap_.top(),
-    // an empty centroid array gets indexed), and --batch 0 turned the batch
-    // loop into `start += 0` and hung looking like it was computing.
+    // Counts with a floor. Every one of these was reachable and every one of
+    // them failed badly rather than loudly: --nprobe 0, --k 0 and --nlist 0
+    // each segfaulted (an empty TopKHeap's push reads heap_.top(), an empty
+    // centroid array gets indexed), --batch 0 turned the batch loop into
+    // `start += 0` and hung looking like it was computing, and --warmup -1
+    // reached `std::vector probes(-1)` and aborted on length_error.
+    //
+    // The last three floor at 0 rather than 1 because "none" is a real
+    // setting for them: --warmup 0 skips profiling and leaves the split to
+    // cluster size alone, --prewarm 0 starts every query from an empty
+    // threshold. A negative is a typo, and used to be a silent no-op.
     //
     // Checked here rather than in parseArgs so one place covers them all, and
     // so the message names the flag the way the user typed it.
-    struct Least { const char* flag; int value; };
+    struct Least { const char* flag; int value; int floor; };
     Least least[] = {
-        {"--nlist", cfg.nlist},
-        {"--nprobe", cfg.nprobe},
-        {"--k", cfg.k},
-        {"--nq", cfg.nq},
-        {"--batch", cfg.batch},
-        {"--iters", cfg.iters},
-        {"--loop", cfg.loop},
-        {"--threads", cfg.threads},
+        {"--nlist", cfg.nlist, 1},
+        {"--nprobe", cfg.nprobe, 1},
+        {"--k", cfg.k, 1},
+        {"--nq", cfg.nq, 1},
+        {"--batch", cfg.batch, 1},
+        {"--iters", cfg.iters, 1},
+        {"--loop", cfg.loop, 1},
+        {"--threads", cfg.threads, 1},
+        {"--warmup", cfg.warmup, 0},
+        {"--prewarm", cfg.prewarm, 0},
+        {"--prewarmlists", cfg.prewarmLists, 0},
     };
     for (size_t i = 0; i < sizeof(least) / sizeof(least[0]); ++i) {
-        if (least[i].value < 1) {
-            std::cerr << least[i].flag << " must be at least 1, got "
-                      << least[i].value << std::endl;
+        if (least[i].value < least[i].floor) {
+            std::cerr << least[i].flag << " must be at least " << least[i].floor
+                      << ", got " << least[i].value << std::endl;
             return false;
         }
     }
