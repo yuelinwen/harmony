@@ -34,32 +34,40 @@ void IvfIndex::build(const Dataset& base, int nlist, int iterations,
     // everything below it touches all n.
     Stopwatch watch;
 
-    // --- 1. init: copy nlist random vectors as starting centroids ---
+    // --- 1. init: nlist distinct vectors as starting centroids ---
+    //
+    // The order every draw below comes from: shuffled once, so taking a
+    // prefix is a sample without replacement. Picking with replacement
+    // (rand() % n, which this did) can start two centroids on the same
+    // vector, and the iterations only pull them apart if some third vector
+    // happens to land between them -- until then the pair splits one
+    // cluster's worth of points and one cluster is effectively lost.
     std::srand(42);   // fixed seed -> same clustering every run (reproducible)
+    std::vector<int> train(n);
+    for (int i = 0; i < n; ++i) {
+        train[i] = i;
+    }
+    for (int i = n - 1; i > 0; --i) {
+        int j = std::rand() % (i + 1);
+        int t = train[i];
+        train[i] = train[j];
+        train[j] = t;
+    }
+
     centroids_.resize((size_t)nlist_ * dim_);
     for (int c = 0; c < nlist_; ++c) {
-        int pick = std::rand() % n;
-        const float* v = base.vec(pick);
+        // % n only matters when nlist > n, which is a degenerate index but
+        // must not read past the end of the shuffle.
+        const float* v = base.vec(train[c % n]);
         for (int j = 0; j < dim_; ++j) {
             centroids_[(size_t)c * dim_ + j] = v[j];
         }
     }
 
-    // Which vectors the rounds below train on: all of them, or a sample.
-    // Drawn by shuffling once and taking a prefix, so a vector cannot be
-    // picked twice, and off the same seed so a run is reproducible.
-    std::vector<int> train(n);
-    for (int i = 0; i < n; ++i) {
-        train[i] = i;
-    }
+    // Which vectors the rounds below train on: all of them, or a prefix of
+    // the same shuffle.
     long cap = (long)nlist_ * perCentroid;
     if (perCentroid > 0 && cap < n) {
-        for (int i = n - 1; i > 0; --i) {
-            int j = std::rand() % (i + 1);
-            int t = train[i];
-            train[i] = train[j];
-            train[j] = t;
-        }
         train.resize((size_t)cap);
         std::cout << "kmeans trains on " << train.size() << " of " << n
                   << " vectors" << std::endl;
