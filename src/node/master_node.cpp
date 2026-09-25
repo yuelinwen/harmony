@@ -1,9 +1,7 @@
 #include "master_node.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <iostream>
 #include <string>
 
@@ -46,22 +44,18 @@ void MasterNode::buildIndex(int nlist, int iterations) {
     std::cout << "\n===== 2. index =====" << std::endl;
 
     std::string path = indexPath(nlist, iterations);
-    auto t0 = std::chrono::steady_clock::now();
+    Stopwatch watch;
 
     if (cfg_.cache && index_.load(path, base_.getN(), base_.getDim())) {
-        auto t1 = std::chrono::steady_clock::now();
         std::cout << "loaded index from " << path << " ("
-                  << std::chrono::duration<double>(t1 - t0).count() << " s)"
-                  << std::endl;
+                  << watch.seconds() << " s)" << std::endl;
         buildSizePrefix();
         return;
     }
 
     std::cout << "building index (nlist=" << nlist << ")" << std::endl;
     index_.build(base_, nlist, iterations, cfg_.trainPoints);
-    auto t1 = std::chrono::steady_clock::now();
-    std::cout << "build time: "
-              << std::chrono::duration<double>(t1 - t0).count() << " s" << std::endl;
+    std::cout << "build time: " << watch.seconds() << " s" << std::endl;
 
     buildSizePrefix();
 
@@ -1285,11 +1279,11 @@ int MasterNode::run() {
     for (int start = 0; start < nq; start += cfg_.batch) {
         int count = (start + cfg_.batch <= nq) ? cfg_.batch : (nq - start);
 
-        auto t0 = std::chrono::steady_clock::now();
+        Stopwatch batchWatch;
         std::vector<std::vector<Candidate>> spread = queryPipeline(start, count, nprobe, k);
-        auto t1 = std::chrono::steady_clock::now();
+        double took = batchWatch.seconds();
         if (!warmup) {
-            seconds = seconds + std::chrono::duration<double>(t1 - t0).count();
+            seconds = seconds + took;
         }
 
         // Between batches, with the chains empty. Outside the timed section:

@@ -418,17 +418,8 @@ int WorkerNode::run() {
             // before the pass that gets reported, so an earlier --loop pass or
             // an earlier --nprobes value does not leak into these numbers.
             if (job[0] == JOB_RESET) {
-                total_ = run.seconds();
                 aliveAtStage_.assign(bDim_, 0);
-                idle_ = 0.0;
-                recv_ = 0.0;
-                compute_ = 0.0;
-                send_ = 0.0;
-                setup_ = 0.0;
-                poll_ = 0.0;
-                admin_ = 0.0;
-                jobs_ = 0;
-                total_ = 0.0;
+                clearCounters();
                 run.reset();
                 continue;
             }

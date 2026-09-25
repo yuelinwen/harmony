@@ -1,7 +1,6 @@
 #ifndef HARMONY_NODE_WORKER_NODE_H
 #define HARMONY_NODE_WORKER_NODE_H
 
-#include <algorithm>
 #include <utility>
 #include <vector>
 
@@ -43,15 +42,7 @@ public:
         sendSlots_ = 1;
         nprobe_ = 0;
         k_ = cfg.k;
-        total_ = 0.0;
-        idle_ = 0.0;
-        recv_ = 0.0;
-        compute_ = 0.0;
-        send_ = 0.0;
-        setup_ = 0.0;
-        poll_ = 0.0;
-        admin_ = 0.0;
-        jobs_ = 0;
+        clearCounters();
     }
     ~WorkerNode() override = default;
 
@@ -154,15 +145,34 @@ private:
     int sendSlots_; // outgoing buffers to rotate through, from the master
     int k_;         // neighbours to keep when this worker ends a chain
 
+    // Back to zero, for the constructor and for JOB_RESET, which starts a
+    // counted stretch and has to forget whatever ran before it.
+    void clearCounters() {
+        total_ = 0.0;
+        idle_ = 0.0;
+        recv_ = 0.0;
+        compute_ = 0.0;
+        send_ = 0.0;
+        setup_ = 0.0;
+        poll_ = 0.0;
+        admin_ = 0.0;
+        jobs_ = 0;
+    }
+
     // Where the run went, in seconds. Reported at shutdown and printed by the
     // master as one row per worker (paper Fig. 9).
     //
-    // The six below are meant to add up to total_ with only a little left
+    // The seven below are meant to add up to total_ with only a little left
     // over. They did not at first: only compute/idle/recv/send existed and
     // between 15% and 45% of the run was unaccounted for, which would have
     // made Fig. 9 mostly one unlabelled block. setup_ and poll_ are that
     // remainder, and they are named rather than subtracted because the first
     // of them turned out to be avoidable work rather than measurement noise.
+    //
+    // The split is by waiting versus working, not by which message arrived:
+    // every block on the master goes to idle_, whichever job it was waiting
+    // for. Splitting it by message type instead just moved the same seconds
+    // between idle_ and admin_ and made admin_ look like a new cost.
     double total_;     // first job to shutdown
     double idle_;      // blocked waiting for the master to hand over a job
     double recv_;      // blocked receiving partial sums from upstream
@@ -170,8 +180,8 @@ private:
     double send_;      // blocked reclaiming a send slot
     double setup_;     // opening a block: its buffer layout and its buffer
     double poll_;      // asking whether anything has arrived, and taking it
-    double admin_;     // waiting for the master's stats / re-plan messages,
-                       // so mostly master-side serial work between batches
+    double admin_;     // handling the master's stats / re-plan messages, not
+                       // the wait for them
     long jobs_;        // clusters served
 
     // Survivors by position in the chain, not by worker: rotation makes a

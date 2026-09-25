@@ -8,9 +8,9 @@ namespace harmony {
 // Elapsed wall time. steady_clock, so a clock adjustment cannot make an
 // interval come out negative.
 //
-// Used to split a worker's run into the four things it can be doing -- idle,
-// receiving, computing, sending -- which is the breakdown behind the paper's
-// Fig. 9.
+// Used to split a worker's run into the things it can be doing -- idle,
+// receiving, computing, sending, and three smaller ones -- which is the
+// breakdown behind the paper's Fig. 9.
 class Stopwatch {
 public:
     Stopwatch() : start_(std::chrono::steady_clock::now()) {}

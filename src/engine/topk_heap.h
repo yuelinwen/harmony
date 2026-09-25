@@ -39,21 +39,19 @@ public:
 
     // Offers a candidate to the heap. Kept only if it is among the K best.
     void push(int id, float dist) {
-        if ((int)heap_.size() < k_) {
-            Candidate c;
-            c.id = id;
-            c.dist = dist;
-            heap_.push(c);
-            return;
-        }
-
-        if (dist < heap_.top().dist) {
+        if ((int)heap_.size() >= k_) {
+            // Negated rather than written as >=, so that a dist that
+            // compares unordered against the top is rejected, exactly as the
+            // straight `dist < top` admission test used to reject it.
+            if (!(dist < heap_.top().dist)) {
+                return;   // no better than the K already kept
+            }
             heap_.pop();
-            Candidate c;
-            c.id = id;
-            c.dist = dist;
-            heap_.push(c);
         }
+        Candidate c;
+        c.id = id;
+        c.dist = dist;
+        heap_.push(c);
     }
 
     // A threshold to use until the heap has K of its own. Prewarming measures
