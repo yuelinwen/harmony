@@ -43,6 +43,9 @@ public:
         bVec_ = 1;
         blockCount_ = 1;
         pipeline_ = true;
+        pruneVector_ = true;
+        myRow_ = 0;
+        count_ = 0;
         nprobe_ = 0;
         k_ = cfg.k;
         clearCounters();
@@ -117,6 +120,14 @@ private:
     int bVec_;        // vector partitions in the grid, which blockTag() needs
     int blockCount_;  // query blocks a group is cut into (--block)
     bool pipeline_;   // false: one block open at a time (--disablepipeline)
+    bool pruneVector_;  // false: take every stage at once, no Fig. 5a barrier
+    int myRow_;         // which vector partition this worker's row holds
+    int count_;         // queries in the batch being run
+
+    // Which query group reaches this row at which stage. Built here from
+    // bVec alone, identically to the master's -- that is what makes the
+    // schedule something a worker knows rather than something it is told.
+    SearchOrder groupOrder_;
 
     // This worker's rows of the chain table (engine/search_order.h), given by
     // the master at setup: for each item, who it takes the partial sums from,

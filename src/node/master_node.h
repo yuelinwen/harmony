@@ -122,13 +122,13 @@ public:
                         const std::vector<QueryState>& batch,
                         std::vector<TopKHeap>& heaps);
 
-    // Algorithm 1, lines 6-12. Hands query group g, on the `stage`-th of the
-    // vector partitions it visits, to every worker of row `row`, with the
-    // thresholds to prune it against -- and returns. The workers cut it into
-    // blocks themselves, pass the running totals down the chain, and only the
-    // last of each chain reports back.
-    void dispatchGroup(int row, int g, int stage, int gStart, int gLen,
-                       const std::vector<TopKHeap>& heaps);
+    // Algorithm 1, lines 6-12. Tells a row to start on the query group that
+    // is due there, by sending the thresholds to prune it against -- and
+    // returns. That the group is due, which one it is, and how it splits into
+    // blocks the workers already know. They pass the running totals down the
+    // chain and only the last of each chain reports back.
+    void sendThresholds(int row, int gStart, int gLen,
+                        const std::vector<TopKHeap>& heaps);
 
     // Candidates a block of queries contributes in one vector partition, in
     // the order the workers of that row will lay them out.

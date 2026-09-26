@@ -204,8 +204,8 @@ long WorkerNode::accumulate(int firstQ, int len,
 }
 
 void WorkerNode::receiveSetup() {
-    int setup[8];
-    MPI_Recv(setup, 8, MPI_INT, MASTER_RANK, TAG_SETUP,
+    int setup[9];
+    MPI_Recv(setup, 9, MPI_INT, MASTER_RANK, TAG_SETUP,
              MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
     myDim_ = setup[0];
@@ -216,6 +216,7 @@ void WorkerNode::receiveSetup() {
     bVec_ = setup[5];
     blockCount_ = setup[6];
     pipeline_ = (setup[7] != 0);
+    pruneVector_ = (setup[8] != 0);
     if (sendSlots_ < 1) {
         sendSlots_ = 1;
     }
@@ -224,7 +225,12 @@ void WorkerNode::receiveSetup() {
     // on the job, since clusters start at different columns.
     myCol_ = (id_ - 1) % bDim_;
     rowBase_ = id_ - myCol_;
+    myRow_ = (id_ - 1) / bDim_;
     aliveAtStage_.assign(bDim_, 0);
+
+    // The same rotation the master builds, from the same one number. Neither
+    // side sends it: at stage s the group on this row is stepsOf(myRow_)[s].
+    groupOrder_ = SearchOrder(bVec_, bVec_, true);
 
     // The chain table, built by the master and handed over row by row. A
     // worker never builds it itself: only the master can change it, which is
@@ -332,12 +338,62 @@ int WorkerNode::run() {
     };
     std::vector<Todo> todo;
 
+    // Stages of the current batch still to be taken. A batch is bVec of
+    // them, each bringing one query group to this row.
+    int stagesLeft = 0;
+
     while (!done) {
-        // ---- 1. take every job already waiting, and block only when there
+        // ---- 1. take the next stage of the batch, if one is due ----
+        //
+        // Nothing announces it. After JOB_QUERY there are exactly bVec
+        // stages, and the group order says which query group each of them
+        // brings to this row; the group's queries, its blocks, and their tags
+        // follow from that (comm/messages.h). All that arrives is the
+        // thresholds.
+        //
+        // Only once the previous stage is finished, which is the vector-level
+        // barrier (Fig. 5a) seen from this side: the next partition starts
+        // from a threshold this one tightened. With --disablevectorpruning
+        // every stage is taken as soon as it arrives instead, which is what
+        // the master does on its side too.
+        if (stagesLeft > 0 &&
+            (!pruneVector_ || (pend.empty() && todo.empty()))) {
+            int s = bVec_ - stagesLeft;
+            stagesLeft = stagesLeft - 1;
+
+            int g = groupOrder_.stepsOf(myRow_)[s];
+            int gStart = (int)(((long)g * count_ + bVec_ - 1) / bVec_);
+            int gEnd = (int)(((long)(g + 1) * count_ + bVec_ - 1) / bVec_);
+            int gLen = gEnd - gStart;
+
+            if (gLen > 0) {
+                // Blocked on the master, which sends this once the row before
+                // has finished with the group -- so it is waiting, not work.
+                phase.reset();
+                MPI_Recv(&thresholds_[gStart], gLen, MPI_FLOAT, MASTER_RANK,
+                         TAG_THRESHOLD, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                idle_ = idle_ + phase.seconds();
+
+                for (int b = 0; b < blockCount_; ++b) {
+                    Todo t;
+                    t.firstQ = gStart + (int)((long)b * gLen / blockCount_);
+                    int endQ = gStart + (int)((long)(b + 1) * gLen / blockCount_);
+                    t.len = endQ - t.firstQ;
+                    if (t.len <= 0) {
+                        continue;
+                    }
+                    t.item = b % bDim_;
+                    t.tag = blockTag(g, s, b, bVec_, blockCount_);
+                    todo.push_back(t);
+                }
+            }
+        }
+
+        // ---- 2. take every job already waiting, and block only when there
         //         is nothing open to work on ----
         while (true) {
             int waiting = 1;
-            if (!pend.empty() || !todo.empty()) {
+            if (!pend.empty() || !todo.empty() || stagesLeft > 0) {
                 // MPI: peek rather than block -- there is real work in hand
                 phase.reset();
                 MPI_Iprobe(MASTER_RANK, TAG_JOB, MPI_COMM_WORLD, &waiting,
@@ -356,7 +412,7 @@ int WorkerNode::run() {
             // open this receive is still time spent, just not time lost --
             // it belongs to dispatch, not to waiting.
             double took = phase.seconds();
-            bool holding = !pend.empty() || !todo.empty();
+            bool holding = !pend.empty() || !todo.empty() || stagesLeft > 0;
             double waited = holding ? 0.0 : took;
             if (holding) {
                 poll_ = poll_ + took;
@@ -428,8 +484,11 @@ int WorkerNode::run() {
             }
 
             if (job[0] == JOB_QUERY) {
-                int count = job[1];
+                count_ = job[1];
+                int count = count_;
                 nprobe_ = job[2];
+                stagesLeft = bVec_;   // a batch is bVec stages, and no job
+                                      // will say so again
                 queries_.resize((size_t)batch_ * myDim_);
                 MPI_Recv(queries_.data(), (int)queries_.size(), MPI_FLOAT,
                          MASTER_RANK, TAG_QUERY, MPI_COMM_WORLD,
@@ -445,41 +504,14 @@ int WorkerNode::run() {
                 continue;
             }
 
-            // ---- one query group against one vector partition ----
-            //
-            // The whole group, in one message. What its blocks are, which
-            // column each enters the row at, and the tag each carries are
-            // worked out here from what this worker already holds -- the
-            // batch's probe lists, the chain table from setup, and blockTag()
-            // -- which is the same arithmetic the master does on its side.
-            // Opening them is step 2; this only decides what they are.
-            int gStart = job[1];
-            int gLen = job[2];
-            int g = job[3];
-            int stage = job[4];
-
-            MPI_Recv(&thresholds_[gStart], gLen, MPI_FLOAT, MASTER_RANK,
-                     TAG_THRESHOLD, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-            for (int b = 0; b < blockCount_; ++b) {
-                Todo t;
-                t.firstQ = gStart + (int)((long)b * gLen / blockCount_);
-                int endQ = gStart + (int)((long)(b + 1) * gLen / blockCount_);
-                t.len = endQ - t.firstQ;
-                if (t.len <= 0) {
-                    continue;
-                }
-                t.item = b % bDim_;
-                t.tag = blockTag(g, stage, b, bVec_, blockCount_);
-                todo.push_back(t);
-            }
+            // Nothing else reaches a worker during a batch.
         }
 
         if (done) {
             break;
         }
 
-        // ---- 2. open what there is room for ----
+        // ---- 3. open what there is room for ----
         //
         // Normally every named block at once, so the wait for one block's
         // upstream overlaps another block's arithmetic. One at a time under
@@ -553,7 +585,7 @@ int WorkerNode::run() {
             continue;
         }
 
-        // ---- 3. work on whichever open block can be worked on ----
+        // ---- 4. work on whichever open block can be worked on ----
         int pick = -1;
         for (size_t i = 0; i < pendReq.size(); ++i) {
             if (pendReq[i] == MPI_REQUEST_NULL) {

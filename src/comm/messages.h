@@ -15,11 +15,14 @@ namespace harmony {
 const int MASTER_RANK = 0;
 
 // startup
-// int[8]: myDim, nClusters (this row), bDim, batch, sendSlots, bVec, block,
-// pipeline.
+// int[9]: myDim, nClusters (this row), bDim, batch, sendSlots, bVec, block,
+// pipeline, vectorPruning.
 //
-// The last three are what let a worker expand one group message into all of
-// that group's blocks by itself, instead of being told about each one.
+// The last four are the shape of the schedule. With them a worker rebuilds
+// the group order itself and walks the batch without being told anything
+// about it -- which query group reaches it at which stage, where that group
+// starts, how it splits into blocks, and what tag each block carries. The
+// master sends only the thresholds.
 //
 // sendSlots is how many blocks the master can have in flight, and the worker
 // sizes its outgoing buffer pool from it. That is an invariant, not a
@@ -49,7 +52,13 @@ const int TAG_PROBES    = 9;   // int[count * nprobe]: every query's clusters,
                                // nearest first. Sent once per batch. A worker
                                // needs them to lay out a block's buffer the
                                // same way its neighbours in the chain do.
-const int TAG_THRESHOLD = 7;   // float[gLen]: tau^2 per query, see JOB_GROUP
+// float[gLen]: tau^2 for one query group, sent when the row it is on is
+// about to start it. Nothing announces it: after JOB_QUERY there are exactly
+// bVec stages, and a worker knows from the group order which group each of
+// them brings. This is the message the vector-level pipeline runs on -- a
+// group's next partition starts from a threshold its last one tightened
+// (Fig. 5a) -- and it is the only thing the master sends during a batch.
+const int TAG_THRESHOLD = 7;
 const int TAG_STATS     = 10;  // long[bDim]: survivors per chain position
 const int TAG_TIMES     = 12;  // double[WORKER_TIMES]: worker's wall time
 
@@ -114,8 +123,8 @@ inline int tagTopk(int slot) { return TAG_CHAIN_BASE + 2 * slot + 1; }
 //     threshold from an empty heap prunes nothing rather than everything.
 const float PRUNED = 1e38f;
 
-// TAG_JOB carries int[5] = {what, ...}, the rest reading per `what`.
-const int JOB_GROUP    = -5;   // what: a query group, fields below
+// TAG_JOB carries int[5] = {what, ...}, the rest reading per `what`. Only
+// between batches, or to open one: the search itself sends no jobs at all.
 const int JOB_QUERY    = -1;   // the batch's query slices follow
 const int JOB_SHUTDOWN = -2;   // stop and exit
 // Zero the pruning counters. With --loop the query set is run several times;
@@ -130,27 +139,23 @@ const int JOB_STATS    = -4;
 // between batches, when nothing is on the chain: a block carries only its
 // item, and both ends of a hop have to agree on what that item means.
 const int JOB_ORDER    = -6;
-// JOB_GROUP carries int[5] = {JOB_GROUP, gStart, gLen, g, stage}, followed by
-// float[gLen] of thresholds over TAG_THRESHOLD.
+// How a worker knows what to do during a batch, given that nothing tells it.
 //
-// It hands a worker one query group against one vector partition (paper
-// §4.2.2, Fig. 4b) and nothing smaller. gStart and gLen name the group, a
-// contiguous run of the batch; g and stage say which group it is and which of
-// its bVec partitions this visit is, which is all blockTag() needs.
+// A batch is bVec stages. At stage s, the query group reaching row r is
+// groupOrder_.stepsOf(r)[s] -- a rotation both sides build from bVec alone,
+// so at every stage the mapping group -> row is a permutation and no row is
+// idle (paper §4.2.2, Fig. 4b). The group's queries are the contiguous run
+// [ceil(g*count/bVec), ceil((g+1)*count/bVec)), the same split the master
+// makes. It is cut into `block` query blocks by the same formula, block b
+// enters the row at column b % bDim so no worker is always the first stop --
+// the one that can prune nothing (paper §4.3) -- and carries blockTag(g, s,
+// b). A block this partition holds nothing for adds up to zero on both sides
+// and simply does not happen.
 //
-// The worker cuts the group into `block` query blocks with the same formula
-// the master uses, works out for each one which column it enters the row at
-// (b % bDim, so no worker is always the first stop -- the one that can prune
-// nothing, paper §4.3), and walks the queries' probe lists to lay out the
-// running totals. A block that this partition holds nothing for comes out
-// empty on both sides and simply does not happen.
-//
-// This is one message where there used to be one per block plus one per
-// group. At 1x8 with --block 128 that is 1040 messages a batch down to 16.
-//
-// The thresholds ride along because §5 has the master "periodically update
-// pruning thresholds, which are broadcast to workers", and a group's whole
-// partition shares one snapshot of them anyway.
+// All of which is why the search sends no jobs. The master dispatched a
+// message per block once, then a message per group; now the only thing it
+// sends during a batch is the thresholds. At 1x8 with --block 128 that is
+// 1040 messages a batch down to 8.
 
 // The largest chain tag this layout will use has to be one MPI accepts. The
 // standard only promises 32767, and the tags here stay far below that, so

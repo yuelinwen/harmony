@@ -41,6 +41,12 @@ public:
     // The workers handling this item, first stop first.
     const std::vector<int>& chain(int item) const { return chain_[item]; }
 
+    // The items this worker takes, in the order it takes them: entry t is
+    // the item it handles at step t. The inverse of chain(), and the table a
+    // worker reads to know which query group reaches it at which stage
+    // without being told (the sample's workerSearchOrder).
+    const std::vector<int>& stepsOf(int worker) const { return step_[worker]; }
+
     // One worker's row of the table, which is what gets handed to it over
     // MPI: entry i is who it passes item i to, or takes item i from, and -1
     // means it is the end or the start of that item's chain.
@@ -77,15 +83,19 @@ private:
         link();
     }
 
-    // next/prev tables, read off the chains.
+    // next/prev/step tables, read off the chains.
     void link() {
         next_.assign(workers_, std::vector<int>(items_, -1));
         prev_.assign(workers_, std::vector<int>(items_, -1));
+        step_.assign(workers_, std::vector<int>(items_, -1));
         for (int i = 0; i < items_; ++i) {
             const std::vector<int>& c = chain_[i];
             for (int p = 0; p + 1 < (int)c.size(); ++p) {
                 next_[c[p]][i] = c[p + 1];
                 prev_[c[p + 1]][i] = c[p];
+            }
+            for (int p = 0; p < (int)c.size(); ++p) {
+                step_[c[p]][p] = i;
             }
         }
     }
@@ -95,6 +105,7 @@ private:
     std::vector<std::vector<int>> chain_;
     std::vector<std::vector<int>> next_;
     std::vector<std::vector<int>> prev_;
+    std::vector<std::vector<int>> step_;
 };
 
 }  // namespace harmony
