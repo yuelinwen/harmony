@@ -89,15 +89,15 @@ private:
     // has to be computed. Grouped by cluster instead of by query, that is a
     // dense matrix multiply, which is what MKL is for (paper §5).
     //
-    // Always taken when MKL is compiled in; returns false when it is not, so
-    // the caller falls back to the scalar loop. There is no switch because
-    // measured on the cluster it is never worse: +49% QPS at myDim 128, +22%
-    // at 64, and inside the noise at 32 and 16, the gain shrinking with the
-    // slice width exactly as arithmetic intensity says it should. On true,
-    // alive holds the survivor count, as accumulate() returns.
-    bool accumulateGemm(int firstQ, int len,
+    // Always taken for a chain head: MKL is a hard requirement of the build,
+    // so there is nothing to fall back to. No switch either, because measured
+    // on the cluster it is never worse: +49% QPS at myDim 128, +22% at 64,
+    // and inside the noise at 32 and 16, the gain shrinking with the slice
+    // width exactly as arithmetic intensity says it should. Returns the
+    // survivor count, like accumulate().
+    long accumulateGemm(int firstQ, int len,
                         const std::vector<size_t>& qOff,
-                        std::vector<float>& sums, long* alive);
+                        std::vector<float>& sums);
 
     // Scratch for the above: byCluster_[bi] lists the queries of the current
     // block that probe cluster bi, and where each one's run starts in sums.

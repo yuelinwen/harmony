@@ -99,31 +99,33 @@ public:
 
     // Algorithm 1, lines 19-23. Runs a batch of queries, the paper's
     // QueryBatch: those probing the same cluster share one visit to it. One
-    // heap per query, unlike line 20 -- see CLAUDE.md.
+    // heap per query, where line 20 reads as one heap for the whole set --
+    // a shared heap would prune one query against another's neighbours.
     std::vector<std::vector<Candidate>> queryPipeline(int firstQuery, int count,
                                                       int nprobe, int k);
 
-    // Algorithm 1, lines 1-5. Seeds the heap with real distances so there is
-    // a threshold to prune against from the very first candidate. Returns how
-    // many it computed.
+    // Algorithm 1, lines 1-5. Seeds the heap's threshold from real distances,
+    // so there is something to prune against from the very first candidate.
     void prewarmHeap(const float* query, QueryState& state, TopKHeap& heap);
 
     // Algorithm 1, lines 13-18. Runs the clusters of every vector partition
     // through the dimension pipeline and pushes the survivors into the heaps.
     //
-    // work[g][r] holds the clusters of vector partition r that query group g
-    // probes. Group g visits the partitions in the order r = (g + stage) %
-    // bVec, one stage at a time, so by the time it reaches its second
-    // partition its heaps already carry the first one's distances (Fig. 5a).
+    // groupMembers[g] holds the batch positions of query group g, a
+    // contiguous run. Group g visits the vector partitions in the order
+    // groupOrder_ gives it, one at a time, so by the time it reaches its
+    // second partition its heaps already carry the first one's distances
+    // (Fig. 5a).
     // Groups advance independently -- at any stage the mapping group -> row is
     // a permutation, so every row stays busy.
     void vectorPipeline(const std::vector<std::vector<int>>& groupMembers,
                         const std::vector<QueryState>& batch,
                         std::vector<TopKHeap>& heaps);
 
-    // Algorithm 1, lines 6-12. Sends one cluster to every worker in its row
-    // and returns; the workers pass the running totals down the chain and only
-    // the last reports back. `members` are the batch positions that probed it.
+    // Algorithm 1, lines 6-12. Sends one block of queries -- [firstQ,
+    // firstQ+len) of the batch -- to every worker in row `row` and returns;
+    // they pass the running totals down the chain and only the last reports
+    // back. `item` picks the chain, `slot` names its tags.
     void dispatchBlock(int row, int firstQ, int len, int item, int slot);
 
     // One query group's thresholds to the row about to work on it (paper §5).
@@ -183,7 +185,8 @@ public:
 
     // Share of the distance work still done when the dimensions are cut into
     // bDim slices: more slices, more chances to stop early. Measured values,
-    // and a term the paper's model does not have -- see CLAUDE.md.
+    // and a term the paper's C(pi,Q) does not have -- it prices the work
+    // before pruning, so without this every extra slice looks like pure cost.
     double pruneFactor(int bDim) const;
 
     // C(pi,Q): computation, communication, and the imbalance penalty, all in
@@ -241,7 +244,8 @@ private:
     SearchOrder chainOrder_;
     SearchOrder groupOrder_;
 
-    // [total, idle, recv, compute, send, jobs] per worker, filled by shutdown()
+    // WORKER_TIMES numbers per worker, in the order comm/messages.h lists
+    // them, filled by collectStats().
     std::vector<std::vector<double>> workerTimes_;
 
     // Wall time from the start of run(), so a CSV row can say how long the

@@ -322,6 +322,11 @@ void MasterNode::warmupPlan(int queries, int nprobe) {
     }
 }
 
+long MasterNode::clusterHitsOf(int c) const {
+    long hits = clusterHits_.empty() ? 1 : clusterHits_[c];
+    return (hits < 1) ? 1 : hits;
+}
+
 // Longest-processing-time first: heaviest cluster to whichever partition is
 // lightest so far. Round-robin ignores that kmeans produces clusters of very
 // different sizes and that queries do not visit them equally often, so one
@@ -332,11 +337,6 @@ void MasterNode::warmupPlan(int queries, int nprobe) {
 //
 // A cluster's weight is how often it is probed times how many vectors it
 // holds, which is the number of distance computations it brings.
-long MasterNode::clusterHitsOf(int c) const {
-    long hits = clusterHits_.empty() ? 1 : clusterHits_[c];
-    return (hits < 1) ? 1 : hits;
-}
-
 std::vector<double> MasterNode::partitionLoads(int bVec,
                                                std::vector<int>* owner) const {
     int nlist = index_.getNlist();
@@ -495,9 +495,9 @@ void MasterNode::choosePlan() {
 // The worker with rank w sits at row (w-1)/bDim, column (w-1)%bDim of the
 // grid. Rows are vector partitions, columns are dimension slices.
 //
-// Clusters go to rows round-robin (c % bVec), the same simple rule the old
-// vector-only split used. Dimensions are cut evenly across a row, which is
-// what the paper does on a homogeneous cluster (Section 4.2).
+// Clusters go to rows by weight -- partitionLoads(), longest-processing-time
+// first. Dimensions are cut evenly across a row, which is what the paper does
+// on a homogeneous cluster (Section 4.2).
 void MasterNode::splitGrid(int bVec, int bDim) {
     bVec_ = bVec;
     bDim_ = bDim;
@@ -505,20 +505,8 @@ void MasterNode::splitGrid(int bVec, int bDim) {
     chainOrder_ = SearchOrder(bDim_, bDim_, true);
     groupOrder_ = SearchOrder(bVec_, bVec_, true);
 
-    // Which partition gets which cluster. Round-robin ignores that kmeans
-    // produces clusters of very different sizes, and that queries do not visit
-    // them equally often, so one partition ends up doing noticeably more work
-    // than another -- and since a query is not done until its slowest
-    // partition reports, that difference is throughput.
-    //
-    // Longest-processing-time first instead: heaviest cluster to whichever
-    // partition is lightest so far. It is the standard greedy for this and
-    // comes within 4/3 of the best possible split. Ties go to the lower
-    // cluster id so a run is reproducible.
-    //
-    // This is the assignment the cost model's I(pi) measures. Until now that
-    // term could only rank grid shapes, since the assignment inside a grid was
-    // fixed; the paper's pi is the partition plan itself (§4.2.1).
+    // This is the assignment the cost model's I(pi) measures -- the paper's pi
+    // is the partition plan itself (§4.2.1), not just the grid shape.
     int nlist = index_.getNlist();
     partitionLoads(bVec_, &clusterOwner_);
 
@@ -564,12 +552,6 @@ void MasterNode::splitGrid(int bVec, int bDim) {
     }
 }
 
-// Each cluster goes only to the workers in its row, and each of those gets
-// only its own slice of the dimensions -- so a worker holds 1/bVec of the
-// vectors x 1/bDim of the dimensions, one block of the paper's grid.
-//
-// The master does the cutting and sends only the slice, so no worker ever
-// holds data it does not own.
 // One column's three rows of the chain table -- next, prev and stage, one
 // entry per item -- which is all a worker needs to know about the order.
 std::vector<int> MasterNode::chainTableFor(int col) const {
@@ -689,6 +671,12 @@ int MasterNode::maxBlocksInFlight() const {
     return bVec_ * perGroup + 1;
 }
 
+// Each cluster goes only to the workers in its row, and each of those gets
+// only its own slice of the dimensions -- so a worker holds 1/bVec of the
+// vectors x 1/bDim of the dimensions, one block of the paper's grid.
+//
+// The master does the cutting and sends only the slice, so no worker ever
+// holds data it does not own.
 void MasterNode::distributeData() {
     std::cout << "\n===== 4. distribute =====" << std::endl;
     Stopwatch watch;
@@ -803,14 +791,6 @@ void MasterNode::shutdown() {
     }
 }
 
-// One row per worker: how much of its run went to computing, and how much to
-// waiting for somebody else. A worker that is mostly idle is being starved by
-// the master; mostly in recv means its upstream is the slow one (paper
-// Fig. 9).
-
-
-
-
 
 // Without this the heap starts empty, worst() is infinite, and nothing can be
 // pruned until a whole block has been through the pipeline (Algorithm 1,
@@ -826,10 +806,9 @@ void MasterNode::shutdown() {
 // the heap already holds. This is what the sample does -- warmUpSearch, then
 // init_result to empty the heap again.
 void MasterNode::prewarmHeap(const float* query, QueryState& state, TopKHeap& heap) {
-    // Spread over the nearest few clusters rather than taking everything from
-    // the first one, as the authors' code does. One cluster can miss: the
-    // nearest centroid is not always where the nearest vectors are, and a seed
-    // drawn only from there gives a loose threshold exactly when it matters.
+    // How many of the query's nearest clusters the seed is drawn from. One by
+    // default, against the ten the authors' code uses: measured, spreading
+    // the same budget wider leaves a looser threshold. See --prewarmlists.
     int lists = cfg_.prewarmLists;
     if (lists > (int)state.clusters.size()) {
         lists = (int)state.clusters.size();
@@ -1111,8 +1090,10 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
         for (int i = 0; i < (int)cl.size(); ++i) {
             probes[(size_t)q * nprobe + i] = cl[i];
         }
-        // a query with fewer than nprobe clusters pads with its last one,
-        // which the workers skip as a repeat
+        // A query with fewer than nprobe clusters pads with -1, which
+        // blockOf() rejects. It must not pad with a real cluster id: the
+        // workers derive a block's buffer layout by walking this list, so a
+        // repeat would reserve the same run of totals twice.
         for (int i = (int)cl.size(); i < nprobe; ++i) {
             probes[(size_t)q * nprobe + i] = -1;
         }

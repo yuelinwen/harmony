@@ -121,6 +121,10 @@ void Metrics::timeBreakdown(double* comm, double* compute,
     *other = *other / n;
 }
 
+// One row per worker: how much of its run went to computing, and how much to
+// waiting for somebody else. A worker that is mostly idle is being starved by
+// the master; mostly in recv means its upstream is the slow one (paper
+// Fig. 9).
 void Metrics::printWorkerTimes() const {
     if (workerTimes.empty()) {
         return;

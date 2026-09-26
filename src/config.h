@@ -200,7 +200,7 @@ inline void printUsage(const char* prog) {
         << "  --disablepruning   turn off dimension-level pruning\n"
         << "                     (drop a candidate past the threshold)\n"
         << "  --disablevectorpruning  turn off vector-level pruning\n"
-        << "                     (tighten the threshold between partitions)\n"        << "  --blocksend <0|1>  wait for each forward to land        (0)\n"
+        << "                     (tighten the threshold between partitions)\n"
         << "  --block <int>      query blocks per group        (from bDim)\n"
         << "                     default keeps about 256/bDim^2 queries in a\n"
         << "                     block: 4 at 8x1, 16 at 4x2, 64 at 2x4,\n"

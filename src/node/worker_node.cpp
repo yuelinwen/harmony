@@ -82,9 +82,9 @@ long WorkerNode::memoryBytes() const {
 //
 // Only here. Later slices skip most candidates, and a dense multiply cannot
 // skip anything, so grouping by cluster would compute what pruning just saved.
-bool WorkerNode::accumulateGemm(int firstQ, int len,
+long WorkerNode::accumulateGemm(int firstQ, int len,
                                 const std::vector<size_t>& qOff,
-                                std::vector<float>& sums, long* alive) {
+                                std::vector<float>& sums) {
     // Which of this block's queries probe each cluster, and where each one's
     // run of totals starts. This is the same walk accumulate() does, read by
     // cluster instead of by query.
@@ -150,18 +150,17 @@ bool WorkerNode::accumulateGemm(int firstQ, int len,
         }
     }
 
-    *alive = survivors;
-    return true;
+    return survivors;
 }
 
 long WorkerNode::accumulate(int firstQ, int len,
                             const std::vector<size_t>& qOff,
                             std::vector<float>& sums, bool first) {
-    long survivors = 0;
-    if (first && accumulateGemm(firstQ, len, qOff, sums, &survivors)) {
-        return survivors;
+    if (first) {
+        return accumulateGemm(firstQ, len, qOff, sums);
     }
 
+    long survivors = 0;
     // One query at a time, walking its probe list and stopping at the
     // clusters this row holds. That walk is the buffer layout: every worker
     // in the row derives the same one, so nobody has to send an index.

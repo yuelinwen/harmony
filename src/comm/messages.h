@@ -85,9 +85,10 @@ inline int tagSums(int slot) { return TAG_CHAIN_BASE + 2 * slot; }
 // cluster's few thousand vectors, which is why this is the hop worth
 // shrinking.
 //
-// The ids are positions within the cluster, not global vector ids -- the
-// master maps them back, and that lets it apply the same prewarm
-// de-duplication it did when it received raw totals.
+// The ids are global vector ids: the tail reads them straight out of the
+// cluster block it holds, so the master pushes them into the heap as they
+// arrive with nothing to map back. There is no de-duplication to do either --
+// prewarm keeps only a threshold, so the heap it hands over is empty.
 inline int tagTopk(int slot) { return TAG_CHAIN_BASE + 2 * slot + 1; }
 
 // A pruned candidate is marked by setting its running sum to this, rather
