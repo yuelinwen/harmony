@@ -1073,6 +1073,21 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
     std::vector<QueryState> batch(count);
     std::vector<TopKHeap> heaps(count, TopKHeap(k));
 
+    // OpenMP: queries are independent here. Each iteration writes only its own
+    // batch[q] and heaps[q], and everything it reads -- the index, the base
+    // and query vectors -- is const, so the values come out the same whatever
+    // the thread count. The loop's implicit barrier still separates this from
+    // the dispatch below, which needs every threshold before it sends any.
+    //
+    // Serial, this cost 32% of throughput at 8x1: one core walking the batch
+    // while eight workers wait for it, and the paper counts centroid
+    // assignment as an ordinary ANNS cost rather than one of Harmony's
+    // (§4.2.2). The sample parallelises both halves the same way
+    // (Index.cpp, findNearNprobeOfCentroidIds and warmUpSearch).
+    //
+    // dynamic, because prewarmHeap's cost follows the size of the cluster its
+    // query lands in.
+    #pragma omp parallel for schedule(dynamic)
     for (int q = 0; q < count; ++q) {
         const float* qv = query_.vec(firstQuery + q);
         batch[q].id = firstQuery + q;
