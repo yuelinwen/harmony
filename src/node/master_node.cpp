@@ -743,6 +743,12 @@ void MasterNode::distributeData() {
 void MasterNode::resetCounters() {
     scanned_ = 0;
     scannedRow_.assign(bVec_, 0);
+    masterTotal_ = 0.0;
+    stage0Seconds_ = 0.0;
+    broadcastSeconds_ = 0.0;
+    dispatchSeconds_ = 0.0;
+    waitSeconds_ = 0.0;
+    mergeSeconds_ = 0.0;
     for (int w = 1; w <= numWorkers_; ++w) {
         int job[5] = {JOB_RESET, 0, 0, 0, 0};
         MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
@@ -859,11 +865,13 @@ long MasterNode::blockLoad(int row, int firstQ, int len,
 // thresholds travel separately (JOB_THRESH) once per partition rather than
 // with every block.
 void MasterNode::dispatchBlock(int row, int firstQ, int len, int item, int slot) {
+    Stopwatch watch;
     for (int col = 0; col < bDim_; ++col) {
         int w = row * bDim_ + col + 1;
         int job[5] = {JOB_BLOCK, firstQ, len, item, slot};
         MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
     }
+    dispatchSeconds_ = dispatchSeconds_ + watch.seconds();
 }
 
 // The thresholds for one query group, to the row about to work on it. Sent
@@ -873,6 +881,7 @@ void MasterNode::dispatchBlock(int row, int firstQ, int len, int item, int slot)
 // §5. Workers keep them between jobs.
 void MasterNode::sendThresholds(int row, int firstQ, int len,
                                 const std::vector<TopKHeap>& heaps) {
+    Stopwatch watch;
     std::vector<float> t(len);
     for (int j = 0; j < len; ++j) {
         // an infinite threshold drops nothing, which is the no-dimension-level
@@ -885,6 +894,7 @@ void MasterNode::sendThresholds(int row, int firstQ, int len,
         MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
         MPI_Send(t.data(), len, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
     }
+    dispatchSeconds_ = dispatchSeconds_ + watch.seconds();
 }
 
 int MasterNode::lastRankOf(int row, int item) const {
@@ -1040,8 +1050,10 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
 
         // MPI: block until any one block reports, whichever it is. This is
         // what lets a slow group not hold up a fast one.
+        Stopwatch watch;
         int index = MPI_UNDEFINED;
         MPI_Waitany(maxInFlight, req.data(), &index, MPI_STATUS_IGNORE);
+        waitSeconds_ = waitSeconds_ + watch.seconds(true);
         if (index == MPI_UNDEFINED) {
             break;
         }
@@ -1058,6 +1070,8 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
             }
         }
 
+        mergeSeconds_ = mergeSeconds_ + watch.seconds();
+
         scanned_ = scanned_ + s.load;
         scannedRow_[s.row] = scannedRow_[s.row] + s.load;
 
@@ -1072,6 +1086,8 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
     // (Algorithm 1 line 20).
     std::vector<QueryState> batch(count);
     std::vector<TopKHeap> heaps(count, TopKHeap(k));
+
+    Stopwatch phase;
 
     // OpenMP: queries are independent here. Each iteration writes only its own
     // batch[q] and heaps[q], and everything it reads -- the index, the base
@@ -1094,6 +1110,7 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
         batch[q].clusters = probesFor(batch[q].id, nprobe, kTestWorkload);
         prewarmHeap(qv, batch[q], heaps[q]);
     }
+    stage0Seconds_ = stage0Seconds_ + phase.seconds(true);
 
     // Every worker gets the batch's query slices and its probe lists once.
     // The probe lists are what let a worker lay out a block's buffer the same
@@ -1142,6 +1159,7 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
         MPI_Send(seed.data(), count, MPI_FLOAT, w,
                  TAG_THRESHOLD, MPI_COMM_WORLD);
     }
+    broadcastSeconds_ = broadcastSeconds_ + phase.seconds(true);
 
     // Stage I: vector-level pipeline (Algorithm 1 lines 21-23).
     //
@@ -1278,6 +1296,7 @@ int MasterNode::run() {
         Stopwatch batchWatch;
         std::vector<std::vector<Candidate>> spread = queryPipeline(start, count, nprobe, k);
         double took = batchWatch.seconds();
+        masterTotal_ = masterTotal_ + took;
         if (!warmup) {
             seconds = seconds + took;
         }
@@ -1349,6 +1368,13 @@ int MasterNode::run() {
     m.aliveAfterStage = aliveAfterStage_;
     m.workerTimes = workerTimes_;
     m.reorders = reorders_;
+
+    m.masterTotal = masterTotal_;
+    m.masterStage0 = stage0Seconds_;
+    m.masterBroadcast = broadcastSeconds_;
+    m.masterDispatch = dispatchSeconds_;
+    m.masterWait = waitSeconds_;
+    m.masterMerge = mergeSeconds_;
 
     m.print();
     m.writeCsv();

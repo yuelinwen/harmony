@@ -204,6 +204,45 @@ void Metrics::printTimeBreakdown() const {
     std::cout.precision(digits);
 }
 
+// Where the master's own time went, over the same pass as the worker table.
+// That table says how long the workers waited; this says what they waited
+// for. The remainder is MPI_Waitany plus pushing returned candidates into the
+// heaps, which is the only part of a batch the master cannot hand to anyone.
+void Metrics::printMasterTimes() const {
+    if (masterTotal <= 0.0) {
+        return;
+    }
+
+    const char* name[6] = {"stage 0 (probes + prewarm)",
+                           "broadcast (queries + probes)",
+                           "dispatch (jobs + thresholds)",
+                           "wait (blocked in Waitany)",
+                           "merge (candidates into heaps)",
+                           "other"};
+    double part[6] = {masterStage0, masterBroadcast, masterDispatch,
+                      masterWait, masterMerge,
+                      masterTotal - masterStage0 - masterBroadcast
+                          - masterDispatch - masterWait - masterMerge};
+
+    std::ios_base::fmtflags flags = std::cout.flags();
+    std::streamsize digits = std::cout.precision();
+
+    std::cout << "\n===== where the master's time went =====" << std::endl;
+    for (int i = 0; i < 6; ++i) {
+        std::cout << "  " << std::left << std::setw(30) << name[i]
+                  << std::right << std::fixed << std::setprecision(3)
+                  << std::setw(8) << part[i] << "s"
+                  << std::setw(8) << std::setprecision(1)
+                  << (100.0 * part[i] / masterTotal) << "%" << std::endl;
+    }
+    std::cout << "  " << std::left << std::setw(30) << "total (batches only)"
+              << std::right << std::setprecision(3) << std::setw(8)
+              << masterTotal << "s" << std::endl;
+
+    std::cout.flags(flags);
+    std::cout.precision(digits);
+}
+
 void Metrics::print() const {
     std::cout << "\n===== 5. results =====" << std::endl;
     std::cout << "setup: " << workers << " workers, grid "
@@ -317,6 +356,7 @@ void Metrics::print() const {
               << std::endl;
 
     printWorkerTimes();
+    printMasterTimes();
     if (bDim > 1) {
         std::cout << "chain reordered " << reorders << " time(s)" << std::endl;
     }

@@ -77,6 +77,14 @@ struct Metrics {
     std::vector<std::vector<double>> workerTimes;
     int reorders = 0;
 
+    // Where the master's own seconds went, over the counted pass.
+    double masterTotal = 0.0;
+    double masterStage0 = 0.0;
+    double masterBroadcast = 0.0;
+    double masterDispatch = 0.0;
+    double masterWait = 0.0;
+    double masterMerge = 0.0;
+
     // The whole "5. results" section, in order.
     void print() const;
 
@@ -98,6 +106,7 @@ struct Metrics {
 
 private:
     void printWorkerTimes() const;
+    void printMasterTimes() const;
     void printTimeBreakdown() const;
 };
 

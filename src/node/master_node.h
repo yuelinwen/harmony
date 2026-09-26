@@ -267,6 +267,17 @@ private:
     // breakdown could not be read with --check on.
     std::vector<std::vector<Candidate>> reference_;
 
+    // Where the master's own time goes inside a batch. The worker table says
+    // how long the workers waited; this says what they were waiting for.
+    // Zeroed by resetCounters(), so it covers the counted pass only, the way
+    // the workers' own counters do.
+    double masterTotal_ = 0.0;       // the batches themselves
+    double stage0Seconds_ = 0.0;     // probe lists and heap seeding
+    double broadcastSeconds_ = 0.0;  // the batch's query slices and probes
+    double dispatchSeconds_ = 0.0;   // JOB_BLOCK and the thresholds
+    double waitSeconds_ = 0.0;       // blocked in MPI_Waitany
+    double mergeSeconds_ = 0.0;      // pushing returned candidates into heaps
+
     // Chain reordering state (§4.3). prevCompute_ is what each worker had
     // done at the previous look, so the difference is this batch's work;
     // colSmooth_ is the per-column load with the swings taken out.
