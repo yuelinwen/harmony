@@ -204,8 +204,8 @@ long WorkerNode::accumulate(int firstQ, int len,
 }
 
 void WorkerNode::receiveSetup() {
-    int setup[5];
-    MPI_Recv(setup, 5, MPI_INT, MASTER_RANK, TAG_SETUP,
+    int setup[8];
+    MPI_Recv(setup, 8, MPI_INT, MASTER_RANK, TAG_SETUP,
              MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
     myDim_ = setup[0];
@@ -213,6 +213,9 @@ void WorkerNode::receiveSetup() {
     bDim_ = setup[2];
     batch_ = setup[3];
     sendSlots_ = setup[4];
+    bVec_ = setup[5];
+    blockCount_ = setup[6];
+    pipeline_ = (setup[7] != 0);
     if (sendSlots_ < 1) {
         sendSlots_ = 1;
     }
@@ -318,12 +321,23 @@ int WorkerNode::run() {
     std::vector<Pending> pend;
     std::vector<MPI_Request> pendReq;   // upstream receive; NULL for a head
 
+    // A block named but not yet opened. A group arrives as one message and
+    // expands into blockCount_ of these; they turn into Pendings as there is
+    // room, which is the only place --disablepipeline bites.
+    struct Todo {
+        int firstQ;
+        int len;
+        int item;
+        int tag;
+    };
+    std::vector<Todo> todo;
+
     while (!done) {
         // ---- 1. take every job already waiting, and block only when there
         //         is nothing open to work on ----
         while (true) {
             int waiting = 1;
-            if (!pend.empty()) {
+            if (!pend.empty() || !todo.empty()) {
                 // MPI: peek rather than block -- there is real work in hand
                 phase.reset();
                 MPI_Iprobe(MASTER_RANK, TAG_JOB, MPI_COMM_WORLD, &waiting,
@@ -342,8 +356,9 @@ int WorkerNode::run() {
             // open this receive is still time spent, just not time lost --
             // it belongs to dispatch, not to waiting.
             double took = phase.seconds();
-            double waited = pend.empty() ? took : 0.0;
-            if (!pend.empty()) {
+            bool holding = !pend.empty() || !todo.empty();
+            double waited = holding ? 0.0 : took;
+            if (holding) {
                 poll_ = poll_ + took;
             }
             if (!started) {
@@ -412,14 +427,6 @@ int WorkerNode::run() {
                 continue;
             }
 
-            // Thresholds for a run of the batch, refreshed between
-            // partitions. job[1] is where the run starts and job[2] how long.
-            if (job[0] == JOB_THRESH) {
-                MPI_Recv(&thresholds_[job[1]], job[2], MPI_FLOAT, MASTER_RANK,
-                         TAG_THRESHOLD, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                continue;
-            }
-
             if (job[0] == JOB_QUERY) {
                 int count = job[1];
                 nprobe_ = job[2];
@@ -438,12 +445,52 @@ int WorkerNode::run() {
                 continue;
             }
 
-            // ---- a block of queries: open it and post its upstream receive ----
+            // ---- one query group against one vector partition ----
+            //
+            // The whole group, in one message. What its blocks are, which
+            // column each enters the row at, and the tag each carries are
+            // worked out here from what this worker already holds -- the
+            // batch's probe lists, the chain table from setup, and blockTag()
+            // -- which is the same arithmetic the master does on its side.
+            // Opening them is step 2; this only decides what they are.
+            int gStart = job[1];
+            int gLen = job[2];
+            int g = job[3];
+            int stage = job[4];
+
+            MPI_Recv(&thresholds_[gStart], gLen, MPI_FLOAT, MASTER_RANK,
+                     TAG_THRESHOLD, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            for (int b = 0; b < blockCount_; ++b) {
+                Todo t;
+                t.firstQ = gStart + (int)((long)b * gLen / blockCount_);
+                int endQ = gStart + (int)((long)(b + 1) * gLen / blockCount_);
+                t.len = endQ - t.firstQ;
+                if (t.len <= 0) {
+                    continue;
+                }
+                t.item = b % bDim_;
+                t.tag = blockTag(g, stage, b, bVec_, blockCount_);
+                todo.push_back(t);
+            }
+        }
+
+        if (done) {
+            break;
+        }
+
+        // ---- 2. open what there is room for ----
+        //
+        // Normally every named block at once, so the wait for one block's
+        // upstream overlaps another block's arithmetic. One at a time under
+        // --disablepipeline, which is exactly the overlap that arm removes.
+        while (!todo.empty() && (pipeline_ || pend.empty())) {
             Pending p;
-            p.firstQ = job[1];
-            p.len = job[2];
-            int item = job[3];
-            p.slotTag = job[4];
+            p.firstQ = todo.front().firstQ;
+            p.len = todo.front().len;
+            int item = todo.front().item;
+            p.slotTag = todo.front().tag;
+            todo.erase(todo.begin());
 
             // Everything about this worker's part in the chain comes out of
             // the table: which item it is decides where the chain starts, and
@@ -455,7 +502,6 @@ int WorkerNode::run() {
             p.isLast = (nextCol < 0);
             p.prevRank = p.isFirst ? MASTER_RANK : rowBase_ + prevCol;
             p.nextRank = p.isLast ? MASTER_RANK : rowBase_ + nextCol;
-
 
             // The layout: each query's run of running totals is its probe
             // list restricted to the clusters this row holds, in probe order.
@@ -478,6 +524,16 @@ int WorkerNode::run() {
                 }
             }
 
+            if (total == 0) {
+                // This partition holds nothing for these queries. The master
+                // adds up the same probe lists and posts no receive for it, so
+                // the block exists on neither side. This is the one place the
+                // two sides have to agree without being told, and they agree
+                // because they are adding up the same numbers.
+                setup_ = setup_ + phase.seconds();
+                continue;
+            }
+
             MPI_Request up = MPI_REQUEST_NULL;
             if (p.isFirst) {
                 p.sums.assign(total, 0.0f);   // nothing upstream to wait for
@@ -493,14 +549,11 @@ int WorkerNode::run() {
             pendReq.push_back(up);
         }
 
-        if (done) {
-            break;
-        }
         if (pend.empty()) {
             continue;
         }
 
-        // ---- 2. work on whichever open block can be worked on ----
+        // ---- 3. work on whichever open block can be worked on ----
         int pick = -1;
         for (size_t i = 0; i < pendReq.size(); ++i) {
             if (pendReq[i] == MPI_REQUEST_NULL) {

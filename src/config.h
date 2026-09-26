@@ -90,11 +90,13 @@ struct Config {
     // us.
     bool blockGiven = false;
 
-    // Hand out one block at a time, waiting for it to come back before
-    // dispatching the next: the arm Fig. 10 calls "without pipeline and
-    // asynchronous execution". Blocks still travel a chain and the forwards
-    // are still non-blocking -- this only stops several being out at once, so
-    // what it measures is the overlap and nothing else.
+    // One block open at a time, anywhere in the system: the arm Fig. 10 calls
+    // "without pipeline and asynchronous execution". The master holds back the
+    // next query group until the current one is fully back, and a worker opens
+    // its group's blocks one at a time rather than all at once. Blocks still
+    // travel a chain and the forwards are still non-blocking -- this only
+    // stops several being out at once, so what it measures is the overlap and
+    // nothing else.
     //
     // Named like --disablepruning: the switch is present or absent, never
     // takes a value, so it cannot quietly change meaning later.

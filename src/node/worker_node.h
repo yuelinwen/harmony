@@ -40,6 +40,9 @@ public:
         rowBase_ = id;
         batch_ = 1;
         sendSlots_ = 1;
+        bVec_ = 1;
+        blockCount_ = 1;
+        pipeline_ = true;
         nprobe_ = 0;
         k_ = cfg.k;
         clearCounters();
@@ -109,6 +112,12 @@ private:
     int bDim_;      // how many workers share this row
     int myCol_;     // which of them this one is
 
+    // The shape of the schedule, so a worker can expand one group message
+    // into that group's blocks instead of being told about each of them.
+    int bVec_;        // vector partitions in the grid, which blockTag() needs
+    int blockCount_;  // query blocks a group is cut into (--block)
+    bool pipeline_;   // false: one block open at a time (--disablepipeline)
+
     // This worker's rows of the chain table (engine/search_order.h), given by
     // the master at setup: for each item, who it takes the partial sums from,
     // who it passes them to (-1 for the ends of the chain), and how far along
@@ -118,7 +127,7 @@ private:
     std::vector<int> stageOf_;
 
     // tau^2 per query of the current batch, kept between jobs and refreshed by
-    // JOB_THRESH. Indexed by position in the batch, like queries_ and probes_.
+    // JOB_GROUP. Indexed by position in the batch, like queries_ and probes_.
     std::vector<float> thresholds_;
 
     // The batch's query slices and probe lists, sent once per batch. The

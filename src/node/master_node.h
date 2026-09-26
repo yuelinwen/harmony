@@ -57,7 +57,7 @@ public:
     // Cuts every cluster into per-worker slices and sends them out.
     void distributeData();
 
-    // The most blocks one query batch can have in flight at once.
+    // The most blocks one worker can have open at once.
     //
     // The only place this is worked out. A worker sizes its outgoing buffer
     // pool from the value it is told at setup, because the two numbers have to
@@ -122,17 +122,13 @@ public:
                         const std::vector<QueryState>& batch,
                         std::vector<TopKHeap>& heaps);
 
-    // Algorithm 1, lines 6-12. Sends one block of queries -- [firstQ,
-    // firstQ+len) of the batch -- to every worker in row `row` and returns;
-    // they pass the running totals down the chain and only the last reports
-    // back. `item` picks the chain, `slot` names its tags.
-    void dispatchBlock(int row, int firstQ, int len, int item, int slot);
-
-    // One query group's thresholds to the row about to work on it (paper §5).
-    // Workers keep them between jobs, so this goes once per partition a group
-    // enters rather than with every block.
-    void sendThresholds(int row, int firstQ, int len,
-                        const std::vector<TopKHeap>& heaps);
+    // Algorithm 1, lines 6-12. Hands query group g, on the `stage`-th of the
+    // vector partitions it visits, to every worker of row `row`, with the
+    // thresholds to prune it against -- and returns. The workers cut it into
+    // blocks themselves, pass the running totals down the chain, and only the
+    // last of each chain reports back.
+    void dispatchGroup(int row, int g, int stage, int gStart, int gLen,
+                       const std::vector<TopKHeap>& heaps);
 
     // Candidates a block of queries contributes in one vector partition, in
     // the order the workers of that row will lay them out.
@@ -274,7 +270,7 @@ private:
     double masterTotal_ = 0.0;       // the batches themselves
     double stage0Seconds_ = 0.0;     // probe lists and heap seeding
     double broadcastSeconds_ = 0.0;  // the batch's query slices and probes
-    double dispatchSeconds_ = 0.0;   // JOB_BLOCK and the thresholds
+    double dispatchSeconds_ = 0.0;   // JOB_GROUP and the thresholds
     double waitSeconds_ = 0.0;       // blocked in MPI_Waitany
     double mergeSeconds_ = 0.0;      // pushing returned candidates into heaps
 

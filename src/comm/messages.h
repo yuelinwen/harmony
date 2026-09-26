@@ -15,7 +15,11 @@ namespace harmony {
 const int MASTER_RANK = 0;
 
 // startup
-// int[5]: myDim, nClusters (this row), bDim, batch, sendSlots.
+// int[8]: myDim, nClusters (this row), bDim, batch, sendSlots, bVec, block,
+// pipeline.
+//
+// The last three are what let a worker expand one group message into all of
+// that group's blocks by itself, instead of being told about each one.
 //
 // sendSlots is how many blocks the master can have in flight, and the worker
 // sizes its outgoing buffer pool from it. That is an invariant, not a
@@ -45,7 +49,7 @@ const int TAG_PROBES    = 9;   // int[count * nprobe]: every query's clusters,
                                // nearest first. Sent once per batch. A worker
                                // needs them to lay out a block's buffer the
                                // same way its neighbours in the chain do.
-const int TAG_THRESHOLD = 7;   // float[len]: tau^2 per query, see JOB_THRESH
+const int TAG_THRESHOLD = 7;   // float[gLen]: tau^2 per query, see JOB_GROUP
 const int TAG_STATS     = 10;  // long[bDim]: survivors per chain position
 const int TAG_TIMES     = 12;  // double[WORKER_TIMES]: worker's wall time
 
@@ -58,22 +62,30 @@ const int TAG_TIMES     = 12;  // double[WORKER_TIMES]: worker's wall time
 // read whatever was next in the array as a timing.
 const int WORKER_TIMES = 10;
 
-// Partial sums and top-K answers get a tag of their own per in-flight
-// cluster, taken from the master's slot for it.
+// Partial sums and top-K answers get a tag of their own per block in flight.
 //
-// They have to, because a worker does not process clusters in the order the
-// master handed them over: one whose upstream has arrived overtakes one still
-// waiting. Two clusters travelling between the same pair of ranks would then
-// be matched by arrival order rather than by which is which, and a worker
-// would add its slice to the wrong running totals. MPI matches on the tag
-// instead, so the order stops mattering. (The sample does the same thing with
+// They have to, because a worker does not process blocks in the order they
+// were handed over: one whose upstream has arrived overtakes one still
+// waiting. Two blocks travelling between the same pair of ranks would then be
+// matched by arrival order rather than by which is which, and a worker would
+// add its slice to the wrong running totals. MPI matches on the tag instead,
+// so the order stops mattering.
+//
+// The number is blockTag() below -- a pure function of where the block sits
+// in the batch's schedule, so the master and the workers arrive at it
+// separately and always agree. It used to be an index into a pool the master
+// allocated from, which nobody else could derive, and that is what forced a
+// message per block. (The sample uses the same idea:
 // tag = groupId * blockCount + blockId.)
-//
-// A slot is reused only once its cluster has fully reported, so slot numbers
-// are unique among everything in flight. Values stay small -- one per worker
-// plus a spare -- and tagsFitMpi() confirms the largest is one MPI will
-// accept.
 const int TAG_CHAIN_BASE = 100;
+
+// Which block this is, out of everything one batch will produce: query group
+// g, visiting vector partition number `stage` of the bVec it must visit, and
+// the b-th of the group's `block` query blocks. Unique across a batch, and a
+// batch is fully drained before the next begins.
+inline int blockTag(int g, int stage, int b, int bVec, int block) {
+    return (g * bVec + stage) * block + b;
+}
 
 // float[m * n]: running partial distances, one worker to the next.
 inline int tagSums(int slot) { return TAG_CHAIN_BASE + 2 * slot; }
@@ -102,21 +114,8 @@ inline int tagTopk(int slot) { return TAG_CHAIN_BASE + 2 * slot + 1; }
 //     threshold from an empty heap prunes nothing rather than everything.
 const float PRUNED = 1e38f;
 
-// TAG_JOB carries int[5] = {what, firstQuery, blockLen, item, slot}.
-//
-// A job is one block of queries against one vector partition (paper §4.2.2,
-// Fig. 4b: a query mapped to a partition is split by dimension and the pieces
-// routed to the machines holding them). firstQuery and blockLen name a
-// contiguous run of the batch; the worker walks those queries' probe lists,
-// keeps the clusters its own partition holds, and that walk is the buffer
-// layout. Every worker in the row derives the same one from the same probe
-// lists, so the running totals line up without anyone sending an index.
-//
-// `item` picks a row out of the chain table the worker was given at setup.
-// Different items run the row in different orders, so no worker is always the
-// first stop, which is the one that can prune nothing (paper §4.3). slot is
-// the master's slot for this block and names its chain tags above.
-const int JOB_BLOCK    = -5;   // what: a block of queries, fields as above
+// TAG_JOB carries int[5] = {what, ...}, the rest reading per `what`.
+const int JOB_GROUP    = -5;   // what: a query group, fields below
 const int JOB_QUERY    = -1;   // the batch's query slices follow
 const int JOB_SHUTDOWN = -2;   // stop and exit
 // Zero the pruning counters. With --loop the query set is run several times;
@@ -131,15 +130,27 @@ const int JOB_STATS    = -4;
 // between batches, when nothing is on the chain: a block carries only its
 // item, and both ends of a hop have to agree on what that item means.
 const int JOB_ORDER    = -6;
-// float[len] of thresholds for [firstQuery, firstQuery+len) of the batch,
-// which the worker keeps and reads when a block of those queries arrives.
+// JOB_GROUP carries int[5] = {JOB_GROUP, gStart, gLen, g, stage}, followed by
+// float[gLen] of thresholds over TAG_THRESHOLD.
 //
-// §5 has the master "periodically update pruning thresholds, which are
-// broadcast to workers" rather than attach them to every job. It is also one
-// message per job cheaper: a group's whole partition is dispatched at once and
-// shares one snapshot of the thresholds, so sending it per block sent the same
-// numbers bDim times over.
-const int JOB_THRESH   = -7;
+// It hands a worker one query group against one vector partition (paper
+// §4.2.2, Fig. 4b) and nothing smaller. gStart and gLen name the group, a
+// contiguous run of the batch; g and stage say which group it is and which of
+// its bVec partitions this visit is, which is all blockTag() needs.
+//
+// The worker cuts the group into `block` query blocks with the same formula
+// the master uses, works out for each one which column it enters the row at
+// (b % bDim, so no worker is always the first stop -- the one that can prune
+// nothing, paper §4.3), and walks the queries' probe lists to lay out the
+// running totals. A block that this partition holds nothing for comes out
+// empty on both sides and simply does not happen.
+//
+// This is one message where there used to be one per block plus one per
+// group. At 1x8 with --block 128 that is 1040 messages a batch down to 16.
+//
+// The thresholds ride along because §5 has the master "periodically update
+// pruning thresholds, which are broadcast to workers", and a group's whole
+// partition shares one snapshot of them anyway.
 
 // The largest chain tag this layout will use has to be one MPI accepts. The
 // standard only promises 32767, and the tags here stay far below that, so

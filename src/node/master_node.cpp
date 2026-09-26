@@ -515,7 +515,7 @@ void MasterNode::splitGrid(int bVec, int bDim) {
     // ceiling is reachable at any worker count that fits on a cluster, but a
     // tag MPI rejects fails at the receive rather than at the send, which is
     // an unpleasant way to find out.
-    if (!tagsFitMpi(bVec_ * bDim_ + 1)) {
+    if (!tagsFitMpi(bVec_ * bVec_ * cfg_.block)) {
         std::cerr << "chain tags exceed this MPI's maximum" << std::endl;
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
@@ -662,10 +662,10 @@ void MasterNode::reorderChains() {
     reorders_ = reorders_ + 1;
 }
 
-// Every group can have all of its blocks out at once, and without the
-// vector-level barrier a group holds every partition at once rather than one,
-// which squares the budget. The spare is so the search for a free slot below
-// cannot spin forever.
+// What a worker sizes its outgoing buffer pool from. A row serves one group
+// at a time, so a worker has that group's blocks open; without the
+// vector-level barrier a group holds every partition at once, which squares
+// the budget. The spare is slack, not a requirement.
 int MasterNode::maxBlocksInFlight() const {
     int perGroup = cfg_.pruneVector ? cfg_.block : (bVec_ * cfg_.block);
     return bVec_ * perGroup + 1;
@@ -690,14 +690,17 @@ void MasterNode::distributeData() {
     for (int w = 1; w <= numWorkers_; ++w) {
         int row = (w - 1) / bDim_;
         int col = (w - 1) % bDim_;
-        int setup[5];
+        int setup[8];
         setup[0] = plan_.end(col) - plan_.begin(col);
         setup[1] = rowClusters[row];
         setup[2] = bDim_;
         setup[3] = cfg_.batch;
         setup[4] = maxBlocksInFlight();
+        setup[5] = bVec_;
+        setup[6] = cfg_.block;
+        setup[7] = cfg_.pipeline ? 1 : 0;
         // MPI: blocking is fine for startup -- the order is fixed and nobody waits
-        MPI_Send(setup, 5, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
+        MPI_Send(setup, 8, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
 
         std::vector<int> table = chainTableFor(col);
         MPI_Send(table.data(), (int)table.size(), MPI_INT, w, TAG_ORDER,
@@ -855,44 +858,30 @@ long MasterNode::blockLoad(int row, int firstQ, int len,
     return total;
 }
 
-// Hands one block of queries to every worker in a row and returns immediately.
+// Hands one query group to every worker in a row and returns immediately.
 // The workers of a row then run one after another, not in parallel: in
 // parallel every slice would be computed in full and nothing saved (§3.2).
 //
-// One small message per worker. The worker already has the batch's probe
-// lists, so it works out for itself which of this block's queries want which
-// of its clusters -- there is no list of participants to send, and the
-// thresholds travel separately (JOB_THRESH) once per partition rather than
-// with every block.
-void MasterNode::dispatchBlock(int row, int firstQ, int len, int item, int slot) {
+// Two small messages per worker, for the whole group -- the schedule, then
+// the thresholds. What each of the group's blocks is, who is first in its
+// chain, and which tag it carries are all things the worker works out from
+// what it already has: the batch's probe lists, the chain table it was given
+// at setup, and blockTag(). That is the difference from dispatching each
+// block: the message count stops growing with --block.
+void MasterNode::dispatchGroup(int row, int g, int stage, int gStart, int gLen,
+                               const std::vector<TopKHeap>& heaps) {
     Stopwatch watch;
-    for (int col = 0; col < bDim_; ++col) {
-        int w = row * bDim_ + col + 1;
-        int job[5] = {JOB_BLOCK, firstQ, len, item, slot};
-        MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
-    }
-    dispatchSeconds_ = dispatchSeconds_ + watch.seconds();
-}
-
-// The thresholds for one query group, to the row about to work on it. Sent
-// once per partition a group enters rather than with every block: the blocks
-// of a partition all go out before any comes back, so they share one snapshot
-// anyway, and this is the "periodically updates ... broadcast to workers" of
-// §5. Workers keep them between jobs.
-void MasterNode::sendThresholds(int row, int firstQ, int len,
-                                const std::vector<TopKHeap>& heaps) {
-    Stopwatch watch;
-    std::vector<float> t(len);
-    for (int j = 0; j < len; ++j) {
+    std::vector<float> t(gLen);
+    for (int j = 0; j < gLen; ++j) {
         // an infinite threshold drops nothing, which is the no-dimension-level
         // arm of --pruning (paper Fig. 10)
-        t[j] = cfg_.pruneDim ? heaps[firstQ + j].worst() : PRUNED;
+        t[j] = cfg_.pruneDim ? heaps[gStart + j].worst() : PRUNED;
     }
     for (int col = 0; col < bDim_; ++col) {
         int w = row * bDim_ + col + 1;
-        int job[5] = {JOB_THRESH, firstQ, len, 0, 0};
+        int job[5] = {JOB_GROUP, gStart, gLen, g, stage};
         MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
-        MPI_Send(t.data(), len, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
+        MPI_Send(t.data(), gLen, MPI_FLOAT, w, TAG_THRESHOLD, MPI_COMM_WORLD);
     }
     dispatchSeconds_ = dispatchSeconds_ + watch.seconds();
 }
@@ -931,120 +920,101 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
     int k = cfg_.k;
     int blocks = cfg_.block;
 
-    // Enough slots for every group to have all of its blocks out at once,
-    // plus a spare so the search for a free one below cannot spin forever.
-    // Without the vector-level barrier a group holds every partition at once
-    // rather than one, so the budget is squared.
-    int maxInFlight = maxBlocksInFlight();
-    if (!tagsFitMpi(maxInFlight)) {
-        std::cerr << "chain tags exceed this MPI's maximum at "
-                  << maxInFlight << " slots; lower --block" << std::endl;
+    // One receive per block the batch can produce: group g, its stage-th
+    // partition, its b-th query block. Named by blockTag(), which the workers
+    // derive too, so nobody has to be told a block's tag -- that is what lets
+    // a whole group go out as one message.
+    int tagSpace = bVec_ * bVec_ * blocks;
+    if (!tagsFitMpi(tagSpace)) {
+        std::cerr << "chain tags exceed this MPI's maximum at " << tagSpace
+                  << " blocks; lower --block" << std::endl;
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    std::vector<Slot> slot(maxInFlight);
-    std::vector<MPI_Request> req(maxInFlight, MPI_REQUEST_NULL);
+    std::vector<Slot> slot(tagSpace);
+    std::vector<MPI_Request> req(tagSpace, MPI_REQUEST_NULL);
 
     std::vector<int> stage(bVec_, 0);     // which partition group g is on
-    std::vector<int> pos(bVec_, 0);       // which of its blocks goes next
-    std::vector<int> inFlight(bVec_, 0);
-    int free = 0;
-
-    // Blocks dispatched and not yet reported, against the most that may be.
-    // --disablepipeline sets the cap to one, which is Fig. 10's arm without
-    // the overlap; otherwise the cap cannot bind, since the slot count is
-    // already a block more than every group can have out.
-    //
-    // The cap has to be a counter rather than a smaller maxInFlight: the
-    // search for a free slot below spins until it finds one, so a pool of one
-    // would never terminate.
-    int outstanding = 0;
-    int inFlightCap = cfg_.pipeline ? maxInFlight : 1;
+    std::vector<int> inFlight(bVec_, 0);  // its blocks not yet reported
+    int busy = 0;                         // the same, over every group
 
     while (true) {
-        for (int g = 0; g < bVec_ && outstanding < inFlightCap; ++g) {
-            while (stage[g] < bVec_ && outstanding < inFlightCap) {
-                int r = groupOrder_.chain(g)[stage[g]];
+        for (int g = 0; g < bVec_; ++g) {
+            while (stage[g] < bVec_) {
+                // Vector-level pruning, Fig. 5a: a group finishes one
+                // partition before starting the next, so the next starts from
+                // a threshold this one has tightened. Without it a group holds
+                // every partition at once and the threshold never tightens
+                // within a batch.
+                if (cfg_.pruneVector && inFlight[g] > 0) {
+                    break;
+                }
 
-                if (pos[g] >= blocks) {
-                    // Vector-level pruning, Fig. 5a: every block of this
-                    // partition is out, and only once they have all come back
-                    // are their distances in the heaps -- so waiting here is
-                    // what makes the next partition start from a threshold
-                    // this one has tightened. Without it the partitions all go
-                    // at once and the threshold never tightens within a batch.
-                    if (cfg_.pruneVector && inFlight[g] > 0) {
-                        break;
-                    }
-                    stage[g] = stage[g] + 1;
-                    pos[g] = 0;
-                    continue;
+                // --disablepipeline: one group's partition anywhere in the
+                // system at a time. The worker serialises the blocks inside
+                // it, so between them exactly one block is ever open -- Fig.
+                // 10's arm without the overlap.
+                if (!cfg_.pipeline && busy > 0) {
+                    break;
                 }
 
                 const std::vector<int>& mem = groupMembers[g];
                 if (mem.empty()) {
                     stage[g] = bVec_;      // nothing for this group to do
-                    continue;
+                    break;
                 }
 
-                // Entering a partition: hand that row this group's thresholds
-                // once, before any of its blocks. Same tag as the jobs, so MPI
-                // delivers it first.
-                if (pos[g] == 0) {
-                    sendThresholds(r, mem[0], (int)mem.size(), heaps);
-                }
-
-                int b = pos[g];
-                pos[g] = pos[g] + 1;
-
-                // Groups are contiguous runs of the batch and so are their
-                // blocks, which is why a job needs only a first and a length.
+                int s = stage[g];
+                stage[g] = stage[g] + 1;
+                int r = groupOrder_.chain(g)[s];
                 int gStart = mem[0];
                 int gLen = (int)mem.size();
-                int firstQ = gStart + (int)((long)b * gLen / blocks);
-                int endQ = gStart + (int)((long)(b + 1) * gLen / blocks);
-                int len = endQ - firstQ;
-                if (len <= 0) {
-                    continue;
+
+                dispatchGroup(r, g, s, gStart, gLen, heaps);
+
+                // A receive per block that has anything in this partition.
+                // The worker cuts the group up the same way and walks the same
+                // probe lists, so a block that comes out empty here comes out
+                // empty there and exists on neither side.
+                for (int b = 0; b < blocks; ++b) {
+                    int firstQ = gStart + (int)((long)b * gLen / blocks);
+                    int endQ = gStart + (int)((long)(b + 1) * gLen / blocks);
+                    int len = endQ - firstQ;
+                    if (len <= 0) {
+                        continue;
+                    }
+
+                    // Walking the queries and their probe lists is not free,
+                    // so it happens once here and the result rides along in
+                    // the slot.
+                    long load = blockLoad(r, firstQ, len, batch);
+                    if (load == 0) {
+                        continue;   // nothing of this partition for these queries
+                    }
+
+                    // Different blocks enter the row at different columns, so
+                    // no worker is always the first stop -- the one that can
+                    // prune nothing (paper §4.3).
+                    int item = b % bDim_;
+                    int id = blockTag(g, s, b, bVec_, blocks);
+
+                    slot[id].group = g;
+                    slot[id].row = r;
+                    slot[id].firstQ = firstQ;
+                    slot[id].len = len;
+                    slot[id].load = load;
+                    slot[id].top.assign((size_t)len * k, Candidate{-1, PRUNED});
+
+                    // MPI: non-blocking, so the next group can go out without
+                    // waiting for this one. lastRankOf is who ends the chain;
+                    // it sends back the k nearest per query rather than every
+                    // running total.
+                    MPI_Irecv(slot[id].top.data(),
+                              (int)(slot[id].top.size() * sizeof(Candidate)),
+                              MPI_BYTE, lastRankOf(r, item), tagTopk(id),
+                              MPI_COMM_WORLD, &req[id]);
+                    inFlight[g] = inFlight[g] + 1;
+                    busy = busy + 1;
                 }
-
-                // Walking the queries and their probe lists is not free, so
-                // it happens once here and the result rides along in the slot
-                // -- the counters below used to call it twice more with the
-                // same arguments, on the path that merges every result.
-                long load = blockLoad(r, firstQ, len, batch);
-                if (load == 0) {
-                    continue;   // nothing of this partition for these queries
-                }
-
-                // The slot is picked first because its number is what tags
-                // this block's messages all the way down the chain.
-                while (req[free] != MPI_REQUEST_NULL) {
-                    free = (free + 1) % maxInFlight;
-                }
-
-                // Different blocks enter the row at different columns, so no
-                // worker is always the first stop -- the one that can prune
-                // nothing (paper §4.3).
-                int item = b % bDim_;
-                dispatchBlock(r, firstQ, len, item, free);
-
-                slot[free].group = g;
-                slot[free].row = r;
-                slot[free].firstQ = firstQ;
-                slot[free].len = len;
-                slot[free].load = load;
-                slot[free].top.assign((size_t)len * k, Candidate{-1, PRUNED});
-
-                // MPI: non-blocking, so the next block can be dispatched
-                // without waiting for this one. lastRankOf is who ends the
-                // chain; it sends back the k nearest per query rather than
-                // every running total.
-                MPI_Irecv(slot[free].top.data(),
-                          (int)(slot[free].top.size() * sizeof(Candidate)),
-                          MPI_BYTE, lastRankOf(r, item), tagTopk(free),
-                          MPI_COMM_WORLD, &req[free]);
-                inFlight[g] = inFlight[g] + 1;
-                outstanding = outstanding + 1;
             }
         }
 
@@ -1052,7 +1022,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
         // what lets a slow group not hold up a fast one.
         Stopwatch watch;
         int index = MPI_UNDEFINED;
-        MPI_Waitany(maxInFlight, req.data(), &index, MPI_STATUS_IGNORE);
+        MPI_Waitany(tagSpace, req.data(), &index, MPI_STATUS_IGNORE);
         waitSeconds_ = waitSeconds_ + watch.seconds(true);
         if (index == MPI_UNDEFINED) {
             break;
@@ -1076,7 +1046,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
         scannedRow_[s.row] = scannedRow_[s.row] + s.load;
 
         inFlight[s.group] = inFlight[s.group] - 1;
-        outstanding = outstanding - 1;
+        busy = busy - 1;
     }
 }
 
@@ -1132,7 +1102,7 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
     }
 
     // Thresholds prewarm has just produced, one per query, sent with the
-    // batch. Every worker gets the whole batch's, and sendThresholds()
+    // batch. Every worker gets the whole batch's, and dispatchGroup()
     // refreshes the parts of it that matter as the groups move on (paper §5).
     std::vector<float> seed(count);
     for (int q = 0; q < count; ++q) {
