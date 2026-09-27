@@ -60,7 +60,7 @@ bool writeBin(const std::string& path, int n, int k, const void* body,
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string data = "Data/sift";
+    std::string data = "Data/sift/sift";
     std::string out;
     int k = 100;
 

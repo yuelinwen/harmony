@@ -15,7 +15,10 @@ namespace harmony {
 
 struct Config {
     // data and index
-    std::string data = "Data/sift";  // prefix of _base.bin, _query.bin, _gt.bin
+    // Prefix of _base.bin, _query.bin, _gt.bin, _gtd.bin. A directory per
+    // dataset, so a second one does not scatter eight more files beside the
+    // first: Data/sift/sift_base.bin, Data/gist/gist_base.bin.
+    std::string data = "Data/sift/sift";
     int nlist = 256;                 // clusters kmeans builds
     int iters = 25;                  // kmeans rounds
     int trainPoints = 256;           // kmeans training points per centroid, 0 = all
@@ -170,7 +173,8 @@ inline void printUsage(const char* prog) {
         << "usage: mpirun -n <N+1> " << prog << " [options]\n"
         << "\n"
         << "data and index\n"
-        << "  --data <prefix>    reads <prefix>_base/_query/_gt.bin (Data/sift)\n"
+        << "  --data <prefix>    reads <prefix>_base/_query/_gt.bin"
+        << "        (Data/sift/sift)\n"
         << "  --nlist <int>      clusters in the index              (256)\n"
         << "  --iters <int>      kmeans rounds                      (25)\n"
         << "  --trainpoints <int>  kmeans training points per centroid (256)\n"

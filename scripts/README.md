@@ -73,7 +73,7 @@ where `_gt.bin` and `_gtd.bin` normally come from. Datasets from anywhere else
 start without an answer key. `./maketruth` computes one:
 
 ```bash
-./maketruth --data Data/msong --k 100
+./maketruth --data Data/msong/msong --k 100
 ```
 
 It reads `_base.bin` and `_query.bin` and writes `_gt.bin` and `_gtd.bin`
@@ -107,7 +107,7 @@ Put the `.hdf5` in `Data/` yourself — nothing downloads it — then:
 
 ```bash
 scripts/data.sh Data/gist-960-euclidean.hdf5
-scripts/run.sh 4 --data Data/gist
+scripts/run.sh 4 --data Data/gist/gist
 ```
 
 Euclidean datasets only. An angular one is refused: dimension pruning depends

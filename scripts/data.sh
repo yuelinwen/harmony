@@ -4,11 +4,13 @@
 # It does not download anything -- put the .hdf5 in Data/ yourself.
 #
 #   scripts/data.sh Data/sift-128-euclidean.hdf5
-#   scripts/data.sh Data/gist-960-euclidean.hdf5 gist
+#   scripts/data.sh Data/gist-960-euclidean.hdf5 gist/gist
 #
-# The name defaults to everything before the first dash, so the example above
-# writes Data/sift_base.bin, Data/sift_query.bin and Data/sift_gt.bin. Pass a
-# second argument to choose it yourself. Run with --data Data/sift.
+# The name defaults to everything before the first dash, used twice: the
+# example above writes Data/sift/sift_base.bin and its three companions. One
+# directory per dataset, because a second dataset beside the first would
+# otherwise scatter eight more files into Data/. Pass a second argument to
+# choose the name yourself. Run with --data Data/sift/sift.
 #
 # The hdf5 holds four arrays and all four are used:
 #   train      -> _base.bin    the vectors being searched
@@ -38,7 +40,9 @@ if [ $# -lt 1 ]; then
 fi
 
 HDF5=$1
-NAME=${2:-$(basename "$HDF5" .hdf5 | cut -d- -f1)}
+SHORT=$(basename "$HDF5" .hdf5 | cut -d- -f1)
+NAME=${2:-$SHORT/$SHORT}
+mkdir -p "Data/$(dirname "$NAME")"
 
 if [ ! -f "$HDF5" ]; then
     echo "no such file: $HDF5" >&2
