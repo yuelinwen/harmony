@@ -1,6 +1,10 @@
 # Build output
 main
+maketruth
 *.o
+
+# faiss is vendored as source (third_party/faiss); what it compiles to is not
+third_party/faiss/build/
 
 # Data and index caches: large, and rebuilt by scripts/data.sh
 /Data

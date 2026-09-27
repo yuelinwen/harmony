@@ -6,6 +6,7 @@ Run them from anywhere; each one finds the project root itself.
 |---|---|
 | `setup_cluster.sh` | prepare fresh machines: ssh keys, packages, `hosts.txt`. Once. |
 | `data.sh` | convert an `.hdf5` in `Data/` into the four `.bin` files the program reads. |
+| `../maketruth` | brute-force the groundtruth for a dataset that did not come with one. |
 | `build.sh` | compile `./main`, and copy it to the workers when run on the master. |
 | `run.sh` | start a run on the machines in `hosts.txt`. |
 
@@ -63,6 +64,42 @@ mpirun needs it at the same path on all of them.
 
 `run.sh N` runs N workers on N+1 machines, one process per machine, one OpenMP
 thread per core.
+
+## A dataset with no groundtruth
+
+`data.sh` pulls the groundtruth out of an ann-benchmarks `.hdf5`, which is
+where `_gt.bin` and `_gtd.bin` normally come from. Datasets from anywhere else
+-- msong, the UCR series, sift1B -- are bare vectors, and `./main` will not
+start without an answer key. `./maketruth` computes one:
+
+```bash
+./maketruth --data Data/msong --k 100
+```
+
+It reads `_base.bin` and `_query.bin` and writes `_gt.bin` and `_gtd.bin`
+beside them. Exhaustive -- every query against every base vector -- so it is
+the answer key rather than one more thing to check. Sift1M takes 36 s on the
+master, once.
+
+It is the only thing here that links faiss, which is vendored under
+`third_party/faiss`. Build the library once on the master:
+
+```bash
+cd third_party/faiss && cmake -B build -DFAISS_ENABLE_GPU=OFF \
+    -DFAISS_ENABLE_PYTHON=OFF -DFAISS_ENABLE_EXTRAS=OFF -DBUILD_TESTING=OFF \
+    -DFAISS_OPT_LEVEL=avx2 -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release . \
+  && cmake --build build -j$(nproc)
+```
+
+`build.sh` then picks it up. Without it `./maketruth` is skipped and `./main`
+builds as before, which is what every worker does -- none of them link faiss
+or need it installed.
+
+Checked against the sift1M groundtruth that ships with ann-benchmarks: all
+10000 rows agree bit for bit once the same `sqrt` round-trip is applied to
+both. The shipped file stores plain distances and `data.sh` squares them,
+which loses a bit on half of them; `maketruth` computes the squared distance
+directly, so its values are the exact integers a uint8 dataset must give.
 
 ## A new dataset
 

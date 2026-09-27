@@ -84,6 +84,38 @@ LIBS="-lmkl_intel_lp64 -lmkl_sequential -lmkl_core -lpthread -lm"
 mpicxx $FLAGS main.cpp src/node/*.cpp src/index/*.cpp src/test/*.cpp -o main $LIBS
 echo "built ./main"
 
+# ---- ./maketruth, only where faiss has been built ----------------------
+#
+# Brute-force groundtruth for a dataset that did not come with any. faiss is
+# linked here and nowhere else: the workers never run this, so they need
+# nothing installed, and ./main stays the same binary it was.
+#
+# Build the library once, on the master, before this finds it:
+#
+#   cd third_party/faiss
+#   cmake -B build -DFAISS_ENABLE_GPU=OFF -DFAISS_ENABLE_PYTHON=OFF \
+#         -DFAISS_ENABLE_EXTRAS=OFF -DBUILD_TESTING=OFF \
+#         -DFAISS_OPT_LEVEL=avx2 -DBUILD_SHARED_LIBS=OFF \
+#         -DCMAKE_BUILD_TYPE=Release .
+#   cmake --build build -j$(nproc)
+#
+# Skipped rather than failed when it is absent, so a tree without faiss --
+# which is every worker, and any machine that only wants to run -- still
+# builds ./main.
+
+# The avx2 build when it is there -- faiss compiles the same sources twice and
+# only the master ever runs this, on a machine known to have AVX2.
+FAISS_LIB=third_party/faiss/build/faiss/libfaiss_avx2.a
+[ -f "$FAISS_LIB" ] || FAISS_LIB=third_party/faiss/build/faiss/libfaiss.a
+
+if [ -f "$FAISS_LIB" ]; then
+    g++ $FLAGS -I third_party/faiss tools/maketruth.cpp src/index/dataset.cpp \
+        -o maketruth "$FAISS_LIB" $LIBS
+    echo "built ./maketruth"
+else
+    echo "no $FAISS_LIB, skipping ./maketruth"
+fi
+
 # ---- copy to the workers, if this is the master ------------------------
 #
 # The test is whether one of this machine's own addresses is in hosts.txt.
