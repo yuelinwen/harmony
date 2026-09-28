@@ -138,7 +138,8 @@ private:
     std::vector<int> stageOf_;
 
     // tau^2 per query of the current batch, kept between jobs and refreshed by
-    // JOB_GROUP. Indexed by position in the batch, like queries_ and probes_.
+    // the TAG_THRESHOLD that opens each stage. Indexed by position in the
+    // batch, like queries_ and probes_.
     std::vector<float> thresholds_;
 
     // The batch's query slices and probe lists, sent once per batch. The

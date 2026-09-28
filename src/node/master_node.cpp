@@ -909,7 +909,6 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
                                 const std::vector<QueryState>& batch,
                                 std::vector<TopKHeap>& heaps) {
     struct Slot {
-        int group;
         int row;
         int firstQ;
         int len;
@@ -1007,7 +1006,6 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
                 int item = b % bDim_;
                 int id = blockTag(g, stage, b, bVec_, blocks);
 
-                slot[id].group = g;
                 slot[id].row = r;
                 slot[id].firstQ = firstQ;
                 slot[id].len = len;
@@ -1101,7 +1099,7 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
     }
 
     // Thresholds prewarm has just produced, one per query, sent with the
-    // batch. Every worker gets the whole batch's, and dispatchGroup()
+    // batch. Every worker gets the whole batch's, and sendThresholds()
     // refreshes the parts of it that matter as the groups move on (paper §5).
     std::vector<float> seed(count);
     for (int q = 0; q < count; ++q) {

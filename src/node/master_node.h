@@ -270,7 +270,7 @@ private:
     double masterTotal_ = 0.0;       // the batches themselves
     double stage0Seconds_ = 0.0;     // probe lists and heap seeding
     double broadcastSeconds_ = 0.0;  // the batch's query slices and probes
-    double dispatchSeconds_ = 0.0;   // JOB_GROUP and the thresholds
+    double dispatchSeconds_ = 0.0;   // the thresholds that open a stage
     double waitSeconds_ = 0.0;       // blocked in MPI_Waitany
     double mergeSeconds_ = 0.0;      // pushing returned candidates into heaps
 
