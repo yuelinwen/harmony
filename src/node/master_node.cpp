@@ -1098,14 +1098,10 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
         }
     }
 
-    // Thresholds prewarm has just produced, one per query, sent with the
-    // batch. Every worker gets the whole batch's, and sendThresholds()
-    // refreshes the parts of it that matter as the groups move on (paper §5).
-    std::vector<float> seed(count);
-    for (int q = 0; q < count; ++q) {
-        seed[q] = cfg_.pruneDim ? heaps[q].worst() : PRUNED;
-    }
-
+    // No thresholds go out with the batch. Every stage opens by sending the
+    // group that reaches that row its own, and a worker computes nothing
+    // until a stage has opened -- so a whole-batch copy here would be
+    // overwritten before it could be read (paper §5).
     for (int w = 1; w <= numWorkers_; ++w) {
         int job[5] = {JOB_QUERY, count, nprobe, 0, 0};
         MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
@@ -1123,8 +1119,6 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
                  TAG_QUERY, MPI_COMM_WORLD);
         MPI_Send(probes.data(), (int)probes.size(), MPI_INT, w,
                  TAG_PROBES, MPI_COMM_WORLD);
-        MPI_Send(seed.data(), count, MPI_FLOAT, w,
-                 TAG_THRESHOLD, MPI_COMM_WORLD);
     }
     broadcastSeconds_ = broadcastSeconds_ + phase.seconds(true);
 

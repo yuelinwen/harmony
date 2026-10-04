@@ -497,9 +497,10 @@ int WorkerNode::run() {
                 MPI_Recv(probes_.data(), (int)probes_.size(), MPI_INT,
                          MASTER_RANK, TAG_PROBES, MPI_COMM_WORLD,
                          MPI_STATUS_IGNORE);
+                // Sized, not filled: each stage receives the thresholds of
+                // the group it brings, and nothing is computed before a
+                // stage has opened.
                 thresholds_.assign(batch_, PRUNED);
-                MPI_Recv(thresholds_.data(), count, MPI_FLOAT, MASTER_RANK,
-                         TAG_THRESHOLD, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 total_ = run.seconds();
                 continue;
             }
