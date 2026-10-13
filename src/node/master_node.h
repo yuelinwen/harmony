@@ -225,6 +225,30 @@ private:
     std::vector<long> scannedRow_;      // per vector partition
     std::vector<long> aliveAfterStage_;  // still alive after the s-th slice
 
+    // The other two rows of TAG_STATS, summed over the workers: what each
+    // chain position actually computed, and what it put on the wire. A
+    // pruning method that evaluates fewer dimensions but forwards more state
+    // can lose on a slow network, and only these two together can say so.
+    std::vector<long> dimsAfterStage_;
+    std::vector<long> bytesAfterStage_;
+
+    // Threshold staleness: how much looser the threshold a visit pruned
+    // against was than the one its own results made available by the time it
+    // finished. A single machine updates its heap after every candidate, so
+    // there the gap is zero; here a whole block is computed against one
+    // threshold, and this is what that batching leaves on the table.
+    //
+    // Per vector-level stage, because the interesting thing is the decay: the
+    // first visit prunes against a prewarm guess and the gap is wide, later
+    // ones start from a threshold earlier visits already tightened.
+    //
+    // Narrowing it is a real knob -- smaller --block means more frequent
+    // updates -- so this is the number that prices that trade.
+    std::vector<float> sentThreshold_;
+    std::vector<double> stalenessSum_;
+    std::vector<double> stalenessMax_;
+    std::vector<long> stalenessCount_;
+
     // Who passes what to whom, at both levels (engine/search_order.h).
     // chainOrder_ runs a cluster across the columns of a row, groupOrder_ runs
     // a query group across the vector partitions. Both are built in

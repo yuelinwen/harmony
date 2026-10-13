@@ -82,9 +82,9 @@ long WorkerNode::memoryBytes() const {
 //
 // Only here. Later slices skip most candidates, and a dense multiply cannot
 // skip anything, so grouping by cluster would compute what pruning just saved.
-long WorkerNode::accumulateGemm(int firstQ, int len,
-                                const std::vector<size_t>& qOff,
-                                std::vector<float>& sums) {
+HopCount WorkerNode::accumulateGemm(int firstQ, int len,
+                                    const std::vector<size_t>& qOff,
+                                    std::vector<float>& sums) {
     // Which of this block's queries probe each cluster, and where each one's
     // run of totals starts. This is the same walk accumulate() does, read by
     // cluster instead of by query.
@@ -108,7 +108,9 @@ long WorkerNode::accumulateGemm(int firstQ, int len,
     // different runs of sums, and a run belongs to one query, so no two
     // threads ever touch the same element.
     long survivors = 0;
-    #pragma omp parallel for schedule(dynamic) reduction(+ : survivors)
+    long evaluated = 0;
+    #pragma omp parallel for schedule(dynamic) \
+        reduction(+ : survivors) reduction(+ : evaluated)
     for (int bi = 0; bi < (int)byCluster_.size(); ++bi) {
         const std::vector<std::pair<int, size_t> >& mem = byCluster_[bi];
         int m = (int)mem.size();
@@ -118,6 +120,10 @@ long WorkerNode::accumulateGemm(int firstQ, int len,
 
         const ClusterBlock& cb = blocks_[bi];
         int n = (int)cb.ids.size();
+
+        // A dense multiply cannot skip, so every pair here is evaluated --
+        // which is the whole reason this path is only ever a chain head.
+        evaluated = evaluated + (long)m * n;
 
         // gemm wants the participating queries contiguous
         std::vector<float> q((size_t)m * myDim_);
@@ -150,17 +156,21 @@ long WorkerNode::accumulateGemm(int firstQ, int len,
         }
     }
 
-    return survivors;
+    HopCount out;
+    out.evaluated = evaluated;
+    out.survivors = survivors;
+    return out;
 }
 
-long WorkerNode::accumulate(int firstQ, int len,
-                            const std::vector<size_t>& qOff,
-                            std::vector<float>& sums, bool first) {
+HopCount WorkerNode::accumulate(int firstQ, int len,
+                                const std::vector<size_t>& qOff,
+                                std::vector<float>& sums, bool first) {
     if (first) {
         return accumulateGemm(firstQ, len, qOff, sums);
     }
 
     long survivors = 0;
+    long evaluated = 0;
     // One query at a time, walking its probe list and stopping at the
     // clusters this row holds. That walk is the buffer layout: every worker
     // in the row derives the same one, so nobody has to send an index.
@@ -168,7 +178,8 @@ long WorkerNode::accumulate(int firstQ, int len,
     // OpenMP: a query owns its own run of sums, so the threads never write
     // the same memory and no locking is needed (paper §5, node-level
     // parallelism; across nodes the work is already split by MPI).
-    #pragma omp parallel for schedule(static) reduction(+ : survivors)
+    #pragma omp parallel for schedule(static) \
+        reduction(+ : survivors) reduction(+ : evaluated)
     for (int j = 0; j < len; ++j) {
         const float* qv = &queries_[(size_t)(firstQ + j) * myDim_];
         float t = thresholds_[firstQ + j];
@@ -188,6 +199,7 @@ long WorkerNode::accumulate(int firstQ, int len,
                 if (row[v] >= PRUNED) {
                     continue;      // an earlier worker already dropped it
                 }
+                evaluated = evaluated + 1;
                 row[v] = row[v] + l2DistanceSquared(qv, &cb.data[(size_t)v * myDim_],
                                                     myDim_);
                 if (row[v] > t) {
@@ -200,7 +212,10 @@ long WorkerNode::accumulate(int firstQ, int len,
         }
     }
 
-    return survivors;
+    HopCount out;
+    out.evaluated = evaluated;
+    out.survivors = survivors;
+    return out;
 }
 
 void WorkerNode::receiveSetup() {
@@ -227,6 +242,8 @@ void WorkerNode::receiveSetup() {
     rowBase_ = id_ - myCol_;
     myRow_ = (id_ - 1) / bDim_;
     aliveAtStage_.assign(bDim_, 0);
+    dimsAtStage_.assign(bDim_, 0);
+    bytesAtStage_.assign(bDim_, 0);
 
     // Both orders are built here rather than sent, from the one number each
     // needs. The master builds the same two from the same numbers, so the two
@@ -457,8 +474,16 @@ int WorkerNode::run() {
             if (job[0] == JOB_STATS) {
                 total_ = run.seconds();
                 Stopwatch adminWatch;
-                MPI_Send(aliveAtStage_.data(), bDim_, MPI_LONG, MASTER_RANK,
-                         TAG_STATS, MPI_COMM_WORLD);
+                std::vector<long> stats;
+                stats.reserve((size_t)STAT_ROWS * bDim_);
+                stats.insert(stats.end(), aliveAtStage_.begin(),
+                             aliveAtStage_.end());
+                stats.insert(stats.end(), dimsAtStage_.begin(),
+                             dimsAtStage_.end());
+                stats.insert(stats.end(), bytesAtStage_.begin(),
+                             bytesAtStage_.end());
+                MPI_Send(stats.data(), STAT_ROWS * bDim_, MPI_LONG,
+                         MASTER_RANK, TAG_STATS, MPI_COMM_WORLD);
                 double times[WORKER_TIMES] = {total_, idle_, recv_, compute_,
                                               send_, (double)jobs_,
                                               setup_, poll_, admin_,
@@ -474,6 +499,8 @@ int WorkerNode::run() {
             // an earlier --nprobes value does not leak into these numbers.
             if (job[0] == JOB_RESET) {
                 aliveAtStage_.assign(bDim_, 0);
+                dimsAtStage_.assign(bDim_, 0);
+                bytesAtStage_.assign(bDim_, 0);
                 clearCounters();
                 run.reset();
                 continue;
@@ -617,9 +644,15 @@ int WorkerNode::run() {
         size_t total = p.sums.size();
 
         phase.reset();
-        aliveAtStage_[p.stage] = aliveAtStage_[p.stage]
-                               + accumulate(p.firstQ, p.len, p.qOff, p.sums,
-                                            p.stage == 0);
+        HopCount hop = accumulate(p.firstQ, p.len, p.qOff, p.sums,
+                                  p.stage == 0);
+        aliveAtStage_[p.stage] = aliveAtStage_[p.stage] + hop.survivors;
+        // One "dimension evaluated" is one (q[i] - v[i])^2, so a candidate
+        // this hop computed costs the width of this worker's slice. Counting
+        // it here rather than as candidates x width on the master is what
+        // makes an uneven split (128 over 3) add up correctly.
+        dimsAtStage_[p.stage] = dimsAtStage_[p.stage]
+                              + hop.evaluated * (long)myDim_;
         compute_ = compute_ + phase.seconds();
         jobs_ = jobs_ + 1;
 
@@ -670,11 +703,14 @@ int WorkerNode::run() {
 
             // MPI: as bytes, since a Candidate is an int beside a float and
             // every rank is the same build (see topk_heap.h).
-            MPI_Isend(outTop[slot].data(),
-                      (int)((size_t)p.len * k_ * sizeof(Candidate)), MPI_BYTE,
+            size_t bytes = (size_t)p.len * k_ * sizeof(Candidate);
+            bytesAtStage_[p.stage] = bytesAtStage_[p.stage] + (long)bytes;
+            MPI_Isend(outTop[slot].data(), (int)bytes, MPI_BYTE,
                       MASTER_RANK, tagTopk(p.slotTag), MPI_COMM_WORLD,
                       &reqSums[slot]);
         } else {
+            bytesAtStage_[p.stage] = bytesAtStage_[p.stage]
+                                   + (long)(total * sizeof(float));
             outSums[slot] = std::move(p.sums);
             MPI_Isend(outSums[slot].data(), (int)total, MPI_FLOAT, p.nextRank,
                       tagSums(p.slotTag), MPI_COMM_WORLD, &reqSums[slot]);

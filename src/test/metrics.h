@@ -69,8 +69,17 @@ struct Metrics {
 
     // how much work, and how much of it pruning removed (paper Table 3)
     long scanned = 0;
+    int dim = 0;
     std::vector<long> scannedRow;
     std::vector<long> aliveAfterStage;
+
+    // The harness: what each chain position computed and put on the wire,
+    // and how far behind the thresholds it pruned against were.
+    std::vector<long> dimsAfterStage;
+    std::vector<long> bytesAfterStage;
+    std::vector<double> stalenessMean;   // per vector-level visit
+    std::vector<double> stalenessMax;
+    std::vector<long> stalenessCount;
 
     // [total, idle, recv, compute, send, jobs, setup, poll, admin, bytes]
     // per worker, as collected over TAG_TIMES
@@ -106,6 +115,10 @@ struct Metrics {
 private:
     void printWorkerTimes() const;
     void printMasterTimes() const;
+
+    // Per chain position: candidates, dimension operations, bytes forwarded;
+    // then the totals and the threshold staleness.
+    void printHarness() const;
     void printTimeBreakdown() const;
 };
 

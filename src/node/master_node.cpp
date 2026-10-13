@@ -633,6 +633,9 @@ void MasterNode::distributeData() {
 void MasterNode::resetCounters() {
     scanned_ = 0;
     scannedRow_.assign(bVec_, 0);
+    stalenessSum_.assign(bVec_, 0.0);
+    stalenessMax_.assign(bVec_, 0.0);
+    stalenessCount_.assign(bVec_, 0);
     masterTotal_ = 0.0;
     stage0Seconds_ = 0.0;
     broadcastSeconds_ = 0.0;
@@ -649,20 +652,24 @@ void MasterNode::resetCounters() {
 // several nprobe values against one distribution needs.
 void MasterNode::collectStats() {
     aliveAfterStage_.assign(bDim_, 0);
+    dimsAfterStage_.assign(bDim_, 0);
+    bytesAfterStage_.assign(bDim_, 0);
 
     for (int w = 1; w <= numWorkers_; ++w) {
         int job[5] = {JOB_STATS, 0, 0, 0, 0};
         MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
     }
 
-    // every worker reports its counts per chain position; sum them up
-    std::vector<long> perWorker(bDim_);
+    // every worker reports its three counters per chain position; sum them up
+    std::vector<long> perWorker((size_t)STAT_ROWS * bDim_);
     workerTimes_.assign(numWorkers_, std::vector<double>(WORKER_TIMES, 0.0));
     for (int w = 1; w <= numWorkers_; ++w) {
-        MPI_Recv(perWorker.data(), bDim_, MPI_LONG, w, TAG_STATS,
+        MPI_Recv(perWorker.data(), STAT_ROWS * bDim_, MPI_LONG, w, TAG_STATS,
                  MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         for (int s = 0; s < bDim_; ++s) {
             aliveAfterStage_[s] = aliveAfterStage_[s] + perWorker[s];
+            dimsAfterStage_[s] = dimsAfterStage_[s] + perWorker[bDim_ + s];
+            bytesAfterStage_[s] = bytesAfterStage_[s] + perWorker[2 * bDim_ + s];
         }
         MPI_Recv(workerTimes_[w - 1].data(), WORKER_TIMES, MPI_DOUBLE, w, TAG_TIMES,
                  MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -764,6 +771,9 @@ void MasterNode::sendThresholds(int row, int gStart, int gLen,
         // an infinite threshold drops nothing, which is the no-dimension-level
         // arm of --pruning (paper Fig. 10)
         t[j] = cfg_.pruneDim ? heaps[gStart + j].worst() : PRUNED;
+        // kept so the staleness of this visit can be read off when the
+        // block it prunes comes back
+        sentThreshold_[gStart + j] = t[j];
     }
     for (int col = 0; col < bDim_; ++col) {
         int w = row * bDim_ + col + 1;
@@ -796,6 +806,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
                                 std::vector<TopKHeap>& heaps) {
     struct Slot {
         int row;
+        int stage;                    // which visit this is, for staleness
         int firstQ;
         int len;
         long load;                    // candidates this block offers, counted once
@@ -838,11 +849,30 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
         for (int j = 0; j < s.len; ++j) {
             const Candidate* top = &s.top[(size_t)j * k];
             TopKHeap& heap = heaps[s.firstQ + j];
+
+            float sent = sentThreshold_[s.firstQ + j];
+
             for (int t = 0; t < k; ++t) {
                 if (top[t].dist >= PRUNED) {
                     break;   // the tail pads its unused slots, nearest first
                 }
                 heap.push(top[t].id, top[t].dist);
+            }
+
+            // After the push: the gap between what this visit actually pruned
+            // against and what its own results had made available by the time
+            // it finished. A single machine never has this gap -- it reheaps
+            // after every candidate -- so it is what deciding once per block
+            // instead of once per candidate leaves on the table.
+            float after = heap.worst();
+            if (sent < PRUNED && after > 0.0f && after < PRUNED &&
+                sent >= after) {
+                double gap = (sent - after) / after;
+                stalenessSum_[s.stage] = stalenessSum_[s.stage] + gap;
+                stalenessCount_[s.stage] = stalenessCount_[s.stage] + 1;
+                if (gap > stalenessMax_[s.stage]) {
+                    stalenessMax_[s.stage] = gap;
+                }
             }
         }
         mergeSeconds_ = mergeSeconds_ + watch.seconds();
@@ -893,6 +923,7 @@ void MasterNode::vectorPipeline(const std::vector<std::vector<int>>& groupMember
                 int id = blockTag(g, stage, b, bVec_, blocks);
 
                 slot[id].row = r;
+                slot[id].stage = stage;
                 slot[id].firstQ = firstQ;
                 slot[id].len = len;
                 slot[id].load = load;
@@ -939,6 +970,7 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
     // (Algorithm 1 line 20).
     std::vector<QueryState> batch(count);
     std::vector<TopKHeap> heaps(count, TopKHeap(k));
+    sentThreshold_.assign(count, PRUNED);
 
     Stopwatch phase;
 
@@ -1209,6 +1241,17 @@ int MasterNode::run() {
     m.scanned = scanned_;
     m.scannedRow = scannedRow_;
     m.aliveAfterStage = aliveAfterStage_;
+    m.dimsAfterStage = dimsAfterStage_;
+    m.bytesAfterStage = bytesAfterStage_;
+    m.stalenessMean.assign(bVec_, 0.0);
+    for (int s = 0; s < bVec_; ++s) {
+        if (stalenessCount_[s] > 0) {
+            m.stalenessMean[s] = stalenessSum_[s] / stalenessCount_[s];
+        }
+    }
+    m.stalenessMax = stalenessMax_;
+    m.stalenessCount = stalenessCount_;
+    m.dim = base_.getDim();
     m.workerTimes = workerTimes_;
 
     m.masterTotal = masterTotal_;

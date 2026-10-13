@@ -56,7 +56,17 @@ const int TAG_PROBES    = 9;   // int[count * nprobe]: every query's clusters,
 // group's next partition starts from a threshold its last one tightened
 // (Fig. 5a) -- and it is the only thing the master sends during a batch.
 const int TAG_THRESHOLD = 7;
-const int TAG_STATS     = 10;  // long[bDim]: survivors per chain position
+// long[STAT_ROWS * bDim]: three counters per chain position, in this order --
+// candidates still alive after that hop, one-dimension operations that hop
+// actually performed, and bytes it forwarded. The first is paper Table 3; the
+// other two are what a pruning method has to be judged on once it is
+// distributed, where computing less and transmitting less are different
+// things and can point opposite ways.
+//
+// Each worker multiplies by its own slice width before reporting, so a
+// dimension split that does not divide evenly still adds up.
+const int STAT_ROWS     = 3;
+const int TAG_STATS     = 10;
 const int TAG_TIMES     = 12;  // double[WORKER_TIMES]: worker's wall time
 
 // How many numbers a worker reports about where its time went, in this order:

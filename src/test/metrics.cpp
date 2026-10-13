@@ -208,6 +208,72 @@ void Metrics::printTimeBreakdown() const {
 // That table says how long the workers waited; this says what they waited
 // for. The remainder is MPI_Waitany plus pushing returned candidates into the
 // heaps, which is the only part of a batch the master cannot hand to anyone.
+// The five numbers the harness exists for. Candidates and dimensions say how
+// much arithmetic the pruning removed; bytes says what it cost to spread that
+// decision over machines; staleness says how far behind the information those
+// decisions were made on. On one machine the last two are zero, which is the
+// point -- they are what distributing the pruning adds.
+void Metrics::printHarness() const {
+    if (dimsAfterStage.empty()) {
+        return;
+    }
+
+    long dims = 0;
+    long bytes = 0;
+    for (size_t s = 0; s < dimsAfterStage.size(); ++s) {
+        dims = dims + dimsAfterStage[s];
+        bytes = bytes + bytesAfterStage[s];
+    }
+
+    // What the same search would have cost with nothing pruned: every
+    // candidate offered, over every dimension.
+    double full = (double)scanned * dim;
+
+    std::ios_base::fmtflags flags = std::cout.flags();
+    std::streamsize digits = std::cout.precision();
+
+    std::cout << "\n===== harness =====" << std::endl;
+    std::cout << "  hop    candidates         dims evaluated        bytes out"
+              << std::endl;
+    for (size_t s = 0; s < dimsAfterStage.size(); ++s) {
+        std::cout << "  " << std::setw(3) << s
+                  << std::setw(14) << aliveAfterStage[s]
+                  << std::setw(23) << dimsAfterStage[s]
+                  << std::setw(17) << bytesAfterStage[s] << std::endl;
+    }
+
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "  dimensions evaluated: " << (double)dims / 1e9 << " G";
+    if (full > 0.0) {
+        std::cout << "   (" << (100.0 * dims / full) << "% of no pruning)";
+    }
+    std::cout << std::endl;
+
+    std::cout << "  bytes forwarded:      " << (double)bytes / 1e6 << " MB";
+    if (nq > 0) {
+        std::cout << "   (" << ((double)bytes / nq / 1024.0)
+                  << " KB per query)";
+    }
+    std::cout << std::endl;
+
+    std::cout << "  threshold staleness, by visit:" << std::endl;
+    for (size_t s = 0; s < stalenessMean.size(); ++s) {
+        if (stalenessCount[s] == 0) {
+            continue;
+        }
+        std::cout << "    visit " << s
+                  << "   mean " << std::setw(8) << (100.0 * stalenessMean[s])
+                  << "%   max " << std::setw(10) << (100.0 * stalenessMax[s])
+                  << "%   over " << stalenessCount[s] << " queries"
+                  << std::endl;
+    }
+    std::cout << "    (0% is what one machine would show: it reheaps after"
+              << " every candidate)" << std::endl;
+
+    std::cout.flags(flags);
+    std::cout.precision(digits);
+}
+
 void Metrics::printMasterTimes() const {
     if (masterTotal <= 0.0) {
         return;
@@ -357,6 +423,7 @@ void Metrics::print() const {
 
     printWorkerTimes();
     printMasterTimes();
+    printHarness();
 }
 
 // One row per run, appended, header written when the file is new. Everything

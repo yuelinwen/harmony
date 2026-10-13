@@ -22,6 +22,15 @@
 
 namespace harmony {
 
+// What one hop of the chain did to a block, which is what the harness is
+// built on: `evaluated` is how many candidate distances it actually computed
+// -- the ones an earlier hop had already pruned cost nothing -- and
+// `survivors` is how many of them are still alive afterwards.
+struct HopCount {
+    long evaluated = 0;
+    long survivors = 0;
+};
+
 // One cluster living on this worker.
 struct ClusterBlock {
     int clusterId;            // id in the master's global clustering
@@ -78,14 +87,14 @@ public:
     // against every cluster of its probe list that this worker holds. qOff
     // says where each query's run of running totals starts in sums.
     //
-    // Returns how many candidates came out of it still alive, which is what
-    // the paper's Table 3 ratios are built from. Counted here rather than by a
-    // pass over sums afterwards: this loop already visits every element, and
-    // has threads, whereas that pass was serial over millions of floats and
-    // measured 2.5% of the run at bDim = 1 and 14% at bDim = 4.
-    long accumulate(int firstQ, int len,
-                    const std::vector<size_t>& qOff, std::vector<float>& sums,
-                    bool first);
+    // Returns how many candidates it computed and how many came out still
+    // alive. Counted here rather than by a pass over sums afterwards: this
+    // loop already visits every element, and has threads, whereas that pass
+    // was serial over millions of floats and measured 2.5% of the run at
+    // bDim = 1 and 14% at bDim = 4.
+    HopCount accumulate(int firstQ, int len,
+                        const std::vector<size_t>& qOff,
+                        std::vector<float>& sums, bool first);
 
 private:
     // Takes myDim, the cluster count, and then every cluster block.
@@ -99,11 +108,12 @@ private:
     // so there is nothing to fall back to. No switch either, because measured
     // on the cluster it is never worse: +49% QPS at myDim 128, +22% at 64,
     // and inside the noise at 32 and 16, the gain shrinking with the slice
-    // width exactly as arithmetic intensity says it should. Returns the
-    // survivor count, like accumulate().
-    long accumulateGemm(int firstQ, int len,
-                        const std::vector<size_t>& qOff,
-                        std::vector<float>& sums);
+    // width exactly as arithmetic intensity says it should. Counts the same
+    // two numbers accumulate() does; a dense multiply skips nothing, so
+    // everything offered here is evaluated.
+    HopCount accumulateGemm(int firstQ, int len,
+                            const std::vector<size_t>& qOff,
+                            std::vector<float>& sums);
 
     // Scratch for the above: byCluster_[bi] lists the queries of the current
     // block that probe cluster bi, and where each one's run starts in sums.
@@ -205,9 +215,13 @@ private:
                        // the wait for them
     long jobs_;        // clusters served
 
-    // Survivors by position in the chain, not by worker: rotation makes a
-    // worker the first stop for some clusters and the last for others.
-    std::vector<long> aliveAtStage_;
+    // Three counters by position in the chain, not by worker: rotation makes
+    // a worker the first stop for some blocks and the last for others, so the
+    // chain position is what the numbers mean something about. Shipped as one
+    // array over TAG_STATS (comm/messages.h).
+    std::vector<long> aliveAtStage_;   // still alive after this hop
+    std::vector<long> dimsAtStage_;    // one-dimension operations performed
+    std::vector<long> bytesAtStage_;   // bytes forwarded out of this hop
     std::vector<ClusterBlock> blocks_;
 };
 
