@@ -12,10 +12,16 @@ namespace harmony {
 // one that can prune nothing, since it has no partial sum to test yet
 // (paper §4.3). Every item therefore enters the chain at a different worker.
 //
-// Held as a table rather than computed from a formula. The rotation below is
-// the only order built so far, but a table can express any order, which is
-// what §4.3's load-aware reordering -- put the overloaded worker last -- would
-// need.
+// Held as a table rather than computed from a formula, because two different
+// rotations are needed -- one over the columns of a row, one over the vector
+// partitions -- and a table says which is which at a glance.
+//
+// §4.3 also suggests reordering the chains from measured load, putting the
+// overloaded machine last. That was built and measured: on a homogeneous
+// cluster the busiest column is the one holding the most discriminative
+// dimensions, and burying it costs 9-12% throughput on fashion-mnist and
+// MNIST because the sharpest pruner then runs last. Removed; the plain
+// rotation below is what ships, as in the authors' own code.
 //
 // Workers and items are both 0-based here.
 class SearchOrder {
@@ -24,18 +30,6 @@ public:
 
     SearchOrder(int workers, int items, bool rotate) {
         build(workers, items, rotate);
-    }
-
-    // Built from chains given outright, one per item, each listing every
-    // worker in the order that item visits them. The rotation above is the
-    // only order this class makes on its own; anything else -- such as §4.3's
-    // "put the overloaded machine last" -- is a policy, and policies live
-    // where the load is measured, not here.
-    SearchOrder(const std::vector<std::vector<int> >& chains, int workers) {
-        workers_ = workers;
-        items_ = (int)chains.size();
-        chain_ = chains;
-        link();
     }
 
     // The workers handling this item, first stop first.

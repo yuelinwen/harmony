@@ -71,11 +71,6 @@ public:
     // One column's rows of the chain table, as the worker expects them.
     std::vector<int> chainTableFor(int col) const;
 
-    // Paper §4.3: moves the column that has been doing the most arithmetic to
-    // the end of every chain, where most candidates have already been pruned.
-    // Call between batches only -- see the comment on the definition.
-    void reorderChains();
-
     // Zeroes the counters, here and on every worker.
     void resetCounters();
 
@@ -273,14 +268,6 @@ private:
     double dispatchSeconds_ = 0.0;   // the thresholds that open a stage
     double waitSeconds_ = 0.0;       // blocked in MPI_Waitany
     double mergeSeconds_ = 0.0;      // pushing returned candidates into heaps
-
-    // Chain reordering state (§4.3). prevCompute_ is what each worker had
-    // done at the previous look, so the difference is this batch's work;
-    // colSmooth_ is the per-column load with the swings taken out.
-    static constexpr double kReorderDeadzone = 0.10;
-    std::vector<double> prevCompute_;
-    std::vector<double> colSmooth_;
-    int reorders_ = 0;
 };
 
 }  // namespace harmony

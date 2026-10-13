@@ -357,9 +357,6 @@ void Metrics::print() const {
 
     printWorkerTimes();
     printMasterTimes();
-    if (bDim > 1) {
-        std::cout << "chain reordered " << reorders << " time(s)" << std::endl;
-    }
 }
 
 // One row per run, appended, header written when the file is new. Everything

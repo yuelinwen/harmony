@@ -232,9 +232,10 @@ void WorkerNode::receiveSetup() {
     // side sends it: at stage s the group on this row is stepsOf(myRow_)[s].
     groupOrder_ = SearchOrder(bVec_, bVec_, true);
 
-    // The chain table, built by the master and handed over row by row. A
-    // worker never builds it itself: only the master can change it, which is
-    // what any load-aware reordering would need.
+    // The chain table, built by the master and handed over column by column.
+    // It never changes after this, so a worker could derive it the way it
+    // derives the group order; it is sent because the master is where the
+    // layout is decided and one source is one thing to keep consistent.
     std::vector<int> table(3 * bDim_);
     MPI_Recv(table.data(), 3 * bDim_, MPI_INT, MASTER_RANK, TAG_ORDER,
              MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -454,21 +455,6 @@ int WorkerNode::run() {
                                               (double)memoryBytes()};
                 MPI_Send(times, WORKER_TIMES, MPI_DOUBLE, MASTER_RANK,
                          TAG_TIMES, MPI_COMM_WORLD);
-                admin_ = admin_ + adminWatch.seconds();
-                continue;
-            }
-
-            // A new chain table. Safe here and only here: the master sends
-            // it between batches, when no block is part-way along a chain.
-            if (job[0] == JOB_ORDER) {
-                total_ = run.seconds();
-                Stopwatch adminWatch;
-                std::vector<int> table(3 * bDim_);
-                MPI_Recv(table.data(), 3 * bDim_, MPI_INT, MASTER_RANK,
-                         TAG_ORDER, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                nextOf_.assign(table.begin(), table.begin() + bDim_);
-                prevOf_.assign(table.begin() + bDim_, table.begin() + 2 * bDim_);
-                stageOf_.assign(table.begin() + 2 * bDim_, table.end());
                 admin_ = admin_ + adminWatch.seconds();
                 continue;
             }

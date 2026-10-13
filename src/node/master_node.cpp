@@ -574,94 +574,6 @@ std::vector<int> MasterNode::chainTableFor(int col) const {
     return table;
 }
 
-// Paper §4.3, the paragraph after Fig. 5b: when the machine holding one
-// dimension block becomes overloaded, later queries should process that block
-// last. Later stages are the light ones -- by the end of a chain most
-// candidates have been pruned -- so the position is the lever.
-//
-// Measure, decide, rewrite the table, send it. Only between batches: a block
-// carries nothing but its item number, and both ends of a hop have to agree
-// on what that item means, so the table can only change while no block is
-// part-way along a chain.
-//
-// The paper gives no rule, so this one: rank the columns by the arithmetic
-// they did since the last look, and make the heaviest one the last stop of
-// every chain. The others keep rotating among the earlier stages, which is
-// what stops any of them becoming the permanent head.
-void MasterNode::reorderChains() {
-    if (bDim_ < 2) {
-        return;      // a chain of one has no order to change
-    }
-
-    collectStats();
-
-    // Work done since the previous look. A --loop pass or a new --nprobes
-    // value zeroes the workers' counters, which shows up as a drop.
-    std::vector<double> colLoad(bDim_, 0.0);
-    for (int w = 0; w < numWorkers_; ++w) {
-        double now = workerTimes_[w][3];
-        double before = (w < (int)prevCompute_.size()) ? prevCompute_[w] : 0.0;
-        double delta = (now >= before) ? (now - before) : now;
-        colLoad[w % bDim_] += delta;
-    }
-    prevCompute_.assign(numWorkers_, 0.0);
-    for (int w = 0; w < numWorkers_; ++w) {
-        prevCompute_[w] = workerTimes_[w][3];
-    }
-
-    // Exponential smoothing, so one unrepresentative batch cannot swing the
-    // order, and a dead zone, so a spread that is already small leaves it
-    // alone. Without both, the heaviest column is relieved, becomes the
-    // lightest, and the order flips back and forth every batch.
-    if (colSmooth_.empty()) {
-        colSmooth_ = colLoad;
-    } else {
-        for (int c = 0; c < bDim_; ++c) {
-            colSmooth_[c] = 0.7 * colSmooth_[c] + 0.3 * colLoad[c];
-        }
-    }
-
-    double lo = colSmooth_[0];
-    double hi = colSmooth_[0];
-    for (int c = 1; c < bDim_; ++c) {
-        lo = (colSmooth_[c] < lo) ? colSmooth_[c] : lo;
-        hi = (colSmooth_[c] > hi) ? colSmooth_[c] : hi;
-    }
-    if (hi <= 0.0 || (hi - lo) / hi < kReorderDeadzone) {
-        return;
-    }
-
-    // Columns lightest first; the last of them is the one to bury.
-    std::vector<int> order(bDim_);
-    for (int c = 0; c < bDim_; ++c) {
-        order[c] = c;
-    }
-    std::sort(order.begin(), order.end(),
-              [this](int a, int b) { return colSmooth_[a] < colSmooth_[b]; });
-
-    int busiest = order[bDim_ - 1];
-    std::vector<int> rest(order.begin(), order.end() - 1);
-
-    std::vector<std::vector<int> > chains(bDim_);
-    for (int item = 0; item < bDim_; ++item) {
-        chains[item].clear();
-        for (int p = 0; p < (int)rest.size(); ++p) {
-            chains[item].push_back(rest[(item + p) % rest.size()]);
-        }
-        chains[item].push_back(busiest);
-    }
-    chainOrder_ = SearchOrder(chains, bDim_);
-
-    for (int w = 1; w <= numWorkers_; ++w) {
-        int job[5] = {JOB_ORDER, 0, 0, 0, 0};
-        MPI_Send(job, 5, MPI_INT, w, TAG_JOB, MPI_COMM_WORLD);
-        std::vector<int> table = chainTableFor((w - 1) % bDim_);
-        MPI_Send(table.data(), (int)table.size(), MPI_INT, w, TAG_ORDER,
-                 MPI_COMM_WORLD);
-    }
-    reorders_ = reorders_ + 1;
-}
-
 // What a worker sizes its outgoing buffer pool from. A row serves one group
 // at a time, so a worker has that group's blocks open; without the
 // vector-level barrier a group holds every partition at once, which squares
@@ -1262,10 +1174,6 @@ int MasterNode::run() {
             seconds = seconds + took;
         }
 
-        // Between batches, with the chains empty. Outside the timed section:
-        // it measures and re-plans, which is not the search.
-        reorderChains();
-
         if (!last) {
             continue;   // intermediate passes are only there to be timed
         }
@@ -1328,7 +1236,6 @@ int MasterNode::run() {
     m.scannedRow = scannedRow_;
     m.aliveAfterStage = aliveAfterStage_;
     m.workerTimes = workerTimes_;
-    m.reorders = reorders_;
 
     m.masterTotal = masterTotal_;
     m.masterStage0 = stage0Seconds_;

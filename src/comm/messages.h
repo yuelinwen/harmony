@@ -135,10 +135,6 @@ const int JOB_RESET    = -3;
 // it ends the process. --nprobes runs several searches against one
 // distribution and each needs its own numbers.
 const int JOB_STATS    = -4;
-// A new chain table follows, same int[3 * bDim] as TAG_ORDER at setup. Sent
-// between batches, when nothing is on the chain: a block carries only its
-// item, and both ends of a hop have to agree on what that item means.
-const int JOB_ORDER    = -6;
 // How a worker knows what to do during a batch, given that nothing tells it.
 //
 // A batch is bVec stages. At stage s, the query group reaching row r is

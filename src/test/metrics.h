@@ -75,7 +75,6 @@ struct Metrics {
     // [total, idle, recv, compute, send, jobs, setup, poll, admin, bytes]
     // per worker, as collected over TAG_TIMES
     std::vector<std::vector<double>> workerTimes;
-    int reorders = 0;
 
     // Where the master's own seconds went, over the counted pass.
     double masterTotal = 0.0;
