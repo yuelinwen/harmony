@@ -68,9 +68,6 @@ public:
     // default changed.
     int maxBlocksInFlight() const;
 
-    // One column's rows of the chain table, as the worker expects them.
-    std::vector<int> chainTableFor(int col) const;
-
     // Zeroes the counters, here and on every worker.
     void resetCounters();
 

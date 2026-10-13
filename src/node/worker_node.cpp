@@ -228,20 +228,30 @@ void WorkerNode::receiveSetup() {
     myRow_ = (id_ - 1) / bDim_;
     aliveAtStage_.assign(bDim_, 0);
 
-    // The same rotation the master builds, from the same one number. Neither
-    // side sends it: at stage s the group on this row is stepsOf(myRow_)[s].
+    // Both orders are built here rather than sent, from the one number each
+    // needs. The master builds the same two from the same numbers, so the two
+    // sides always agree without a message: at stage s the group on this row
+    // is stepsOf(myRow_)[s], and item i enters the row at chain(i)[0].
+    //
+    // This works because neither order changes once the grid is fixed. It did
+    // not always: §4.3's load-aware reordering rewrote the chain order from
+    // measured load, which only the master can see, so the table had to be
+    // shipped. That was measured and removed (engine/search_order.h).
     groupOrder_ = SearchOrder(bVec_, bVec_, true);
+    SearchOrder chainOrder(bDim_, bDim_, true);
 
-    // The chain table, built by the master and handed over column by column.
-    // It never changes after this, so a worker could derive it the way it
-    // derives the group order; it is sent because the master is where the
-    // layout is decided and one source is one thing to keep consistent.
-    std::vector<int> table(3 * bDim_);
-    MPI_Recv(table.data(), 3 * bDim_, MPI_INT, MASTER_RANK, TAG_ORDER,
-             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    nextOf_.assign(table.begin(), table.begin() + bDim_);
-    prevOf_.assign(table.begin() + bDim_, table.begin() + 2 * bDim_);
-    stageOf_.assign(table.begin() + 2 * bDim_, table.end());
+    nextOf_ = chainOrder.nextRow(myCol_);
+    prevOf_ = chainOrder.prevRow(myCol_);
+    stageOf_.assign(bDim_, 0);
+    for (int item = 0; item < bDim_; ++item) {
+        const std::vector<int>& chain = chainOrder.chain(item);
+        for (int p = 0; p < (int)chain.size(); ++p) {
+            if (chain[p] == myCol_) {
+                stageOf_[item] = p;
+                break;
+            }
+        }
+    }
 
     for (int c = 0; c < nClusters; ++c) {
         int header[2];

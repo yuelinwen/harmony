@@ -41,9 +41,6 @@ const int TAG_SETUP   = 1;
 const int TAG_CLUSTER = 2;   // int[2]: clusterId, nIds
 const int TAG_IDS     = 3;   // int[nIds]
 const int TAG_DATA    = 4;   // float[nIds * myDim]
-const int TAG_ORDER   = 13;  // int[3 * bDim]: this worker's rows of the
-                             // chain table -- next, prev, stage -- one entry
-                             // per item. See engine/search_order.h.
 
 // per batch of queries
 const int TAG_JOB       = 5;   // int[5], see below

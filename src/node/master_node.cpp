@@ -552,28 +552,6 @@ void MasterNode::splitGrid(int bVec, int bDim) {
     }
 }
 
-// One column's three rows of the chain table -- next, prev and stage, one
-// entry per item -- which is all a worker needs to know about the order.
-std::vector<int> MasterNode::chainTableFor(int col) const {
-    std::vector<int> table;
-    table.insert(table.end(), chainOrder_.nextRow(col).begin(),
-                 chainOrder_.nextRow(col).end());
-    table.insert(table.end(), chainOrder_.prevRow(col).begin(),
-                 chainOrder_.prevRow(col).end());
-    for (int item = 0; item < bDim_; ++item) {
-        const std::vector<int>& chain = chainOrder_.chain(item);
-        int stage = 0;
-        for (int p = 0; p < (int)chain.size(); ++p) {
-            if (chain[p] == col) {
-                stage = p;
-                break;
-            }
-        }
-        table.push_back(stage);
-    }
-    return table;
-}
-
 // What a worker sizes its outgoing buffer pool from. A row serves one group
 // at a time, so a worker has that group's blocks open; without the
 // vector-level barrier a group holds every partition at once, which squares
@@ -614,10 +592,6 @@ void MasterNode::distributeData() {
         setup[8] = cfg_.pruneVector ? 1 : 0;
         // MPI: blocking is fine for startup -- the order is fixed and nobody waits
         MPI_Send(setup, 9, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
-
-        std::vector<int> table = chainTableFor(col);
-        MPI_Send(table.data(), (int)table.size(), MPI_INT, w, TAG_ORDER,
-                 MPI_COMM_WORLD);
     }
 
     for (int c = 0; c < index_.getNlist(); ++c) {
