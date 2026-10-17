@@ -170,6 +170,38 @@ void Metrics::printWorkerTimes() const {
                   << (100.0 * (total - named) / total) << "%" << std::endl;
     }
 
+    // How unevenly the arithmetic actually fell, as one number. The table
+    // above has it per worker, but comparing eight rows by eye does not go
+    // into a result table, and this is the figure a partitioning scheme is
+    // judged on: every query waits for the slowest machine holding part of
+    // it.
+    //
+    // Measured on compute seconds rather than total, because total is the
+    // same for everyone by construction -- a worker that finishes early just
+    // waits.
+    double lo = -1.0;
+    double hi = 0.0;
+    double sum = 0.0;
+    for (int w = 1; w <= workers; ++w) {
+        double c = workerTimes[w - 1][3];
+        if (lo < 0.0 || c < lo) {
+            lo = c;
+        }
+        if (c > hi) {
+            hi = c;
+        }
+        sum = sum + c;
+    }
+    if (lo > 0.0) {
+        std::cout << std::fixed << std::setprecision(3)
+                  << "  busy time: " << lo << "s to " << hi << "s"
+                  << "   mean " << (sum / workers) << "s"
+                  << std::setprecision(2)
+                  << "   spread " << (hi / lo) << "x" << std::endl;
+        std::cout.flags(flags);
+        std::cout.precision(digits);
+    }
+
     std::cout.flags(flags);
     std::cout.precision(digits);
 
@@ -435,6 +467,90 @@ void Metrics::print() const {
     printWorkerTimes();
     printMasterTimes();
     printThresholdGap();
+    printFive();
+}
+
+// The five numbers everything above exists to produce, together, so that one
+// run can be put beside another without reading the whole output.
+//
+// They decompose "why was this fast or slow" into four separate questions:
+// how much arithmetic the pruning removed, what it cost to spread that
+// decision over machines, how evenly the work landed, and how far behind the
+// information each decision was made on. A method that evaluates fewer
+// dimensions but forwards more state can lose, and only these together say
+// so.
+void Metrics::printFive() const {
+    std::ios_base::fmtflags flags = std::cout.flags();
+    std::streamsize digits = std::cout.precision();
+
+    long dimOps = 0;
+    long bytesSent = 0;
+    for (size_t s = 0; s < dimsAfterStage.size(); ++s) {
+        dimOps = dimOps + dimsAfterStage[s];
+        bytesSent = bytesSent + bytesAfterStage[s];
+    }
+    double full = (double)scanned * dim;
+
+    double lo = -1.0;
+    double hi = 0.0;
+    for (int w = 1; w <= (int)workerTimes.size(); ++w) {
+        double c = workerTimes[w - 1][3];
+        if (lo < 0.0 || c < lo) {
+            lo = c;
+        }
+        if (c > hi) {
+            hi = c;
+        }
+    }
+
+    std::cout << "\n===== five numbers =====" << std::endl;
+    std::cout << std::fixed << std::setprecision(2);
+
+    std::cout << "  1. dimensions evaluated   " << (double)dimOps / 1e9 << " G";
+    if (full > 0.0) {
+        std::cout << "   (" << (100.0 * dimOps / full) << "% of no pruning)";
+    }
+    std::cout << std::endl;
+
+    std::cout << "  2. candidates per hop     ";
+    if (!aliveAfterStage.empty()) {
+        std::cout << (double)scanned / 1e6 << " M offered, "
+                  << (double)aliveAfterStage[aliveAfterStage.size() - 1] / 1e6
+                  << " M alive at the tail   (" << bDim << " hop"
+                  << (bDim == 1 ? "" : "s") << ")";
+    }
+    std::cout << std::endl;
+
+    std::cout << "  3. bytes per hop          " << (double)bytesSent / 1e6
+              << " MB";
+    if (nq > 0) {
+        std::cout << "   (" << ((double)bytesSent / nq / 1024.0)
+                  << " KB per query)";
+    }
+    std::cout << std::endl;
+
+    std::cout << "  4. node busy-time skew    ";
+    if (lo > 0.0) {
+        std::cout << (hi / lo) << "x"
+                  << std::setprecision(3) << "   (" << lo << "s to " << hi
+                  << "s over " << workerTimes.size() << " workers)"
+                  << std::setprecision(2);
+    }
+    std::cout << std::endl;
+
+    std::cout << "  5. threshold gap          ";
+    if (!stalenessMean.empty()) {
+        std::cout << (100.0 * stalenessMean[0]) << "% at round 1";
+        if (stalenessMean.size() > 1) {
+            std::cout << ", " << (100.0 * stalenessMean[stalenessMean.size() - 1])
+                      << "% at round " << stalenessMean.size();
+        }
+        std::cout << "   (average)";
+    }
+    std::cout << std::endl;
+
+    std::cout.flags(flags);
+    std::cout.precision(digits);
 }
 
 // One row per run, appended, header written when the file is new. Everything

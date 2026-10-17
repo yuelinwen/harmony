@@ -118,6 +118,9 @@ private:
 
     // How stale the threshold each round pruned against was.
     void printThresholdGap() const;
+
+    // The five, together, at the very bottom: one run beside another.
+    void printFive() const;
     void printTimeBreakdown() const;
 };
 
