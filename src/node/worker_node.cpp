@@ -270,6 +270,25 @@ void WorkerNode::receiveSetup() {
         }
     }
 
+    // --netprobe: the master times a few round trips against rank 1 before
+    // any data moves. The counts come from comm/messages.h so both sides
+    // agree; getting them wrong would hang here rather than fail.
+    if (cfg_.netProbe && id_ == 1) {
+        std::vector<char> buf(PROBE_BYTES);
+        char ping[8] = {0};
+        for (int i = 0; i < PROBE_ROUNDS + 1; ++i) {
+            MPI_Recv(buf.data(), PROBE_BYTES, MPI_BYTE, MASTER_RANK, TAG_PROBE,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Send(buf.data(), PROBE_BYTES, MPI_BYTE, MASTER_RANK, TAG_PROBE,
+                     MPI_COMM_WORLD);
+        }
+        for (int i = 0; i < PROBE_PINGS; ++i) {
+            MPI_Recv(ping, 8, MPI_BYTE, MASTER_RANK, TAG_PROBE, MPI_COMM_WORLD,
+                     MPI_STATUS_IGNORE);
+            MPI_Send(ping, 8, MPI_BYTE, MASTER_RANK, TAG_PROBE, MPI_COMM_WORLD);
+        }
+    }
+
     for (int c = 0; c < nClusters; ++c) {
         int header[2];
         MPI_Recv(header, 2, MPI_INT, MASTER_RANK, TAG_CLUSTER,

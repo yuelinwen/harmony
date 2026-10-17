@@ -57,6 +57,11 @@ public:
     // Cuts every cluster into per-worker slices and sends them out.
     void distributeData();
 
+    // What this interconnect does for a chain-sized message, and what that
+    // implies --commcost should be. Nothing reads the answer -- it is printed
+    // so a result can be read knowing what the network was doing under it.
+    void probeNetwork();
+
     // The most blocks one worker can have open at once.
     //
     // The only place this is worked out. A worker sizes its outgoing buffer

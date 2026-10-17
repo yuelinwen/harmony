@@ -567,6 +567,92 @@ int MasterNode::maxBlocksInFlight() const {
 //
 // The master does the cutting and sends only the slice, so no worker ever
 // holds data it does not own.
+// Bandwidth at the size a chain hop carries, latency at the smallest size,
+// and this machine's own distance-kernel rate -- the three numbers
+// --commcost is a ratio of. Run against rank 1 only; the rest are already
+// blocked waiting for their clusters, so they pay nothing.
+//
+// The kernel rate is measured here rather than assumed because it is the
+// denominator: a byte is expensive only relative to how fast the arithmetic
+// it displaces would have been.
+void MasterNode::probeNetwork() {
+    if (!cfg_.netProbe || numWorkers_ < 1) {
+        return;
+    }
+
+    std::vector<char> buf(PROBE_BYTES);
+    char ping[8] = {0};
+
+    // One untimed round trip first: the first message on a connection pays
+    // for setting it up.
+    MPI_Send(buf.data(), PROBE_BYTES, MPI_BYTE, 1, TAG_PROBE, MPI_COMM_WORLD);
+    MPI_Recv(buf.data(), PROBE_BYTES, MPI_BYTE, 1, TAG_PROBE, MPI_COMM_WORLD,
+             MPI_STATUS_IGNORE);
+
+    Stopwatch watch;
+    for (int i = 0; i < PROBE_ROUNDS; ++i) {
+        MPI_Send(buf.data(), PROBE_BYTES, MPI_BYTE, 1, TAG_PROBE, MPI_COMM_WORLD);
+        MPI_Recv(buf.data(), PROBE_BYTES, MPI_BYTE, 1, TAG_PROBE, MPI_COMM_WORLD,
+                 MPI_STATUS_IGNORE);
+    }
+    double bigSeconds = watch.seconds(true);
+
+    for (int i = 0; i < PROBE_PINGS; ++i) {
+        MPI_Send(ping, 8, MPI_BYTE, 1, TAG_PROBE, MPI_COMM_WORLD);
+        MPI_Recv(ping, 8, MPI_BYTE, 1, TAG_PROBE, MPI_COMM_WORLD,
+                 MPI_STATUS_IGNORE);
+    }
+    double pingSeconds = watch.seconds(true);
+
+    // This node's own rate for the arithmetic a byte is being priced against.
+    //
+    // Over a span about the size of one cluster, repeated, rather than a long
+    // walk through the base: a worker's inner loop stays inside one cluster at
+    // a time, so it runs out of cache, and a streaming walk would measure
+    // memory bandwidth instead. Threaded for the same reason -- the cost
+    // model's compute term is per machine, and a machine uses all its cores.
+    //
+    // Still the scalar path, not the gemm one a chain head takes, so this is
+    // the lower of the two rates the search actually runs at.
+    int d = base_.getDim();
+    int span = 4000;
+    if (span > base_.getN()) {
+        span = base_.getN();
+    }
+    int reps = 200;
+    double sink = 0.0;
+    watch.reset();
+    #pragma omp parallel for schedule(static) reduction(+ : sink)
+    for (int r = 0; r < reps; ++r) {
+        for (int i = 0; i < span; ++i) {
+            sink = sink + l2DistanceSquared(base_.vec(0), base_.vec(i), d);
+        }
+    }
+    double kernelSeconds = watch.seconds();
+
+    double bytesPerSec = 2.0 * PROBE_BYTES * PROBE_ROUNDS / bigSeconds;
+    double micros = pingSeconds / PROBE_PINGS / 2.0 * 1e6;
+    double opsPerSec = (kernelSeconds > 0.0)
+                     ? ((double)reps * span * d / kernelSeconds) : 0.0;
+
+    std::cout << "network: " << (bytesPerSec / 1e6) << " MB/s at "
+              << (PROBE_BYTES / 1048576) << " MB, " << micros
+              << " us one-way; this node does " << (opsPerSec / 1e9)
+              << " G dim-ops/s" << std::endl;
+    if (bytesPerSec > 0.0 && opsPerSec > 0.0) {
+        std::cout << "  so a byte costs about " << (opsPerSec / bytesPerSec)
+                  << " multiply-adds; --commcost is " << cfg_.commCost
+                  << std::endl;
+    }
+    // Reading the sum keeps the loop above from being optimised away, and a
+    // zero means every sampled vector equals the first one, which would make
+    // the rate meaningless rather than merely imprecise.
+    if (!(sink > 0.0)) {
+        std::cout << "  (kernel rate not trustworthy: the sample summed to "
+                  << sink << ")" << std::endl;
+    }
+}
+
 void MasterNode::distributeData() {
     std::cout << "\n===== 4. distribute =====" << std::endl;
     Stopwatch watch;
@@ -593,6 +679,8 @@ void MasterNode::distributeData() {
         // MPI: blocking is fine for startup -- the order is fixed and nobody waits
         MPI_Send(setup, 9, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
     }
+
+    probeNetwork();
 
     for (int c = 0; c < index_.getNlist(); ++c) {
         const std::vector<int>& ids = index_.clusterIds(c);

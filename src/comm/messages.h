@@ -66,6 +66,19 @@ const int TAG_THRESHOLD = 7;
 // Each worker multiplies by its own slice width before reporting, so a
 // dimension split that does not divide evenly still adds up.
 const int STAT_ROWS     = 3;
+// --netprobe: a short exchange with rank 1 before any data moves, to see what
+// this interconnect does for the message size a chain hop actually carries.
+// Off by default -- it is a diagnostic, not part of the search. tools/netbench
+// sweeps every size; this is the one point that matters, reported in place so
+// a result can be read knowing what the network was doing.
+//
+// Both sides take the counts from here, because a mismatch would not fail, it
+// would leave a message unmatched and hang the startup.
+const int TAG_PROBE     = 14;
+const int PROBE_BYTES   = 2 << 20;   // 2 MB, about what a chain hop forwards
+const int PROBE_ROUNDS  = 5;         // big round trips, for bandwidth
+const int PROBE_PINGS   = 20;        // tiny round trips, for latency
+
 const int TAG_STATS     = 10;
 const int TAG_TIMES     = 12;  // double[WORKER_TIMES]: worker's wall time
 

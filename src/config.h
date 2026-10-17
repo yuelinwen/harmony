@@ -73,6 +73,10 @@ struct Config {
     // partitions, nothing reads it, and the pipeline is otherwise untouched.
     bool pruneDim = true;
     bool pruneVector = true;
+    // Measure the interconnect against rank 1 before distributing, and say
+    // what it implies --commcost should be. Off by default: it costs about
+    // 40 ms and answers a question that only needs asking once per cluster.
+    bool netProbe = false;
     // Wait for each forward to land before starting the next cluster, which
     // is the blocking arm of the paper's Fig. 2(b) comparison.
     bool blockSend = false;
@@ -207,6 +211,8 @@ inline void printUsage(const char* prog) {
         << "                     (drop a candidate past the threshold)\n"
         << "  --disablevectorpruning  turn off vector-level pruning\n"
         << "                     (tighten the threshold between partitions)\n"
+        << "  --netprobe <0|1>   measure the interconnect first          (0)\n"
+        << "                     reports what it implies for --commcost\n"
         << "  --block <int>      query blocks per group        (from bDim)\n"
         << "                     default keeps about 256/bDim^2 queries in a\n"
         << "                     block: 4 at 8x1, 16 at 4x2, 64 at 2x4,\n"
@@ -320,6 +326,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.pruneDim = false;
         } else if (opt == "--disablevectorpruning") {
             cfg.pruneVector = false;
+        } else if (opt == "--netprobe" && hasValue) {
+            cfg.netProbe = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--loop" && hasValue) {
             cfg.loop = std::atoi(argv[++i]);
         } else if (opt == "--check" && hasValue) {
