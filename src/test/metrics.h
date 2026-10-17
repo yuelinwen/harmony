@@ -116,9 +116,8 @@ private:
     void printWorkerTimes() const;
     void printMasterTimes() const;
 
-    // Per chain position: candidates, dimension operations, bytes forwarded;
-    // then the totals and the threshold staleness.
-    void printHarness() const;
+    // How stale the threshold each round pruned against was.
+    void printThresholdGap() const;
     void printTimeBreakdown() const;
 };
 

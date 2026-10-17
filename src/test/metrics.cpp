@@ -208,67 +208,39 @@ void Metrics::printTimeBreakdown() const {
 // That table says how long the workers waited; this says what they waited
 // for. The remainder is MPI_Waitany plus pushing returned candidates into the
 // heaps, which is the only part of a batch the master cannot hand to anyone.
-// The five numbers the harness exists for. Candidates and dimensions say how
-// much arithmetic the pruning removed; bytes says what it cost to spread that
-// decision over machines; staleness says how far behind the information those
-// decisions were made on. On one machine the last two are zero, which is the
-// point -- they are what distributing the pruning adds.
-void Metrics::printHarness() const {
-    if (dimsAfterStage.empty()) {
+// How much looser the threshold a round pruned against was than the one that
+// round's own results turned out to support, as a percentage of the latter.
+// A single machine reheaps after every candidate and would show 0% here;
+// what is left is the price of deciding once per block instead.
+//
+// One row per round, because the interesting thing is the decay: the first
+// round prunes against a prewarm guess and the gap is wide, later ones start
+// from a threshold earlier rounds already tightened.
+void Metrics::printThresholdGap() const {
+    if (stalenessMean.empty()) {
         return;
     }
-
-    long dims = 0;
-    long bytes = 0;
-    for (size_t s = 0; s < dimsAfterStage.size(); ++s) {
-        dims = dims + dimsAfterStage[s];
-        bytes = bytes + bytesAfterStage[s];
-    }
-
-    // What the same search would have cost with nothing pruned: every
-    // candidate offered, over every dimension.
-    double full = (double)scanned * dim;
 
     std::ios_base::fmtflags flags = std::cout.flags();
     std::streamsize digits = std::cout.precision();
 
-    std::cout << "\n===== harness =====" << std::endl;
-    std::cout << "  hop    candidates         dims evaluated        bytes out"
-              << std::endl;
-    for (size_t s = 0; s < dimsAfterStage.size(); ++s) {
-        std::cout << "  " << std::setw(3) << s
-                  << std::setw(14) << aliveAfterStage[s]
-                  << std::setw(23) << dimsAfterStage[s]
-                  << std::setw(17) << bytesAfterStage[s] << std::endl;
-    }
-
+    std::cout << "\n===== how far behind the thresholds were =====" << std::endl;
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "  dimensions evaluated: " << (double)dims / 1e9 << " G";
-    if (full > 0.0) {
-        std::cout << "   (" << (100.0 * dims / full) << "% of no pruning)";
-    }
-    std::cout << std::endl;
-
-    std::cout << "  bytes forwarded:      " << (double)bytes / 1e6 << " MB";
-    if (nq > 0) {
-        std::cout << "   (" << ((double)bytes / nq / 1024.0)
-                  << " KB per query)";
-    }
-    std::cout << std::endl;
-
-    std::cout << "  threshold staleness, by visit:" << std::endl;
     for (size_t s = 0; s < stalenessMean.size(); ++s) {
         if (stalenessCount[s] == 0) {
             continue;
         }
-        std::cout << "    visit " << s
-                  << "   mean " << std::setw(8) << (100.0 * stalenessMean[s])
-                  << "%   max " << std::setw(10) << (100.0 * stalenessMax[s])
+        std::cout << "  round " << (s + 1)
+                  << "   average " << std::setw(7) << (100.0 * stalenessMean[s])
+                  << "%   worst " << std::setw(9) << (100.0 * stalenessMax[s])
                   << "%   over " << stalenessCount[s] << " queries"
                   << std::endl;
     }
-    std::cout << "    (0% is what one machine would show: it reheaps after"
-              << " every candidate)" << std::endl;
+    std::cout << "  how much looser the threshold a round pruned with was"
+              << " than the one its own" << std::endl;
+    std::cout << "  results turned out to support; one machine updates after"
+              << " every candidate," << std::endl;
+    std::cout << "  so it would show 0%" << std::endl;
 
     std::cout.flags(flags);
     std::cout.precision(digits);
@@ -407,23 +379,59 @@ void Metrics::print() const {
         }
     }
 
-    // Pruning ratios in the shape of the paper's Table 3: the share of
-    // candidates that never had to reach the s-th slice of the chain. Slice 1
-    // is always 0 -- everyone computes the first slice, there is nothing to
-    // skip yet.
-    std::cout << "\npruning (" << bDim << " slices per chain)" << std::endl;
-    for (int s = 0; s < bDim; ++s) {
-        long processed = (s == 0) ? scanned : aliveAfterStage[s - 1];
-        std::cout << "  slice " << (s + 1) << ": skipped "
-                  << (100.0 * (1.0 - (double)processed / (double)scanned))
-                  << "%   (" << processed << " candidates reached it)" << std::endl;
+    // One row per dimension slice, which is also one hop of the chain. The
+    // paper's Table 3 is the `skipped` column; the two beside it are what a
+    // pruning method costs once it is distributed, where computing less and
+    // transmitting less are different things and can point opposite ways.
+    //
+    // Slice 1 always skips 0% -- everyone computes the first slice, there is
+    // nothing to skip against yet.
+    long dimOps = 0;
+    long bytesSent = 0;
+    for (int s = 0; s < bDim && s < (int)dimsAfterStage.size(); ++s) {
+        dimOps = dimOps + dimsAfterStage[s];
+        bytesSent = bytesSent + bytesAfterStage[s];
     }
-    std::cout << "distance work vs no pruning: " << workPercent() << "%"
+
+    std::cout << "\npruning, by dimension slice" << std::endl;
+    std::cout << "  slice        reached      survived   skipped"
+              << "        distance ops      bytes sent" << std::endl;
+    for (int s = 0; s < bDim; ++s) {
+        long reached = (s == 0) ? scanned : aliveAfterStage[s - 1];
+        std::cout << "  " << std::setw(5) << (s + 1)
+                  << std::setw(15) << reached
+                  << std::setw(14) << aliveAfterStage[s]
+                  << std::setw(9) << std::fixed << std::setprecision(1)
+                  << (100.0 * (1.0 - (double)reached / (double)scanned)) << "%";
+        if (s < (int)dimsAfterStage.size()) {
+            std::cout << std::setw(20) << dimsAfterStage[s]
+                      << std::setw(16) << bytesAfterStage[s];
+        }
+        std::cout << std::endl;
+        std::cout.unsetf(std::ios_base::floatfield);
+        std::cout.precision(6);
+    }
+
+    // What the same search would have cost with nothing pruned: every
+    // candidate offered, over every dimension.
+    double full = (double)scanned * dim;
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "  distance ops: " << (double)dimOps / 1e9 << " G of "
+              << full / 1e9 << " G without pruning   ("
+              << ((full > 0.0) ? (100.0 * dimOps / full) : 0.0) << "%)"
               << std::endl;
+    std::cout << "  bytes sent:   " << (double)bytesSent / 1e6 << " MB";
+    if (nq > 0) {
+        std::cout << "   (" << ((double)bytesSent / nq / 1024.0)
+                  << " KB per query)";
+    }
+    std::cout << std::endl;
+    std::cout.unsetf(std::ios_base::floatfield);
+    std::cout.precision(6);
 
     printWorkerTimes();
     printMasterTimes();
-    printHarness();
+    printThresholdGap();
 }
 
 // One row per run, appended, header written when the file is new. Everything
