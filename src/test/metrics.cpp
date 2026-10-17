@@ -225,16 +225,19 @@ void Metrics::printThresholdGap() const {
     std::streamsize digits = std::cout.precision();
 
     std::cout << "\n===== how far behind the thresholds were =====" << std::endl;
+    std::cout << "  " << std::setw(5) << "round"
+              << std::setw(12) << "average"
+              << std::setw(13) << "worst"
+              << std::setw(13) << "queries" << std::endl;
     std::cout << std::fixed << std::setprecision(2);
     for (size_t s = 0; s < stalenessMean.size(); ++s) {
         if (stalenessCount[s] == 0) {
             continue;
         }
-        std::cout << "  round " << (s + 1)
-                  << "   average " << std::setw(7) << (100.0 * stalenessMean[s])
-                  << "%   worst " << std::setw(9) << (100.0 * stalenessMax[s])
-                  << "%   over " << stalenessCount[s] << " queries"
-                  << std::endl;
+        std::cout << "  " << std::setw(5) << (s + 1)
+                  << std::setw(11) << (100.0 * stalenessMean[s]) << "%"
+                  << std::setw(12) << (100.0 * stalenessMax[s]) << "%"
+                  << std::setw(13) << stalenessCount[s] << std::endl;
     }
     std::cout << "  how much looser the threshold a round pruned with was"
               << " than the one its own" << std::endl;
