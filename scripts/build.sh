@@ -84,6 +84,15 @@ LIBS="-lmkl_intel_lp64 -lmkl_sequential -lmkl_core -lpthread -lm"
 mpicxx $FLAGS main.cpp src/node/*.cpp src/index/*.cpp src/test/*.cpp -o main $LIBS
 echo "built ./main"
 
+# ---- ./netbench -------------------------------------------------------
+#
+# What the interconnect does, which is what --commcost is supposed to price.
+# Needs MPI and nothing else, so it is built unconditionally; it runs on two
+# machines, so it travels with ./main below.
+
+mpicxx $FLAGS tools/netbench.cpp -o netbench
+echo "built ./netbench"
+
 # ---- ./maketruth, only where faiss has been built ----------------------
 #
 # Brute-force groundtruth for a dataset that did not come with any. faiss is
@@ -142,6 +151,6 @@ while read -r host _; do
     [ -z "$host" ] && continue
     [ "$host" = "$MASTER" ] && continue      # this is where it was built
     ssh -n -o BatchMode=yes "$host" "mkdir -p ~/harmony"
-    scp -q main "$host:~/harmony/main"
+    scp -q main netbench "$host:~/harmony/"
     echo "  copied to $host"
 done < "$HOSTS"
