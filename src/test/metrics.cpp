@@ -588,13 +588,55 @@ void Metrics::writeCsv() const {
                         "comm_time,compute_time,other_time,"
                         "train_time,add_time,distribute_time,"
                         "mem_mb,mem_pct,"
-                        "differing,ties,scanned,work_pct\n");
+                        "differing,ties,scanned,work_pct,"
+                        "dim_ops,dim_ops_pct,bytes_fwd,busy_skew,"
+                        "stale_first,stale_mean\n");
     }
 
     double comm = 0.0;
     double compute = 0.0;
     double other = 0.0;
     timeBreakdown(&comm, &compute, &other);
+
+    // The five, so a sweep can be read from the file rather than from
+    // terminal scrollback. dim_ops is the exact count; work_pct beside it
+    // weights every slice equally and only agrees with it when the slices
+    // are the same width, which 128 over 3 is not.
+    long dimOps = 0;
+    long bytesFwd = 0;
+    for (size_t s = 0; s < dimsAfterStage.size(); ++s) {
+        dimOps = dimOps + dimsAfterStage[s];
+        bytesFwd = bytesFwd + bytesAfterStage[s];
+    }
+    double full = (double)scanned * dim;
+    double dimOpsPct = (full > 0.0) ? (100.0 * dimOps / full) : 0.0;
+
+    // Busiest machine over idlest, on compute seconds. Total is the same for
+    // everyone by construction -- whoever finishes early just waits -- so it
+    // would show no skew at all.
+    double busyLo = -1.0;
+    double busyHi = 0.0;
+    for (size_t w = 0; w < workerTimes.size(); ++w) {
+        double c = workerTimes[w][3];
+        if (busyLo < 0.0 || c < busyLo) {
+            busyLo = c;
+        }
+        if (c > busyHi) {
+            busyHi = c;
+        }
+    }
+    double busySkew = (busyLo > 0.0) ? (busyHi / busyLo) : 0.0;
+
+    // The first round separately: it is the one the prewarm quality decides,
+    // and where the gap is widest. The mean is over every (query, round).
+    double staleFirst = stalenessMean.empty() ? 0.0 : stalenessMean[0];
+    double staleSum = 0.0;
+    long staleN = 0;
+    for (size_t s = 0; s < stalenessMean.size(); ++s) {
+        staleSum = staleSum + stalenessMean[s] * (double)stalenessCount[s];
+        staleN = staleN + stalenessCount[s];
+    }
+    double staleMean = (staleN > 0) ? (staleSum / staleN) : 0.0;
 
     std::fprintf(f,
         "%s,%s,%s,%.1f,"
@@ -604,7 +646,8 @@ void Metrics::writeCsv() const {
         "%.4f,%.4f,%.4f,"
         "%.3f,%.3f,%.3f,"
         "%ld,%.2f,"
-        "%d,%d,%ld,%.4f\n",
+        "%d,%d,%ld,%.4f,"
+        "%ld,%.4f,%ld,%.4f,%.6f,%.6f\n",
         timestampNow().c_str(), buildId(), hostName().c_str(), elapsed,
         cfg.data.c_str(), nlist, cfg.iters, cfg.trainPoints,
         workers, bVec, bDim, cfg.mode.c_str(),
@@ -618,7 +661,8 @@ void Metrics::writeCsv() const {
         trainSeconds, addSeconds, distributeSeconds,
         workerBytes / 1048576,
         (singleBytes > 0) ? (100.0 * workerBytes / singleBytes) : 0.0,
-        differing, ties, scanned, workPercent());
+        differing, ties, scanned, workPercent(),
+        dimOps, dimOpsPct, bytesFwd, busySkew, staleFirst, staleMean);
 
     std::fclose(f);
     std::cout << "appended to " << cfg.csv << std::endl;
