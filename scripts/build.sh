@@ -121,8 +121,16 @@ if [ -f "$FAISS_LIB" ]; then
     g++ $FLAGS -I third_party/faiss tools/maketruth.cpp src/index/dataset.cpp \
         -o maketruth "$FAISS_LIB" $LIBS
     echo "built ./maketruth"
+
+    # The single-node baseline the paper's speedups are against. It reuses
+    # src/test/verify.cpp so recall and r2 mean the same thing on both sides
+    # of the comparison, which is the whole point of having it.
+    g++ $FLAGS -I third_party/faiss tools/faissbase.cpp \
+        src/index/dataset.cpp src/index/ivf_index.cpp src/test/verify.cpp \
+        -o faissbase "$FAISS_LIB" $LIBS
+    echo "built ./faissbase"
 else
-    echo "no $FAISS_LIB, skipping ./maketruth"
+    echo "no $FAISS_LIB, skipping ./maketruth and ./faissbase"
 fi
 
 # ---- copy to the workers, if this is the master ------------------------

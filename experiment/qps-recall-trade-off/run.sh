@@ -15,7 +15,8 @@
 #   4x2   hybrid
 #   2x4   hybrid
 #   1x8   the paper's Harmony-dimension
-#   one machine   in place of Faiss, which is not wired up as a baseline yet
+#   single-node IVF   this program's own index on one machine, in place of
+#                     Faiss, which is not wired up as a baseline yet
 #
 # on Sift1M, the one dataset here that the paper also uses.
 #
@@ -51,9 +52,11 @@ for grid in "8 1" "4 2" "2 4" "1 8"; do
     scripts/run.sh 8 --bvec "$1" --bdim "$2" $COMMON --check 0 --baseline 0
 done
 
-# The single-machine curve. It does not depend on the grid, so it is measured
-# once rather than on every line -- which is why --baseline is off above.
-echo "===== single machine ====="
+# The single-node IVF curve: this program's own index, on one machine, with no
+# partitioning and no pruning. It does not depend on the grid, so it is
+# measured once rather than on every line -- which is why --baseline is off
+# above. It is not Faiss, so speedups against it are not the paper's number.
+echo "===== single-node IVF ====="
 scripts/run.sh 8 --bvec 8 --bdim 1 $COMMON --check 0 --baseline 1
 
 # One verified run per grid, so the timings above are known to be timings of
