@@ -332,9 +332,17 @@ void Metrics::print() const {
     // Is the distributed answer the same as one machine's? This is the check
     // that has to pass; everything below it is a measurement, not a verdict.
     std::cout << "\ncorrectness" << std::endl;
-    std::cout << "  queries differing from single machine: "
-              << differing << "/" << nq
-              << "   (ties broken differently: " << ties << ")" << std::endl;
+    if (cfg.check) {
+        std::cout << "  queries differing from single machine: "
+                  << differing << "/" << nq
+                  << "   (ties broken differently: " << ties << ")" << std::endl;
+    } else {
+        // Saying 0/nq here would read as a check that passed. It is off,
+        // which is a different thing, and the two are easy to confuse in a
+        // log of a sweep where most runs skip it to save the time.
+        std::cout << "  not checked against the single machine (--check 0)"
+                  << std::endl;
+    }
     std::cout << "  recall@" << k << ": " << recall
               << "   (" << (k * (1.0 - recall))
               << " of " << k << " true neighbours missed per query)" << std::endl;
@@ -661,7 +669,10 @@ void Metrics::writeCsv() const {
         trainSeconds, addSeconds, distributeSeconds,
         workerBytes / 1048576,
         (singleBytes > 0) ? (100.0 * workerBytes / singleBytes) : 0.0,
-        differing, ties, scanned, workPercent(),
+        // -1 rather than 0 when the check was off: a sweep leaves it off on
+        // most runs, and a column of zeroes would read as a column of passes.
+        cfg.check ? differing : -1, cfg.check ? ties : -1,
+        scanned, workPercent(),
         dimOps, dimOpsPct, bytesFwd, busySkew, staleFirst, staleMean);
 
     std::fclose(f);
