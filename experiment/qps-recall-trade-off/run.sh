@@ -15,8 +15,11 @@
 #   4x2   hybrid
 #   2x4   hybrid
 #   1x8   the paper's Harmony-dimension
-#   single-node IVF   this program's own index on one machine, in place of
-#                     Faiss, which is not wired up as a baseline yet
+#   faiss             the paper's baseline: faiss IndexIVFFlat on one node,
+#                     same nlist, same thread count one worker gets
+#   single-node IVF   this program's own index on one machine. Kept beside
+#                     faiss because the gap between them is the correction
+#                     every speedup against it needs
 #
 # on Sift1M, the one dataset here that the paper also uses.
 #
@@ -32,7 +35,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../.."
 
 OUT="$HERE/results.csv"
-rm -f "$OUT"
+FAISS="$HERE/faiss.csv"
+rm -f "$OUT" "$FAISS"
 
 # 1 to 256 covers recall from about 0.4 to 1.0. 256 is nlist, where the index
 # degenerates to brute force and recall stops improving. Several values in one
@@ -59,6 +63,14 @@ done
 echo "===== single-node IVF ====="
 scripts/run.sh 8 --bvec 8 --bdim 1 $COMMON --check 0 --baseline 1
 
+# The paper's baseline. A separate binary because faiss is linked only there;
+# see tools/faissbase.cpp. Same nlist and same threads as one worker machine,
+# and recall comes from the same code as everything above, so the two curves
+# can be drawn on one chart.
+echo "===== faiss ====="
+./faissbase --data Data/sift/sift --nq 1024 --k 100 --loop 3 --threads 8 \
+    --nlist 256 --csv "$FAISS" --nprobe 1 2 4 8 16 32 64 128 256
+
 # One verified run per grid, so the timings above are known to be timings of
 # the right answer. Deliberately not written to the CSV: same settings,
 # different purpose, and `differing` is a verdict rather than a measurement.
@@ -71,4 +83,4 @@ for grid in "8 1" "4 2" "2 4" "1 8"; do
 done
 
 echo
-echo "wrote $OUT"
+echo "wrote $OUT and $FAISS"
