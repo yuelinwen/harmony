@@ -41,11 +41,22 @@ Against the paper's Sift1M row:
 
 ### Two 784-dimensional datasets, four nodes
 
+<<<<<<< Updated upstream
 | dataset | one machine | 4x1 | 2x2 | 1x4 | 1x4 overhead |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Sift1M (128 dim) | 492 MiB | 495 | 503 | 518 | **+5.40%** |
 | fashion-mnist (784 dim) | 180 MiB | 179 | 180 | 181 | **+0.6%** |
 | MNIST (784 dim) | 180 MiB | 179 | 180 | 181 | **+0.6%** |
+=======
+| dataset | one machine | 4x1 | 2x2 | 1x4 | overhead 4x1 / 2x2 / 1x4 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Sift1M (128 dim) | 492 MiB | 495 | 503 | 518 | +0.75% / +2.30% / **+5.40%** |
+| fashion-mnist (784 dim) | 180 MiB | 179 | 180 | 181 | −0.30% / −0.04% / **+0.47%** |
+| MNIST (784 dim) | 180 MiB | 179 | 180 | 181 | −0.30% / −0.04% / **+0.47%** |
+
+The two negative figures are real but are an artefact of what each side
+counts, not a saving -- see the note below.
+>>>>>>> Stashed changes
 
 ## Against the paper
 
@@ -78,6 +89,7 @@ how many vectors there are.
 | | predicted | measured |
 | --- | ---: | ---: |
 | Sift1M, bDim 4, d 128 | 6.25% | 5.40% |
+<<<<<<< Updated upstream
 | fashion, bDim 4, d 784 | 1.02% | 0.60% |
 | Sift1M, bDim 1, d 128 | 1.56% | 0.75% |
 
@@ -88,6 +100,25 @@ id duplication at all and the whole 0.75% is the norms array.
 
 **The higher the dimension, the less dimension slicing costs in space.**
 
+=======
+| fashion, bDim 4, d 784 | 1.02% | 0.47% |
+| Sift1M, bDim 1, d 128 | 1.56% | 0.75% |
+
+**The higher the dimension, the less dimension slicing costs in space.**
+
+Measured runs below predicted for a reason worth stating, because it is what
+makes two of the figures above negative. The single-machine number counts
+the centroids, `nlist * d * 4`, and the workers hold none -- only the master
+does, and the master is not counted. On a 784-dimensional dataset that term
+is 0.80 MB while the whole norms array is 0.24 MB, so at bDim 1 the
+distributed index measures *smaller* than the single-machine one. Nothing
+was saved; the two sides are counting slightly different things, and the
+difference only shows up where the overhead is small enough for it to.
+
+At bDim 1 there is no id duplication at all, and on Sift1M the whole 0.75%
+is the norms array.
+
+>>>>>>> Stashed changes
 ## Notes
 
 - The faiss figure is the index file on disk. For a flat IVF that is within

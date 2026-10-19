@@ -1,0 +1,95 @@
+cluster: 4 workers, 8 threads each
++ mpirun -n 5 --hostfile scripts/hosts.txt -N 1 ./main --threads 8 --bvec 2 --bdim 2 --nprobe 160 --k 10 --nq 1024 --loop 3 --cache 1 --check 0 --baseline 0 --csv /home/ubuntu/harmony/experiment/optimization-contribution/results.csv
+run 2026-10-18T23:55:37  build 90f99b1+2f987286  host yw-vdb-1
+
+===== 1. data =====
+base:  n=1000000 dim=128
+query: n=10000 dim=128
+gt:    n=10000 dim=100
+
+===== 2. index =====
+loaded index from Data/sift/sift_nlist256_iters25_tp256.idx (0.00393604 s)
+warmup: 1000 queries profiled at skew 0, cluster probe counts mean 625 variance 155.618 (0.248988 x mean)
+
+===== 3. layout =====
+grid: 2 vector partitions x 2 dimension slices  (even share would be 50%)
+  worker 1: partition 0, dims [0,64), 498413 vectors, 49.9924% of the work
+  worker 2: partition 0, dims [64,128), 498413 vectors, 49.9924% of the work
+  worker 3: partition 1, dims [0,64), 501587 vectors, 50.0076% of the work
+  worker 4: partition 1, dims [64,128), 501587 vectors, 50.0076% of the work
+
+===== 4. distribute =====
+worker 1 ready: 498413 vectors x 64 dims, 8 thread(s), loop+mkl
+distributed 256 clusters over the grid (1.13237 s)
+worker 2 ready: 498413 vectors x 64 dims, 8 thread(s), loop+mkl
+worker 3 ready: 501587 vectors x 64 dims, 8 thread(s), loop+mkl
+worker 4 ready: 501587 vectors x 64 dims, 8 thread(s), loop+mkl
+
+timing over 3 passes, after one untimed warm-up
+
+===== 5. results =====
+setup: 4 workers, grid 2 x 2, nlist 256, nprobe 160, k 10, batch 1024, block 16
+arms: pruning both, assign lpt, pipeline on, blocksend off
+
+correctness
+  not checked against the single machine (--check 0)
+  recall@10: 0.999414   (0.00585938 of 10 true neighbours missed per query)
+  r2: 5.17672e-10   (squared distances this much further than the true top-10)
+
+throughput
+  1024 queries in 2.89269 s
+  QPS: 353.996   (2.82489 ms per query)
+  test workload variance: 159.483   (mean 640 probes per cluster)
+
+index build
+  train 0 s, add 0 s, distribute 1.13237 s   (loaded from cache, so train and add are 0)
+  index memory: 503 MB over 4 workers (125 MB each), vs 492 MB on one machine
+    102.3% of the single-machine index, so 2.30039% overhead
+
+work
+  candidates scanned: 615900946   (601466 per query, 60.1466% of the base)
+  per vector partition   (even would be 50% each)
+    partition 0: 307924855 candidates   49.9958%
+    partition 1: 307976091 candidates   50.0042%
+
+pruning, by dimension slice
+  slice        reached      survived   skipped        distance ops      bytes sent
+      1      615900946      82401169      0.0%         39417660544      2463603784
+      2       82401169        205749     86.6%          5273674816          163840
+  distance ops: 44.69 G of 78.84 G without pruning   (56.69%)
+  bytes sent:   2463.77 MB   (2349.63 KB per query)
+
+===== where each worker's time went =====
+  worker   grid    jobs     total    compute      idle      recv      send     setup      poll     admin     other
+       1    0x0      32     2.90s    11.8%     6.9%    52.0%     0.0%    27.3%     0.1%     0.0%     2.0%
+       2    0x1      32     2.90s    13.0%    23.8%    14.9%     0.0%    41.8%     4.4%     0.0%     2.1%
+       3    1x0      32     2.90s    12.6%    17.6%    12.0%     0.0%    52.5%     3.0%     0.0%     2.4%
+       4    1x1      32     2.90s    12.6%     1.1%    56.2%     0.0%    28.0%     0.1%     0.0%     2.0%
+  busy time: 0.343s to 0.377s   mean 0.363s   spread 1.10x
+  ---- paper Fig. 9, mean worker ----
+  communication 0.980s (33.8%)   computation 0.363s (12.5%)   other 1.560s (53.7%)
+
+===== where the master's time went =====
+  stage 0 (probes + prewarm)       0.020s     0.7%
+  broadcast (queries + probes)     0.017s     0.6%
+  dispatch (jobs + thresholds)     0.000s     0.0%
+  wait (blocked in Waitany)        2.862s    98.6%
+  merge (candidates into heaps)    0.000s     0.0%
+  other                            0.003s     0.1%
+  total (batches only)             2.903s
+
+===== how far behind the thresholds were =====
+  round     average        worst      queries
+      1      24.99%      107.21%         1024
+      2       9.80%      151.39%         1024
+  how much looser the threshold a round pruned with was than the one its own
+  results turned out to support; one machine updates after every candidate,
+  so it would show 0%
+
+===== five numbers =====
+  1. dimensions evaluated   44.69 G   (56.69% of no pruning)
+  2. candidates per hop     615.90 M offered, 0.21 M alive at the tail   (2 hops)
+  3. bytes per hop          2463.77 MB   (2349.63 KB per query)
+  4. node busy-time skew    1.10x   (0.343s to 0.377s over 4 workers)
+  5. threshold gap          24.99% at round 1, 9.80% at round 2   (average)
+appended to /home/ubuntu/harmony/experiment/optimization-contribution/results.csv

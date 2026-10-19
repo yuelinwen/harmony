@@ -2,6 +2,7 @@
 main
 maketruth
 netbench
+faissbase
 *.o
 /experiment
 
