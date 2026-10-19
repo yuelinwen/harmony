@@ -403,8 +403,23 @@ int WorkerNode::run() {
         // from a threshold this one tightened. With --disablevectorpruning
         // every stage is taken as soon as it arrives instead, which is what
         // the master does on its side too.
-        if (stagesLeft > 0 &&
-            (!pruneVector_ || (pend.empty() && todo.empty()))) {
+        bool stageDue = false;
+        if (stagesLeft > 0) {
+            if (pend.empty() && todo.empty()) {
+                stageDue = true;
+            } else if (!pruneVector_) {
+                // Work in hand, so take the stage only if it has already
+                // arrived. Under --disablepipeline the master does not send
+                // the next one until the blocks still sitting in todo come
+                // back, and blocking here waits for a message it is waiting
+                // on this worker to earn.
+                int ready = 0;
+                MPI_Iprobe(MASTER_RANK, TAG_THRESHOLD, MPI_COMM_WORLD, &ready,
+                           MPI_STATUS_IGNORE);
+                stageDue = (ready != 0);
+            }
+        }
+        if (stageDue) {
             int s = bVec_ - stagesLeft;
             stagesLeft = stagesLeft - 1;
 
