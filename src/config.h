@@ -77,6 +77,14 @@ struct Config {
     // what it implies --commcost should be. Off by default: it costs about
     // 40 ms and answers a question that only needs asking once per cluster.
     bool netProbe = false;
+
+    // GEMM at every chain position, not only the head. The head is dense by
+    // definition; later slices are not, so this computes the candidates
+    // pruning has already dropped. Whether that pays is a race between the
+    // multiply's speed and the prune rate, and the prune rate at the second
+    // slice is 3.1% at the defaults -- which is why it is worth measuring
+    // rather than assuming.
+    bool gemmAll = false;
     // Wait for each forward to land before starting the next cluster, which
     // is the blocking arm of the paper's Fig. 2(b) comparison.
     bool blockSend = false;
@@ -221,6 +229,7 @@ inline void printUsage(const char* prog) {
         << "  --disablepipeline  one block out at a time, no overlap\n"
         << "                     otherwise all of a partition's blocks fly\n"
         << "                     at once\n"
+        << "  --gemmall <0|1>    gemm at every slice, not just the head (0)\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
         << "                     costs more than the search it checks\n"
         << "  --baseline <0|1>   time that pass, report the speedup  (1)\n"
@@ -245,6 +254,7 @@ inline void printUsage(const char* prog) {
         << "  --commcost <float> a transferred byte, in multiply-adds (100)\n"
         << "  --alpha <float>    weight on the imbalance term        (0.3)\n"
         << "  --warmup <int>     queries used to find hot clusters   (1000)\n";
+
 }
 
 // Returns false on an unknown or incomplete option.
@@ -326,6 +336,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.pruneDim = false;
         } else if (opt == "--disablevectorpruning") {
             cfg.pruneVector = false;
+        } else if (opt == "--gemmall" && hasValue) {
+            cfg.gemmAll = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--netprobe" && hasValue) {
             cfg.netProbe = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--loop" && hasValue) {

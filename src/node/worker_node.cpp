@@ -80,9 +80,14 @@ long WorkerNode::memoryBytes() const {
 // the dot products being the matrix product. ||v||^2 came with the cluster
 // and never changes.
 //
-// Only here. Later slices skip most candidates, and a dense multiply cannot
-// skip anything, so grouping by cluster would compute what pruning just saved.
-HopCount WorkerNode::accumulateGemm(int firstQ, int len,
+// Later slices are a different case: a dense multiply cannot skip, so it
+// recomputes what pruning has already dropped. That is a race between the
+// multiply's speed and the prune rate -- 3.1% at the second slice and 71.2%
+// at the fourth, measured -- so --gemmall decides it rather than this
+// comment. first says which semantics to write back with: the head assigns
+// into a zero buffer, a later slice accumulates into what it received and
+// has to leave already-pruned entries alone.
+HopCount WorkerNode::accumulateGemm(int firstQ, int len, bool first,
                                     const std::vector<size_t>& qOff,
                                     std::vector<float>& sums) {
     // Which of this block's queries probe each cluster, and where each one's
@@ -145,11 +150,18 @@ HopCount WorkerNode::accumulateGemm(int firstQ, int len,
             float* row = &sums[mem[a].second];
             const float* d = &dot[(size_t)a * n];
             for (int v = 0; v < n; ++v) {
-                float dist = qn[a] + cb.norm[v] - 2.0f * d[v];
-                if (dist > t) {
+                float part = qn[a] + cb.norm[v] - 2.0f * d[v];
+                if (first) {
+                    row[v] = part;
+                } else if (row[v] >= PRUNED) {
+                    continue;      // dropped upstream; the multiply computed
+                                   // it anyway, which is what this costs
+                } else {
+                    row[v] = row[v] + part;
+                }
+                if (row[v] > t) {
                     row[v] = PRUNED;
                 } else {
-                    row[v] = dist;
                     survivors = survivors + 1;
                 }
             }
@@ -165,8 +177,8 @@ HopCount WorkerNode::accumulateGemm(int firstQ, int len,
 HopCount WorkerNode::accumulate(int firstQ, int len,
                                 const std::vector<size_t>& qOff,
                                 std::vector<float>& sums, bool first) {
-    if (first) {
-        return accumulateGemm(firstQ, len, qOff, sums);
+    if (first || cfg_.gemmAll) {
+        return accumulateGemm(firstQ, len, first, qOff, sums);
     }
 
     long survivors = 0;

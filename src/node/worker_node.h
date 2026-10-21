@@ -111,7 +111,7 @@ private:
     // width exactly as arithmetic intensity says it should. Counts the same
     // two numbers accumulate() does; a dense multiply skips nothing, so
     // everything offered here is evaluated.
-    HopCount accumulateGemm(int firstQ, int len,
+    HopCount accumulateGemm(int firstQ, int len, bool first,
                             const std::vector<size_t>& qOff,
                             std::vector<float>& sums);
 
