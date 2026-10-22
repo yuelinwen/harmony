@@ -9,6 +9,10 @@ faissbase
 # faiss is vendored as source (third_party/faiss); what it compiles to is not
 third_party/faiss/build/
 
+# The running log of every run, appended to automatically: one file per
+# measurement, joined on run_id.
+/test/
+
 # Data and index caches: large, and rebuilt by scripts/data.sh
 /Data
 

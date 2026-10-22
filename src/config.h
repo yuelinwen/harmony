@@ -126,7 +126,6 @@ struct Config {
     // paper's, which compares against a different implementation.
     bool baseline = true;
     int loop = 1;         // timed passes over the query set, averaged
-    std::string csv;      // append one row per run here, "" = off
 
     // Synthetic skewed workload (paper §6.6, Fig. 7/8; the sample's
     // --HardInBalance). 0 uses the real nearest clusters. Above that, this
@@ -178,6 +177,12 @@ struct Config {
     double commCost = 100.0;  // a transferred byte, in multiply-adds. Hardware.
     double alpha = 0.3;       // weight on the imbalance term of C(pi,Q)
     int warmup = 1000;        // queries profiled to find the hot clusters
+
+    // Which pruning strategy the run used. Only recorded today -- there is
+    // one -- but the column has to exist before the backends do, or the rows
+    // taken before them cannot be told apart from the rows taken after.
+    std::string backend = "harmony";
+
 };
 
 inline void printUsage(const char* prog) {
@@ -230,12 +235,12 @@ inline void printUsage(const char* prog) {
         << "                     otherwise all of a partition's blocks fly\n"
         << "                     at once\n"
         << "  --gemmall <0|1>    gemm at every slice, not just the head (0)\n"
+        << "  --backend <name>   pruning strategy, recorded only  (harmony)\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
         << "                     costs more than the search it checks\n"
         << "  --baseline <0|1>   time that pass, report the speedup  (1)\n"
         << "  --loop <int>       timed passes, averaged               (1)\n"
         << "                     above 1 adds an untimed warm-up pass\n"
-        << "  --csv <path>       append one row per run to this file\n"
         << "\n"
         << "skewed workload (paper 6.6)\n"
         << "  --assign <name>    lpt | roundrobin                    (lpt)\n"
@@ -291,8 +296,6 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             if (!cfg.nprobes.empty()) {
                 cfg.nprobe = cfg.nprobes[0];
             }
-        } else if (opt == "--csv" && hasValue) {
-            cfg.csv = argv[++i];
         } else if (opt == "--assign" && hasValue) {
             cfg.assign = argv[++i];
             if (cfg.assign != "lpt" && cfg.assign != "roundrobin") {
@@ -336,6 +339,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.pruneDim = false;
         } else if (opt == "--disablevectorpruning") {
             cfg.pruneVector = false;
+        } else if (opt == "--backend" && hasValue) {
+            cfg.backend = argv[++i];
         } else if (opt == "--gemmall" && hasValue) {
             cfg.gemmAll = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--netprobe" && hasValue) {

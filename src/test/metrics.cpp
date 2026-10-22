@@ -7,6 +7,7 @@
 #include <ios>
 #include <iostream>
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifdef _OPENMP
@@ -475,153 +476,98 @@ void Metrics::print() const {
     printWorkerTimes();
     printMasterTimes();
     printThresholdGap();
-    printFive();
 }
 
-// The five numbers everything above exists to produce, together, so that one
-// run can be put beside another without reading the whole output.
+// Six files under test/, one per measurement plus one for everything else.
+// Each gets the grain its own quantity has -- per hop, per worker, per round,
+// per run -- rather than one shape forced on all of them, and each repeats
+// enough identity to be read on its own. run_id joins them back together.
 //
-// They decompose "why was this fast or slow" into four separate questions:
-// how much arithmetic the pruning removed, what it cost to spread that
-// decision over machines, how evenly the work landed, and how far behind the
-// information each decision was made on. A method that evaluates fewer
-// dimensions but forwards more state can lose, and only these together say
-// so.
-void Metrics::printFive() const {
-    std::ios_base::fmtflags flags = std::cout.flags();
-    std::streamsize digits = std::cout.precision();
-
-    long dimOps = 0;
-    long bytesSent = 0;
-    for (size_t s = 0; s < dimsAfterStage.size(); ++s) {
-        dimOps = dimOps + dimsAfterStage[s];
-        bytesSent = bytesSent + bytesAfterStage[s];
-    }
-    double full = (double)scanned * dim;
-
-    double lo = -1.0;
-    double hi = 0.0;
-    for (int w = 1; w <= (int)workerTimes.size(); ++w) {
-        double c = workerTimes[w - 1][3];
-        if (lo < 0.0 || c < lo) {
-            lo = c;
-        }
-        if (c > hi) {
-            hi = c;
-        }
-    }
-
-    std::cout << "\n===== five numbers =====" << std::endl;
-    std::cout << std::fixed << std::setprecision(2);
-
-    std::cout << "  1. dimensions evaluated   " << (double)dimOps / 1e9 << " G";
-    if (full > 0.0) {
-        std::cout << "   (" << (100.0 * dimOps / full) << "% of no pruning)";
-    }
-    std::cout << std::endl;
-
-    std::cout << "  2. candidates per hop     ";
-    if (!aliveAfterStage.empty()) {
-        std::cout << (double)scanned / 1e6 << " M offered, "
-                  << (double)aliveAfterStage[aliveAfterStage.size() - 1] / 1e6
-                  << " M alive at the tail   (" << bDim << " hop"
-                  << (bDim == 1 ? "" : "s") << ")";
-    }
-    std::cout << std::endl;
-
-    std::cout << "  3. bytes per hop          " << (double)bytesSent / 1e6
-              << " MB";
-    if (nq > 0) {
-        std::cout << "   (" << ((double)bytesSent / nq / 1024.0)
-                  << " KB per query)";
-    }
-    std::cout << std::endl;
-
-    std::cout << "  4. node busy-time skew    ";
-    if (lo > 0.0) {
-        std::cout << (hi / lo) << "x"
-                  << std::setprecision(3) << "   (" << lo << "s to " << hi
-                  << "s over " << workerTimes.size() << " workers)"
-                  << std::setprecision(2);
-    }
-    std::cout << std::endl;
-
-    std::cout << "  5. threshold gap          ";
-    if (!stalenessMean.empty()) {
-        std::cout << (100.0 * stalenessMean[0]) << "% at round 1";
-        if (stalenessMean.size() > 1) {
-            std::cout << ", " << (100.0 * stalenessMean[stalenessMean.size() - 1])
-                      << "% at round " << stalenessMean.size();
-        }
-        std::cout << "   (average)";
-    }
-    std::cout << std::endl;
-
-    std::cout.flags(flags);
-    std::cout.precision(digits);
-}
-
-// One row per run, appended, header written when the file is new. Everything
-// that was varied over a set of runs has to be in the row, or the rows cannot
-// be told apart later.
+// No flag turns this on. A run that was not recorded cannot be compared with
+// another later, and remembering to pass a flag is exactly the thing that
+// gets forgotten on the run that turns out to matter.
 void Metrics::writeCsv() const {
-    if (cfg.csv.empty()) {
-        return;
+    mkdir("test", 0755);   // already there is not an error worth reporting
+
+    // Unique per run: two runs can start within the same second, but not
+    // within the same second from the same process.
+    char runId[64];
+    std::snprintf(runId, sizeof(runId), "%s-%d",
+                  timestampNow().c_str(), (int)getpid());
+
+    // Repeated into every file so one can be read without a join. Five
+    // columns is the most that earns its place: which strategy, which grid,
+    // and where on the accuracy curve.
+    char id[256];
+    std::snprintf(id, sizeof(id), "%s,%s,%d,%d,%d,%d",
+                  runId, cfg.backend.c_str(), bVec, bDim, nprobe, k);
+
+    // Appends, writing the header only into a file that is new or empty.
+    struct Open {
+        static std::FILE* at(const char* path, const char* header) {
+            bool isNew = true;
+            std::FILE* probe = std::fopen(path, "rb");
+            if (probe != nullptr) {
+                std::fseek(probe, 0, SEEK_END);
+                isNew = (std::ftell(probe) == 0);
+                std::fclose(probe);
+            }
+            std::FILE* f = std::fopen(path, "ab");
+            if (f != nullptr && isNew) {
+                std::fprintf(f, "%s\n", header);
+            }
+            return f;
+        }
+    };
+
+    // ---- 1. dimensions evaluated: per hop, and what it would have been ----
+    std::FILE* f = Open::at("test/dims_evaluated.csv",
+        "run_id,backend,bvec,bdim,nprobe,k,hop_id,dims_evaluated,"
+        "dims_no_pruning,pct_of_no_pruning");
+    if (f != nullptr) {
+        for (int h = 0; h < bDim; ++h) {
+            long ops = (h < (int)dimsAfterStage.size()) ? dimsAfterStage[h] : 0;
+            // What this slice alone would have cost with nothing pruned.
+            double bare = (double)scanned * (dim / (bDim > 0 ? bDim : 1));
+            std::fprintf(f, "%s,%d,%ld,%.0f,%.4f\n", id, h + 1, ops, bare,
+                         (bare > 0.0) ? (100.0 * ops / bare) : 0.0);
+        }
+        std::fclose(f);
     }
 
-    bool isNew = true;
-    std::FILE* probe = std::fopen(cfg.csv.c_str(), "rb");
-    if (probe != nullptr) {
-        std::fseek(probe, 0, SEEK_END);
-        isNew = (std::ftell(probe) == 0);
-        std::fclose(probe);
+    // ---- 2. candidates forwarded per hop ----
+    f = Open::at("test/candidates_per_hop.csv",
+        "run_id,backend,bvec,bdim,nprobe,k,hop_id,reached,alive,skipped_pct");
+    if (f != nullptr) {
+        for (int h = 0; h < bDim; ++h) {
+            long reached = (h == 0) ? scanned
+                         : (h - 1 < (int)aliveAfterStage.size()
+                            ? aliveAfterStage[h - 1] : 0);
+            long alive = (h < (int)aliveAfterStage.size())
+                       ? aliveAfterStage[h] : 0;
+            // The share of every candidate offered that never got this far.
+            double skipped = (scanned > 0)
+                           ? (100.0 * (1.0 - (double)reached / (double)scanned))
+                           : 0.0;
+            std::fprintf(f, "%s,%d,%ld,%ld,%.4f\n", id, h + 1,
+                         reached, alive, skipped);
+        }
+        std::fclose(f);
     }
 
-    std::FILE* f = std::fopen(cfg.csv.c_str(), "ab");
-    if (f == nullptr) {
-        std::cout << "could not write " << cfg.csv << std::endl;
-        return;
+    // ---- 3. bytes per hop ----
+    f = Open::at("test/bytes_per_hop.csv",
+        "run_id,backend,bvec,bdim,nprobe,k,hop_id,bytes_fwd,bytes_per_query");
+    if (f != nullptr) {
+        for (int h = 0; h < bDim; ++h) {
+            long by = (h < (int)bytesAfterStage.size()) ? bytesAfterStage[h] : 0;
+            std::fprintf(f, "%s,%d,%ld,%.2f\n", id, h + 1, by,
+                         (nq > 0) ? ((double)by / nq) : 0.0);
+        }
+        std::fclose(f);
     }
 
-    // The four identity columns come first: a row has to say when it was
-    // taken, from what, and where, or a file of them cannot be sorted, and a
-    // repeat of the same settings is indistinguishable from the original.
-    if (isNew) {
-        std::fprintf(f, "timestamp,build,host,elapsed,"
-                        "data,nlist,iters,trainpoints,workers,bvec,bdim,mode,"
-                        "assign,skew,indexskew,skewshift,batch,block,blocksend,pipeline,"
-                        "threads,prewarm,prewarmlists,"
-                        "pruning,loop,nprobe,k,nq,recall,r2,qps,ms_per_query,"
-                        "single_time,speedup,variance,"
-                        "comm_time,compute_time,other_time,"
-                        "train_time,add_time,distribute_time,"
-                        "mem_mb,mem_pct,"
-                        "differing,ties,scanned,work_pct,"
-                        "dim_ops,dim_ops_pct,bytes_fwd,busy_skew,"
-                        "stale_first,stale_mean\n");
-    }
-
-    double comm = 0.0;
-    double compute = 0.0;
-    double other = 0.0;
-    timeBreakdown(&comm, &compute, &other);
-
-    // The five, so a sweep can be read from the file rather than from
-    // terminal scrollback. dim_ops is the exact count; work_pct beside it
-    // weights every slice equally and only agrees with it when the slices
-    // are the same width, which 128 over 3 is not.
-    long dimOps = 0;
-    long bytesFwd = 0;
-    for (size_t s = 0; s < dimsAfterStage.size(); ++s) {
-        dimOps = dimOps + dimsAfterStage[s];
-        bytesFwd = bytesFwd + bytesAfterStage[s];
-    }
-    double full = (double)scanned * dim;
-    double dimOpsPct = (full > 0.0) ? (100.0 * dimOps / full) : 0.0;
-
-    // Busiest machine over idlest, on compute seconds. Total is the same for
-    // everyone by construction -- whoever finishes early just waits -- so it
-    // would show no skew at all.
+    // ---- 4. node busy-time skew: the per-worker seconds it comes from ----
     double busyLo = -1.0;
     double busyHi = 0.0;
     for (size_t w = 0; w < workerTimes.size(); ++w) {
@@ -635,48 +581,87 @@ void Metrics::writeCsv() const {
     }
     double busySkew = (busyLo > 0.0) ? (busyHi / busyLo) : 0.0;
 
-    // The first round separately: it is the one the prewarm quality decides,
-    // and where the gap is widest. The mean is over every (query, round).
-    double staleFirst = stalenessMean.empty() ? 0.0 : stalenessMean[0];
+    f = Open::at("test/busy_skew.csv",
+        "run_id,backend,bvec,bdim,nprobe,k,worker,row,col,"
+        "busy_s,total_s,idle_pct,setup_pct,run_skew");
+    if (f != nullptr) {
+        for (size_t w = 0; w < workerTimes.size(); ++w) {
+            double tot = workerTimes[w][0];
+            std::fprintf(f, "%s,%d,%d,%d,%.6f,%.6f,%.2f,%.2f,%.4f\n",
+                         id, (int)w + 1,
+                         (int)w / (bDim > 0 ? bDim : 1),
+                         (int)w % (bDim > 0 ? bDim : 1),
+                         workerTimes[w][3], tot,
+                         (tot > 0.0) ? (100.0 * workerTimes[w][1] / tot) : 0.0,
+                         (tot > 0.0) ? (100.0 * workerTimes[w][6] / tot) : 0.0,
+                         busySkew);
+        }
+        std::fclose(f);
+    }
+
+    // ---- 5. threshold staleness: per vector-level round ----
+    f = Open::at("test/threshold_staleness.csv",
+        "run_id,backend,bvec,bdim,nprobe,k,round,mean_pct,worst_pct,queries");
+    if (f != nullptr) {
+        for (size_t r = 0; r < stalenessMean.size(); ++r) {
+            std::fprintf(f, "%s,%d,%.4f,%.4f,%ld\n", id, (int)r + 1,
+                         100.0 * stalenessMean[r],
+                         100.0 * (r < stalenessMax.size() ? stalenessMax[r] : 0.0),
+                         r < stalenessCount.size() ? stalenessCount[r] : 0L);
+        }
+        std::fclose(f);
+    }
+
+    // ---- 6. everything else: one row per run ----
+    double comm = 0.0;
+    double compute = 0.0;
+    double other = 0.0;
+    timeBreakdown(&comm, &compute, &other);
+
+    long dimOps = 0;
+    long bytesFwd = 0;
+    for (size_t s2 = 0; s2 < dimsAfterStage.size(); ++s2) {
+        dimOps = dimOps + dimsAfterStage[s2];
+        bytesFwd = bytesFwd + bytesAfterStage[s2];
+    }
+
     double staleSum = 0.0;
     long staleN = 0;
-    for (size_t s = 0; s < stalenessMean.size(); ++s) {
-        staleSum = staleSum + stalenessMean[s] * (double)stalenessCount[s];
-        staleN = staleN + stalenessCount[s];
+    for (size_t s2 = 0; s2 < stalenessMean.size(); ++s2) {
+        staleSum = staleSum + stalenessMean[s2] * (double)stalenessCount[s2];
+        staleN = staleN + stalenessCount[s2];
     }
     double staleMean = (staleN > 0) ? (staleSum / staleN) : 0.0;
 
-    std::fprintf(f,
-        "%s,%s,%s,%.1f,"
-        "%s,%d,%d,%d,%d,%d,%d,%s,%s,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%s,%d,"
-        "%d,%d,%d,%.6f,%.6f,%.3f,%.4f,"
-        "%.4f,%.3f,%.2f,"
-        "%.4f,%.4f,%.4f,"
-        "%.3f,%.3f,%.3f,"
-        "%ld,%.2f,"
-        "%d,%d,%ld,%.4f,"
-        "%ld,%.4f,%ld,%.4f,%.6f,%.6f\n",
-        timestampNow().c_str(), buildId(), hostName().c_str(), elapsed,
-        cfg.data.c_str(), nlist, cfg.iters, cfg.trainPoints,
-        workers, bVec, bDim, cfg.mode.c_str(),
-        cfg.assign.c_str(), cfg.skew, cfg.indexSkew, cfg.skewShift,
-        cfg.batch, cfg.block, cfg.blockSend ? 1 : 0, cfg.pipeline ? 1 : 0,
-        cfg.threads, cfg.prewarm, cfg.prewarmLists,
-        pruningLabel().c_str(), cfg.loop,
-        nprobe, k, nq, recall, r2, nq / seconds, 1000.0 * seconds / nq,
-        single, (single > 0.0) ? (single / seconds) : 0.0, variance,
-        comm, compute, other,
-        trainSeconds, addSeconds, distributeSeconds,
-        workerBytes / 1048576,
-        (singleBytes > 0) ? (100.0 * workerBytes / singleBytes) : 0.0,
-        // -1 rather than 0 when the check was off: a sweep leaves it off on
-        // most runs, and a column of zeroes would read as a column of passes.
-        cfg.check ? differing : -1, cfg.check ? ties : -1,
-        scanned, workPercent(),
-        dimOps, dimOpsPct, bytesFwd, busySkew, staleFirst, staleMean);
-
-    std::fclose(f);
-    std::cout << "appended to " << cfg.csv << std::endl;
+    f = Open::at("test/runs.csv",
+        "run_id,timestamp,build,host,data,"
+        "backend,pruning,assign,pipeline,blocksend,gemmall,"
+        "bvec,bdim,nlist,nprobe,k,nq,workers,skew,skewshift,variance,prewarm,"
+        "qps,latency_ms,recall,differing,speedup,"
+        "dim_ops,bytes_fwd,cand_offered,busy_skew,stale_mean,"
+        "comm_time,compute_time,other_time,mem_mb");
+    if (f != nullptr) {
+        std::fprintf(f,
+            "%s,%s,%s,%s,%s,"
+            "%s,%s,%s,%d,%d,%d,"
+            "%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.2f,%d,"
+            "%.3f,%.4f,%.6f,%d,%.3f,"
+            "%ld,%ld,%ld,%.4f,%.6f,"
+            "%.4f,%.4f,%.4f,%ld\n",
+            runId, timestampNow().c_str(), buildId(), hostName().c_str(),
+            cfg.data.c_str(), cfg.backend.c_str(), pruningLabel().c_str(), cfg.assign.c_str(),
+            cfg.pipeline ? 1 : 0, cfg.blockSend ? 1 : 0, cfg.gemmAll ? 1 : 0,
+            bVec, bDim, nlist, nprobe, k, nq, workers,
+            cfg.skew, cfg.skewShift, variance, cfg.prewarm,
+            nq / seconds, 1000.0 * seconds / nq, recall,
+            // -1 rather than 0 when the check was off: a sweep leaves it off
+            // on most runs, and a column of zeroes would read as passes.
+            cfg.check ? differing : -1,
+            (single > 0.0) ? (single / seconds) : 0.0,
+            dimOps, bytesFwd, scanned, busySkew, staleMean,
+            comm, compute, other, workerBytes / 1048576);
+        std::fclose(f);
+    }
 }
 
 }  // namespace harmony
