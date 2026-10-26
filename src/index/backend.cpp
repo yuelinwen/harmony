@@ -235,13 +235,22 @@ protected:
         // ssyev returns them ascending; the whole point is to take the
         // largest first.
         r_.assign((size_t)d * d, 0.0f);
+        lambda_.assign((size_t)d, 0.0f);
         for (int i = 0; i < d; ++i) {
             const float* src = &cov[(size_t)(d - 1 - i) * d];
             std::copy(src, src + d, &r_[(size_t)i * d]);
+            // Kept in the same order as the rows above: how much of the
+            // data's variance the i-th direction accounts for. PCA alone
+            // does not need these, but a backend that has to say how much
+            // of a distance the first few dimensions already explain does.
+            // A near-singular covariance can return small negatives.
+            float l = eig[(size_t)(d - 1 - i)];
+            lambda_[i] = (l > 0.0f) ? l : 0.0f;
         }
     }
 
     std::vector<float> r_;
+    std::vector<float> lambda_;   // descending, matching the rows of r_
 };
 
 
@@ -335,8 +344,156 @@ private:
     float eps_;
 };
 
+// DADE (Deng et al., PVLDB 18), which is ADSampling's idea with the basis
+// and the slack both read off the data instead of assumed.
+//
+// Its transform is PCA, so it inherits one and pca is the right thing to
+// read it against -- same basis, same everything, differing only in what
+// it concludes from a partial sum.
+//
+// ADSampling can say the first d of D dimensions carry d/D of the distance
+// because a random rotation spreads the variance evenly, which is the
+// price it pays for needing no training. PCA does the opposite on purpose:
+// it piles the variance into the leading directions, so after d dimensions
+// the share already accounted for is not d/D but the eigenvalue ratio
+// L_d/L_D, and on Sift1M that reaches half the variance in well under half
+// the dimensions. Estimating the full squared distance as S * L_D/L_d and
+// rejecting when it clears the threshold gives
+//
+//     m = (L_d / L_D) * (1 + eps_d)^2
+//
+// the same shape as ADSampling with the variance share in place of the
+// dimension share.
+//
+// eps_d is the other half. ADSampling has a closed form from a
+// concentration bound; DADE has none, and measures instead: how far the
+// estimate at d dimensions overshoots the true distance, over a sample of
+// pairs, at the quantile the significance level asks for. That is why this
+// backend's scales are worked out on the master -- they are learned from
+// the data, and a worker has none.
+class DadeBackend : public PcaBackend {
+public:
+    explicit DadeBackend(float sig) {
+        sig_ = sig;
+    }
+
+    const char* name() const override {
+        return "dade";
+    }
+
+    void fit(const Dataset& base, const IvfIndex& index) override {
+        PcaBackend::fit(base, index);
+        estimateDeviation(base, index);
+    }
+
+    float thresholdScale(int dimsSoFar, int dimsTotal) const override {
+        if (dimsSoFar <= 0 || dimsSoFar >= dimsTotal) {
+            return 1.0f;
+        }
+        if ((int)eps_.size() < dimsSoFar || prefix_[dimsTotal] <= 0.0f) {
+            return 1.0f;   // fit found nothing to work with
+        }
+        float f = 1.0f + eps_[dimsSoFar - 1];
+        return (prefix_[dimsSoFar] / prefix_[dimsTotal]) * f * f;
+    }
+
+private:
+    // Pairs are drawn from inside a cluster, not from the dataset at large.
+    // The threshold only ever decides between candidates a query is already
+    // scanning, which are the near pairs; the overshoot on a random far
+    // pair is a different distribution and would set the slack for a case
+    // that never comes up.
+    void estimateDeviation(const Dataset& base, const IvfIndex& index) {
+        int d = base.getDim();
+        prefix_.assign((size_t)d + 1, 0.0f);
+        for (int k = 0; k < d; ++k) {
+            prefix_[k + 1] = prefix_[k] + lambda_[k];
+        }
+        eps_.assign((size_t)d, 0.0f);
+        if (prefix_[d] <= 0.0f) {
+            return;
+        }
+
+        std::vector<int> usable;
+        for (int c = 0; c < index.getNlist(); ++c) {
+            if (index.clusterSize(c) >= 2) {
+                usable.push_back(c);
+            }
+        }
+        if (usable.empty()) {
+            return;
+        }
+
+        const int pairs = 2000;
+        std::mt19937 gen(54321);   // its own, for the reason rotation has one
+        std::vector<float> over((size_t)d * pairs, 0.0f);
+        std::vector<float> diff((size_t)d);
+        std::vector<float> proj((size_t)d);
+
+        for (int s = 0; s < pairs; ++s) {
+            const std::vector<int>& ids =
+                index.clusterIds(usable[gen() % usable.size()]);
+            size_t ia = gen() % ids.size();
+            size_t ib = (ia + 1 + (gen() % (ids.size() - 1))) % ids.size();
+            const float* va = base.vec(ids[ia]);
+            const float* vb = base.vec(ids[ib]);
+            for (int k = 0; k < d; ++k) {
+                diff[k] = va[k] - vb[k];
+            }
+            // The basis is fitted but not yet applied to the dataset, so
+            // the difference is rotated here rather than read off.
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, d, d, 1.0f, r_.data(),
+                        d, diff.data(), 1, 0.0f, proj.data(), 1);
+
+            float cum = 0.0f;
+            for (int k = 0; k < d; ++k) {
+                cum = cum + proj[k] * proj[k];
+                over[(size_t)k * pairs + s] = cum;   // partial, scaled below
+            }
+            float full = cum;
+            if (full <= 0.0f) {
+                for (int k = 0; k < d; ++k) {
+                    over[(size_t)k * pairs + s] = 0.0f;
+                }
+                continue;
+            }
+            for (int k = 0; k < d; ++k) {
+                float est2 = over[(size_t)k * pairs + s] * prefix_[d]
+                           / prefix_[k + 1];
+                over[(size_t)k * pairs + s] =
+                    std::sqrt(est2 / full) - 1.0f;
+            }
+        }
+
+        int at = (int)((1.0f - sig_) * pairs);
+        if (at < 0) {
+            at = 0;
+        }
+        if (at > pairs - 1) {
+            at = pairs - 1;
+        }
+        for (int k = 0; k < d; ++k) {
+            float* row = &over[(size_t)k * pairs];
+            std::nth_element(row, row + at, row + pairs);
+            // Negative is the normal case here, and it must be kept. It
+            // says the estimate runs low at this many dimensions, so the
+            // threshold has to come down to match -- that is the whole
+            // point of measuring the deviation instead of bounding it.
+            // Clamping it away was worth 3.5% where keeping it is worth
+            // far more, and made --dadesig do nothing at all.
+            //
+            // The floor only stops the square below going negative.
+            eps_[k] = (row[at] > -0.99f) ? row[at] : -0.99f;
+        }
+    }
+
+    float sig_;
+    std::vector<float> prefix_;   // prefix sums of lambda_, size d + 1
+    std::vector<float> eps_;      // eps_[k] is the slack at k + 1 dimensions
+};
+
 std::unique_ptr<PruningBackend> makeBackend(const std::string& name,
-                                            float adEps) {
+                                            const Config& cfg) {
     if (name == "harmony") {
         return std::unique_ptr<PruningBackend>(new HarmonyBackend());
     }
@@ -350,13 +507,16 @@ std::unique_ptr<PruningBackend> makeBackend(const std::string& name,
         return std::unique_ptr<PruningBackend>(new ResidualPcaBackend());
     }
     if (name == "adsampling") {
-        return std::unique_ptr<PruningBackend>(new AdSamplingBackend(adEps));
+        return std::unique_ptr<PruningBackend>(new AdSamplingBackend(cfg.adEps));
+    }
+    if (name == "dade") {
+        return std::unique_ptr<PruningBackend>(new DadeBackend(cfg.dadeSig));
     }
     return nullptr;
 }
 
 std::string backendNames() {
-    return "harmony, rotation, pca, residual_pca, adsampling";
+    return "harmony, rotation, pca, residual_pca, adsampling, dade";
 }
 
 }  // namespace harmony

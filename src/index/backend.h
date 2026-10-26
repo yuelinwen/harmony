@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 
+#include "../config.h"
 #include "dataset.h"
 #include "ivf_index.h"
 
@@ -87,9 +88,10 @@ public:
 
 // Returns nullptr for a name that is not a backend, so the caller can print
 // the list rather than run something the user did not ask for.
-// adEps is --adeps, which only the ADSampling backend reads.
+// Handed the whole config because each backend reads its own knobs out of
+// it and the list grows with every one added.
 std::unique_ptr<PruningBackend> makeBackend(const std::string& name,
-                                            float adEps);
+                                            const Config& cfg);
 
 // Every name makeBackend accepts, for the error message and for --help.
 std::string backendNames();

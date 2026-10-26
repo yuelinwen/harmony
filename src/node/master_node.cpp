@@ -638,6 +638,14 @@ void MasterNode::distributeData() {
         rowClusters[clusterOwner_[c]] = rowClusters[clusterOwner_[c]] + 1;
     }
 
+    // The same table the workers build for themselves, so the scales below
+    // land on the hop each one actually makes.
+    SearchOrder chainOrder(bDim_, bDim_, true);
+    int fullDim = 0;
+    for (int c = 0; c < bDim_; ++c) {
+        fullDim = fullDim + (plan_.end(c) - plan_.begin(c));
+    }
+
     for (int w = 1; w <= numWorkers_; ++w) {
         int row = (w - 1) / bDim_;
         int col = (w - 1) % bDim_;
@@ -654,16 +662,30 @@ void MasterNode::distributeData() {
         // MPI: blocking is fine for startup -- the order is fixed and nobody waits
         MPI_Send(setup, 9, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
 
-        // Every column's slice width, in column order. A worker derives the
-        // chain order itself, so what it cannot know is only how wide the
-        // workers ahead of it are -- which is what it needs to say how many
-        // dimensions a partial sum reaching it has already covered. The sum
-        // of these is the full dimension.
-        std::vector<int> widths(bDim_);
-        for (int c = 0; c < bDim_; ++c) {
-            widths[c] = plan_.end(c) - plan_.begin(c);
+        // What this worker multiplies the pruning threshold by on the hop it
+        // makes for each item. Worked out here because the backend is here:
+        // a scale can depend on the eigenvalues of the data and on a
+        // deviation estimated by sampling it, none of which a worker has or
+        // should have. It receives bDim floats and never learns what chose
+        // them -- which is the property this file's rotations already had.
+        std::vector<float> scales(bDim_);
+        for (int item = 0; item < bDim_; ++item) {
+            const std::vector<int>& chain = chainOrder.chain(item);
+            int through = 0;
+            for (int p = 0; p < (int)chain.size(); ++p) {
+                through = through + (plan_.end(chain[p])
+                                     - plan_.begin(chain[p]));
+                if (chain[p] == col) {
+                    break;   // the sum as it leaves this worker
+                }
+            }
+            float m = backend_->thresholdScale(through, fullDim);
+            // Never looser than the exact test, which is always valid and
+            // at the later hops is the tighter of the two.
+            scales[item] = (m < 1.0f) ? m : 1.0f;
         }
-        MPI_Send(widths.data(), bDim_, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
+        MPI_Send(scales.data(), bDim_, MPI_FLOAT, w, TAG_SETUP,
+                 MPI_COMM_WORLD);
     }
 
     probeNetwork();
@@ -1139,7 +1161,7 @@ int MasterNode::run() {
 
     // Before anything is loaded: an unknown name should cost a typo, not a
     // minute of clustering.
-    backend_ = makeBackend(cfg_.backend, cfg_.adEps);
+    backend_ = makeBackend(cfg_.backend, cfg_);
     if (backend_ == nullptr) {
         std::cerr << "unknown backend: " << cfg_.backend
                   << "   (" << backendNames() << ")" << std::endl;

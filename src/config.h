@@ -96,6 +96,11 @@ struct Config {
     // dropped on it. Larger prunes later and keeps more recall. 2.1 is the
     // paper's default. Read by no other backend.
     float adEps = 2.1f;
+
+    // DADE's significance level: the share of candidates its estimate is
+    // allowed to be wrong about at each test. Smaller keeps more recall and
+    // prunes later. 0.1 is the paper's. Read by no other backend.
+    float dadeSig = 0.1f;
     // Wait for each forward to land before starting the next cluster, which
     // is the blocking arm of the paper's Fig. 2(b) comparison.
     bool blockSend = false;
@@ -247,6 +252,7 @@ inline void printUsage(const char* prog) {
         << "  --gemmall <0|1>    gemm at every slice, not just the head (0)\n"
         << "  --compact <0|1>    forward only the surviving candidates   (0)\n"
         << "  --adeps <float>    adsampling confidence slack      (2.1)\n"
+        << "  --dadesig <float>  dade significance level          (0.1)\n"
         << "  --backend <name>   rotation applied before search   (harmony)\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
         << "                     costs more than the search it checks\n"
@@ -353,6 +359,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.backend = argv[++i];
         } else if (opt == "--adeps" && hasValue) {
             cfg.adEps = (float)std::atof(argv[++i]);
+        } else if (opt == "--dadesig" && hasValue) {
+            cfg.dadeSig = (float)std::atof(argv[++i]);
         } else if (opt == "--compact" && hasValue) {
             cfg.compact = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--gemmall" && hasValue) {

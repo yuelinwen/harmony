@@ -415,32 +415,13 @@ void WorkerNode::receiveSetup() {
         }
     }
 
-    // The slice widths, in column order, straight after the setup message.
-    // With them the chain order this worker just derived says how many
-    // dimensions a partial sum has covered by the time it leaves here.
-    std::vector<int> widths(bDim_);
-    MPI_Recv(widths.data(), bDim_, MPI_INT, MASTER_RANK, TAG_SETUP,
-             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    int fullDim = 0;
-    for (int c = 0; c < bDim_; ++c) {
-        fullDim = fullDim + widths[c];
-    }
-
-    backend_ = makeBackend(cfg_.backend, cfg_.adEps);
+    // What to multiply the pruning threshold by on this worker's hop for
+    // each item, straight after the setup message. One float per item and
+    // no explanation: the master works them out, because what sets them can
+    // depend on the data, which only the master has.
     scaleOf_.assign(bDim_, 1.0f);
-    if (backend_ != nullptr) {
-        for (int item = 0; item < bDim_; ++item) {
-            const std::vector<int>& chain = chainOrder.chain(item);
-            int through = 0;
-            for (int p = 0; p <= stageOf_[item]; ++p) {
-                through = through + widths[chain[p]];
-            }
-            float m = backend_->thresholdScale(through, fullDim);
-            // Never looser than the exact test, which is always valid and
-            // at the later hops is the tighter of the two.
-            scaleOf_[item] = (m < 1.0f) ? m : 1.0f;
-        }
-    }
+    MPI_Recv(scaleOf_.data(), bDim_, MPI_FLOAT, MASTER_RANK, TAG_SETUP,
+             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
     // --netprobe: the master times a few round trips against rank 1 before
     // any data moves. The counts come from comm/messages.h so both sides
