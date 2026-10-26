@@ -47,7 +47,6 @@ public:
     void buildSizePrefix();
 
     // Where a cached index with these settings lives.
-    std::string indexPath(int nlist, int iterations) const;
 
     // Lays the workers out as a bVec x bDim grid (paper Fig. 4a). Clusters go
     // to rows by weight, heaviest first to the lightest row; within a row,

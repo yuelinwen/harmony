@@ -42,8 +42,6 @@ public:
     // save returns false if the file cannot be written; load returns false if
     // it is missing, truncated, or was built for a different dataset, and
     // leaves the index untouched so the caller can just build instead.
-    bool save(const std::string& path) const;
-    bool load(const std::string& path, int expectN, int expectDim);
 
     // Returns the k nearest neighbors of one query vector, scanning only
     // the nprobe nearest clusters.
