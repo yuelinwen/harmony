@@ -45,6 +45,11 @@ def main():
     ap.add_argument("--label", default="",
                     help="comma-separated columns to use as the row label")
     ap.add_argument("--width", type=int, default=13)
+    ap.add_argument("--agg", action="store_true",
+                    help="group rows that share the label and report mean and "
+                         "spread instead of listing them. QPS on these VMs "
+                         "scatters by several percent run to run, so a single "
+                         "number cannot tell an effect from the noise")
     args = ap.parse_args()
 
     runs = load("runs")[args.start:]
@@ -65,6 +70,45 @@ def main():
                 pivot_rows.setdefault(r["run_id"], {})[int(r["hop_id"])] = r[field]
         for d in pivot_rows.values():
             hops = sorted(set(hops) | set(d))
+
+    if args.agg:
+        groups = {}
+        order = []
+        for r in runs:
+            key = tuple(r.get(c, "") for c in label)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(r)
+
+        head = [fmt(c, args.width) for c in label] + [fmt("n", 4)]
+        for c in cols:
+            head += [fmt(c, args.width), fmt("+-%", 7)]
+        print("  " + "".join(head))
+
+        for key in order:
+            rows = groups[key]
+            line = [fmt(v, args.width) for v in key] + [fmt(len(rows), 4)]
+            for c in cols:
+                vals = []
+                for r in rows:
+                    try:
+                        vals.append(float(r.get(c, "")))
+                    except ValueError:
+                        pass
+                if not vals:
+                    line += [fmt("", args.width), fmt("", 7)]
+                    continue
+                mean = sum(vals) / len(vals)
+                # Half the range over the mean: with five runs this says more
+                # about how far apart they landed than a standard deviation
+                # computed from five points.
+                half = (max(vals) - min(vals)) / 2.0
+                line += [fmt("%.1f" % mean, args.width),
+                         fmt("%.1f" % (100.0 * half / mean) if mean else "",
+                             7)]
+            print("  " + "".join(line))
+        return 0
 
     head = [fmt(c, args.width) for c in label + cols]
     head += [fmt("hop%d" % h, args.width) for h in hops]

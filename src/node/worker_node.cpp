@@ -69,6 +69,139 @@ long WorkerNode::memoryBytes() const {
     return b + (long)(where_.size() * sizeof(int));
 }
 
+// ---- compaction ------------------------------------------------------------
+//
+// A hop forwards one float per (query, candidate) pair whether or not the
+// candidate is still alive, because pruning marks it PRUNED in place and
+// leaves the array the same length. That makes pruning save arithmetic and
+// nothing else: measured on Sift1M at 1x4, the bytes on the wire are
+// identical under every backend, including the one that drops three times
+// as many candidates.
+//
+// Compacting sends a bitmap of who survived followed by only their values.
+// At survival rate s the cost is total/8 + 4*s*total against 4*total, so it
+// pays whenever s < 0.97 -- which is every hop after the first.
+//
+// The receiver does not need to be told the length. The bitmap is a fixed
+// size for a known candidate count, and its population count says how many
+// floats follow, so one Irecv into a worst-case buffer is enough.
+
+size_t bitmapBytes(size_t n) {
+    // Rounded up to four so the values that follow start aligned.
+    return (((n + 7) / 8) + 3) & ~(size_t)3;
+}
+
+// Both halves run over the whole candidate array, which is the same array
+// accumulate() just walked -- and accumulate walks it on eight threads. Left
+// serial, this scan alone cost a third of the run (measured: "other" went
+// from 9% to 33%), so it is split the same way.
+//
+// A chunk is a whole number of bitmap bytes, so no two threads ever write the
+// same byte. The first pass counts survivors per chunk, the prefix sum says
+// where each chunk's values go, and the second pass writes them with no
+// coordination.
+const size_t kPackChunk = 4096;
+
+// [bitmap][surviving values], returning the length actually used.
+//
+// The store is guarded rather than branchless. Writing every value and
+// advancing by 0 or 1 is the faster shape and is safe in one sequential
+// pass -- the stray write is overwritten by the next live value -- but not
+// once the passes are chunked: a chunk whose last entries are all dead
+// writes past its own region and into the first slot of the next chunk,
+// which another thread has already filled. That cost two wrong answers in
+// 1024 and 12,832 missing dim_ops before it was caught.
+size_t packSurvivors(const std::vector<float>& sums, unsigned char* out,
+                     std::vector<size_t>& starts) {
+    size_t n = sums.size();
+    size_t bits = bitmapBytes(n);
+    size_t chunks = (n + kPackChunk - 1) / kPackChunk;
+    float* values = reinterpret_cast<float*>(out + bits);
+
+    // bitmapBytes rounds up to four; zero the bytes no chunk will write, so
+    // what goes on the wire does not depend on what was in the buffer last.
+    for (size_t b = (n + 7) / 8; b < bits; ++b) {
+        out[b] = 0;
+    }
+
+    starts.assign(chunks + 1, 0);
+    #pragma omp parallel for schedule(static)
+    for (long c = 0; c < (long)chunks; ++c) {
+        size_t lo = (size_t)c * kPackChunk;
+        size_t hi = (lo + kPackChunk < n) ? (lo + kPackChunk) : n;
+        size_t alive = 0;
+        for (size_t i = lo; i < hi; ++i) {
+            alive = alive + ((sums[i] < PRUNED) ? 1 : 0);
+        }
+        starts[c + 1] = alive;
+    }
+    for (size_t c = 0; c < chunks; ++c) {
+        starts[c + 1] = starts[c + 1] + starts[c];
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (long c = 0; c < (long)chunks; ++c) {
+        size_t lo = (size_t)c * kPackChunk;
+        size_t hi = (lo + kPackChunk < n) ? (lo + kPackChunk) : n;
+        size_t kept = starts[c];
+        for (size_t i = lo; i < hi; i += 8) {
+            size_t end = (i + 8 < hi) ? (i + 8) : hi;
+            unsigned mask = 0;
+            for (size_t j = i; j < end; ++j) {
+                if (sums[j] < PRUNED) {
+                    mask = mask | (1u << (j - i));
+                    values[kept] = sums[j];
+                    kept = kept + 1;
+                }
+            }
+            out[i >> 3] = (unsigned char)mask;
+        }
+    }
+    return bits + starts[chunks] * sizeof(float);
+}
+
+// The inverse. Everything the bitmap does not claim is PRUNED, which is what
+// the uncompacted array would have carried. Here the per-chunk count is a
+// popcount of the bitmap, so the first pass touches bytes rather than floats.
+//
+// This half can stay branchless: the overshooting access is a read, and a
+// read of the next chunk's first value races with nothing.
+void unpackSurvivors(const unsigned char* in, std::vector<float>& sums,
+                     std::vector<size_t>& starts) {
+    size_t n = sums.size();
+    size_t bits = bitmapBytes(n);
+    size_t chunks = (n + kPackChunk - 1) / kPackChunk;
+    const float* values = reinterpret_cast<const float*>(in + bits);
+
+    starts.assign(chunks + 1, 0);
+    #pragma omp parallel for schedule(static)
+    for (long c = 0; c < (long)chunks; ++c) {
+        size_t lo = (size_t)c * kPackChunk;
+        size_t hi = (lo + kPackChunk < n) ? (lo + kPackChunk) : n;
+        size_t alive = 0;
+        for (size_t b = lo >> 3; b < (hi + 7) >> 3; ++b) {
+            alive = alive + (size_t)__builtin_popcount(in[b]);
+        }
+        starts[c + 1] = alive;
+    }
+    for (size_t c = 0; c < chunks; ++c) {
+        starts[c + 1] = starts[c + 1] + starts[c];
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (long c = 0; c < (long)chunks; ++c) {
+        size_t lo = (size_t)c * kPackChunk;
+        size_t hi = (lo + kPackChunk < n) ? (lo + kPackChunk) : n;
+        size_t kept = starts[c];
+        for (size_t i = lo; i < hi; ++i) {
+            unsigned alive = (in[i >> 3] >> (i & 7)) & 1u;
+            // The unconditional read is in range: kept never passes n - 1.
+            sums[i] = alive ? values[kept] : PRUNED;
+            kept = kept + alive;
+        }
+    }
+}
+
 // Head of the chain: sums are all zero and nothing is pruned, so every
 // (query, candidate) pair has to be computed. Regrouping those pairs by
 // cluster turns them into one dense matrix multiply per cluster --
@@ -364,6 +497,11 @@ int WorkerNode::run() {
     // memory.
     int slots = sendSlots_;
     std::vector<std::vector<float>> outSums(slots);       // mid-chain: totals
+    // Under --compact the totals are packed into these instead. Grown to the
+    // largest block seen and then left alone: a fresh allocation per block
+    // costs a malloc and a zero-fill of an array this size, which is the
+    // same order as the bytes compacting saves.
+    std::vector<std::vector<unsigned char>> outWire(slots);
     std::vector<std::vector<Candidate>> outTop(slots);    // chain tail: top-k
     std::vector<MPI_Request> reqSums(slots, MPI_REQUEST_NULL);
     int slot = 0;
@@ -382,8 +520,16 @@ int WorkerNode::run() {
         int nextRank;
         std::vector<size_t> qOff;   // where each query's totals start
         std::vector<float> sums;
+        // Under --compact the wire form arrives here and is expanded into
+        // sums once the receive completes. Sized for the worst case, which
+        // is everything surviving, so one receive covers any survival rate.
+        bool packed = false;
+        std::vector<unsigned char> wire;
     };
     std::vector<Pending> pend;
+    // Recycled across blocks, for the reason outWire is.
+    std::vector<std::vector<unsigned char>> wireFree;
+    std::vector<size_t> wireChunks;   // scratch for pack/unpack
     std::vector<MPI_Request> pendReq;   // upstream receive; NULL for a head
 
     // A block named but not yet opened. A group arrives as one message and
@@ -643,8 +789,25 @@ int WorkerNode::run() {
                 p.sums.resize(total);
                 // MPI: posted now, collected later -- the point of the whole
                 // arrangement is that this wait overlaps other blocks.
-                MPI_Irecv(p.sums.data(), (int)total, MPI_FLOAT, p.prevRank,
-                          tagSums(p.slotTag), MPI_COMM_WORLD, &up);
+                if (cfg_.compact) {
+                    // Worst case, so one receive is enough however many
+                    // survive. MPI delivers fewer bytes without complaint.
+                    size_t need = bitmapBytes(total) + total * sizeof(float);
+                    if (!wireFree.empty()) {
+                        p.wire = std::move(wireFree.back());
+                        wireFree.pop_back();
+                    }
+                    if (p.wire.size() < need) {
+                        p.wire.resize(need);
+                    }
+                    p.packed = true;
+                    MPI_Irecv(p.wire.data(), (int)need, MPI_BYTE,
+                              p.prevRank, tagSums(p.slotTag), MPI_COMM_WORLD,
+                              &up);
+                } else {
+                    MPI_Irecv(p.sums.data(), (int)total, MPI_FLOAT, p.prevRank,
+                              tagSums(p.slotTag), MPI_COMM_WORLD, &up);
+                }
             }
             setup_ = setup_ + phase.seconds();
             pend.push_back(std::move(p));
@@ -688,6 +851,16 @@ int WorkerNode::run() {
 
         Pending& p = pend[pick];
         size_t total = p.sums.size();
+
+        if (p.packed) {
+            // The bitmap puts the survivors back where they came from and
+            // marks everything else PRUNED, which is what the upstream hop
+            // decided. Charged to recv: taking a block off the wire is not
+            // finished until it has been expanded.
+            phase.reset();
+            unpackSurvivors(p.wire.data(), p.sums, wireChunks);
+            recv_ = recv_ + phase.seconds();
+        }
 
         phase.reset();
         HopCount hop = accumulate(p.firstQ, p.len, p.qOff, p.sums,
@@ -754,6 +927,21 @@ int WorkerNode::run() {
             MPI_Isend(outTop[slot].data(), (int)bytes, MPI_BYTE,
                       MASTER_RANK, tagTopk(p.slotTag), MPI_COMM_WORLD,
                       &reqSums[slot]);
+        } else if (cfg_.compact) {
+            size_t need = bitmapBytes(total) + total * sizeof(float);
+            if (outWire[slot].size() < need) {
+                outWire[slot].resize(need);
+            }
+            phase.reset();
+            size_t wireBytes = packSurvivors(p.sums, outWire[slot].data(),
+                                             wireChunks);
+            send_ = send_ + phase.seconds();   // the other half of the same cost
+            // What actually went out, not what the array could have held --
+            // the whole point of compacting is that these differ.
+            bytesAtStage_[p.stage] = bytesAtStage_[p.stage] + (long)wireBytes;
+            MPI_Isend(outWire[slot].data(), (int)wireBytes, MPI_BYTE,
+                      p.nextRank, tagSums(p.slotTag), MPI_COMM_WORLD,
+                      &reqSums[slot]);
         } else {
             bytesAtStage_[p.stage] = bytesAtStage_[p.stage]
                                    + (long)(total * sizeof(float));
@@ -772,6 +960,9 @@ int WorkerNode::run() {
             send_ = send_ + phase.seconds();
         }
 
+        if (!p.wire.empty()) {
+            wireFree.push_back(std::move(p.wire));
+        }
         pend.erase(pend.begin() + pick);
         pendReq.erase(pendReq.begin() + pick);
 

@@ -244,6 +244,41 @@ protected:
     std::vector<float> r_;
 };
 
+
+// PCA on what is left after the cluster centroid is subtracted.
+//
+// The reasoning is that global PCA finds the directions the whole dataset
+// varies along, and most of that variance is between clusters -- which the
+// IVF has already dealt with, because a query only ever scans the handful
+// of clusters nearest it. Inside one of those clusters the between-cluster
+// spread is a constant offset and contributes nothing to telling two
+// candidates apart. What does is the residual, so those are the directions
+// worth putting first.
+//
+// One basis for all of them, not one per cluster. Per-cluster bases would
+// concentrate harder, but then a query would have to be rotated once per
+// cluster it probes, and the dimension slice would mean a different thing
+// in every cluster -- a much larger change for a gain that has not been
+// measured yet.
+class ResidualPcaBackend : public PcaBackend {
+public:
+    const char* name() const override {
+        return "residual_pca";
+    }
+
+    void fit(const Dataset& base, const IvfIndex& index) override {
+        // Which cluster each vector landed in, inverted from the lists.
+        std::vector<int> owner((size_t)base.getN(), 0);
+        for (int c = 0; c < index.getNlist(); ++c) {
+            const std::vector<int>& ids = index.clusterIds(c);
+            for (size_t i = 0; i < ids.size(); ++i) {
+                owner[(size_t)ids[i]] = c;
+            }
+        }
+        fitFrom(base, &owner, index);
+    }
+};
+
 }  // namespace
 
 std::unique_ptr<PruningBackend> makeBackend(const std::string& name) {
@@ -256,11 +291,14 @@ std::unique_ptr<PruningBackend> makeBackend(const std::string& name) {
     if (name == "pca") {
         return std::unique_ptr<PruningBackend>(new PcaBackend());
     }
+    if (name == "residual_pca") {
+        return std::unique_ptr<PruningBackend>(new ResidualPcaBackend());
+    }
     return nullptr;
 }
 
 std::string backendNames() {
-    return "harmony, rotation, pca";
+    return "harmony, rotation, pca, residual_pca";
 }
 
 }  // namespace harmony

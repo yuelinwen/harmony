@@ -84,6 +84,12 @@ struct Config {
     // slice is 3.1% at the defaults -- which is why it is worth measuring
     // rather than assuming.
     bool gemmAll = false;
+
+    // Forward only the candidates that are still alive, with a bitmap
+    // saying which, instead of the whole running-total array with the
+    // dropped ones marked in place. Pruning saves arithmetic either way;
+    // this is what makes it save bandwidth as well.
+    bool compact = false;
     // Wait for each forward to land before starting the next cluster, which
     // is the blocking arm of the paper's Fig. 2(b) comparison.
     bool blockSend = false;
@@ -233,7 +239,8 @@ inline void printUsage(const char* prog) {
         << "                     otherwise all of a partition's blocks fly\n"
         << "                     at once\n"
         << "  --gemmall <0|1>    gemm at every slice, not just the head (0)\n"
-        << "  --backend <name>   pruning strategy, recorded only  (harmony)\n"
+        << "  --compact <0|1>    forward only the surviving candidates   (0)\n"
+        << "  --backend <name>   rotation applied before search   (harmony)\n"
         << "  --check <0|1>      verify against a single machine    (1)\n"
         << "                     costs more than the search it checks\n"
         << "  --baseline <0|1>   time that pass, report the speedup  (1)\n"
@@ -337,6 +344,8 @@ inline bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.pruneVector = false;
         } else if (opt == "--backend" && hasValue) {
             cfg.backend = argv[++i];
+        } else if (opt == "--compact" && hasValue) {
+            cfg.compact = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--gemmall" && hasValue) {
             cfg.gemmAll = (std::atoi(argv[++i]) != 0);
         } else if (opt == "--netprobe" && hasValue) {
