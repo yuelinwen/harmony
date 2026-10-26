@@ -635,7 +635,7 @@ void Metrics::writeCsv() const {
 
     f = Open::at("test/runs.csv",
         "run_id,timestamp,build,host,data,"
-        "backend,pruning,assign,pipeline,blocksend,gemmall,compact,"
+        "backend,pruning,assign,pipeline,blocksend,gemmall,compact,adeps,"
         "bvec,bdim,nlist,nprobe,k,nq,workers,skew,skewshift,variance,prewarm,"
         "qps,latency_ms,recall,differing,speedup,"
         "dim_ops,bytes_fwd,cand_offered,busy_skew,stale_mean,"
@@ -643,7 +643,7 @@ void Metrics::writeCsv() const {
     if (f != nullptr) {
         std::fprintf(f,
             "%s,%s,%s,%s,%s,"
-            "%s,%s,%s,%d,%d,%d,%d,"
+            "%s,%s,%s,%d,%d,%d,%d,%.3f,"
             "%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.2f,%d,"
             "%.3f,%.4f,%.6f,%d,%.3f,"
             "%ld,%ld,%ld,%.4f,%.6f,"
@@ -651,7 +651,7 @@ void Metrics::writeCsv() const {
             runId, timestampNow().c_str(), buildId(), hostName().c_str(),
             cfg.data.c_str(), cfg.backend.c_str(), pruningLabel().c_str(), cfg.assign.c_str(),
             cfg.pipeline ? 1 : 0, cfg.blockSend ? 1 : 0, cfg.gemmAll ? 1 : 0,
-            cfg.compact ? 1 : 0,
+            cfg.compact ? 1 : 0, cfg.adEps,
             bVec, bDim, nlist, nprobe, k, nq, workers,
             cfg.skew, cfg.skewShift, variance, cfg.prewarm,
             nq / seconds, 1000.0 * seconds / nq, recall,

@@ -279,7 +279,7 @@ HopCount WorkerNode::accumulateGemm(int firstQ, int len, bool first,
                     0.0f, dot.data(), n);
 
         for (int a = 0; a < m; ++a) {
-            float t = thresholds_[firstQ + mem[a].first];
+            float t = thresholds_[firstQ + mem[a].first] * curScale_;
             float* row = &sums[mem[a].second];
             const float* d = &dot[(size_t)a * n];
             for (int v = 0; v < n; ++v) {
@@ -327,7 +327,7 @@ HopCount WorkerNode::accumulate(int firstQ, int len,
         reduction(+ : survivors) reduction(+ : evaluated)
     for (int j = 0; j < len; ++j) {
         const float* qv = &queries_[(size_t)(firstQ + j) * myDim_];
-        float t = thresholds_[firstQ + j];
+        float t = thresholds_[firstQ + j] * curScale_;
         size_t off = qOff[j];
 
         for (int i = 0; i < nprobe_; ++i) {
@@ -412,6 +412,33 @@ void WorkerNode::receiveSetup() {
                 stageOf_[item] = p;
                 break;
             }
+        }
+    }
+
+    // The slice widths, in column order, straight after the setup message.
+    // With them the chain order this worker just derived says how many
+    // dimensions a partial sum has covered by the time it leaves here.
+    std::vector<int> widths(bDim_);
+    MPI_Recv(widths.data(), bDim_, MPI_INT, MASTER_RANK, TAG_SETUP,
+             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    int fullDim = 0;
+    for (int c = 0; c < bDim_; ++c) {
+        fullDim = fullDim + widths[c];
+    }
+
+    backend_ = makeBackend(cfg_.backend, cfg_.adEps);
+    scaleOf_.assign(bDim_, 1.0f);
+    if (backend_ != nullptr) {
+        for (int item = 0; item < bDim_; ++item) {
+            const std::vector<int>& chain = chainOrder.chain(item);
+            int through = 0;
+            for (int p = 0; p <= stageOf_[item]; ++p) {
+                through = through + widths[chain[p]];
+            }
+            float m = backend_->thresholdScale(through, fullDim);
+            // Never looser than the exact test, which is always valid and
+            // at the later hops is the tighter of the two.
+            scaleOf_[item] = (m < 1.0f) ? m : 1.0f;
         }
     }
 
@@ -513,6 +540,7 @@ int WorkerNode::run() {
         int firstQ;
         int len;
         int stage;
+        int item;     // which of the row's items, so the hop knows its scale
         int slotTag;
         bool isFirst;
         bool isLast;
@@ -746,6 +774,7 @@ int WorkerNode::run() {
             int prevCol = prevOf_[item];
             int nextCol = nextOf_[item];
             p.stage = stageOf_[item];        // 0 = first stop
+            p.item = item;
             p.isFirst = (prevCol < 0);
             p.isLast = (nextCol < 0);
             p.prevRank = p.isFirst ? MASTER_RANK : rowBase_ + prevCol;
@@ -863,6 +892,7 @@ int WorkerNode::run() {
         }
 
         phase.reset();
+        curScale_ = scaleOf_[p.item];
         HopCount hop = accumulate(p.firstQ, p.len, p.qOff, p.sums,
                                   p.stage == 0);
         aliveAtStage_[p.stage] = aliveAtStage_[p.stage] + hop.survivors;

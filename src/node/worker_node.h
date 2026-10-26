@@ -4,8 +4,11 @@
 #include <utility>
 #include <vector>
 
+#include <memory>
+
 #include "node.h"
 #include "../config.h"
+#include "../index/backend.h"
 #include "../engine/search_order.h"
 #include "../engine/stopwatch.h"
 #include "../engine/topk_heap.h"
@@ -146,6 +149,18 @@ private:
     std::vector<int> nextOf_;
     std::vector<int> prevOf_;
     std::vector<int> stageOf_;
+
+    // What the pruning threshold is multiplied by on the hop this worker
+    // makes for each item, asked of the backend once at setup. The exact
+    // test is 1.0, so for every backend that only changes the basis this
+    // table is all ones and nothing downstream moves.
+    //
+    // Per item rather than per hop position because an uneven split gives
+    // the columns different widths, and which ones a partial sum has already
+    // been through depends on where the chain started.
+    std::vector<float> scaleOf_;
+    float curScale_ = 1.0f;   // the entry for the block being worked on
+    std::unique_ptr<PruningBackend> backend_;
 
     // tau^2 per query of the current batch, kept between jobs and refreshed by
     // the TAG_THRESHOLD that opens each stage. Indexed by position in the

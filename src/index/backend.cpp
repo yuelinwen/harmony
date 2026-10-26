@@ -281,7 +281,62 @@ public:
 
 }  // namespace
 
-std::unique_ptr<PruningBackend> makeBackend(const std::string& name) {
+// ADSampling (Gao & Long, SIGMOD 2023), as far as this chain can carry it.
+//
+// It wants a random orthogonal basis and nothing more, so it inherits one
+// from rotation and the two differ in exactly one thing: what they are
+// willing to conclude from a partial sum.
+//
+// Harmony drops a candidate once its partial sum is already past the
+// threshold. That is exact, and it is also late -- it waits for proof. The
+// random projection is what turns the partial sum into an estimator of the
+// whole: after d' of D dimensions the full squared distance is around
+// S * D / d', so a candidate can go as soon as that estimate is
+// confidently above the threshold rather than once it is certainly so.
+//
+// The paper's test, written for squared distances:
+//
+//     S / d'  >  (T / D) * (1 + eps / sqrt(d'))^2
+//
+// which is S > T * m with m = (d'/D) * (1 + eps/sqrt(d'))^2. That m is all
+// this backend has to return. eps (--adeps) is the confidence knob: larger
+// is more cautious and prunes later.
+//
+// This is the first backend that is allowed to be wrong, and it will be:
+// the estimate can clear a candidate's true neighbour out of the way, so
+// recall drops and differing stops being 0. That is the method, not a bug
+// in applying it, and sweeping eps is how the trade is measured.
+//
+// What the chain costs it: the paper tests every 32 dimensions, this can
+// only test where one worker hands over to the next, so bDim times. At 1x4
+// on Sift the slice is 32 dimensions and the two agree; at 2x2 there are
+// two tests; at 4x1 the first and only sum is already the whole distance
+// and this degenerates into the exact test. Its headroom here is bounded
+// by bDim, which is worth knowing before reading the numbers.
+class AdSamplingBackend : public RotationBackend {
+public:
+    explicit AdSamplingBackend(float eps) {
+        eps_ = eps;
+    }
+
+    const char* name() const override {
+        return "adsampling";
+    }
+
+    float thresholdScale(int dimsSoFar, int dimsTotal) const override {
+        if (dimsSoFar <= 0 || dimsSoFar >= dimsTotal) {
+            return 1.0f;   // nothing summed yet, or all of it: no guessing
+        }
+        float f = 1.0f + eps_ / std::sqrt((float)dimsSoFar);
+        return ((float)dimsSoFar / (float)dimsTotal) * f * f;
+    }
+
+private:
+    float eps_;
+};
+
+std::unique_ptr<PruningBackend> makeBackend(const std::string& name,
+                                            float adEps) {
     if (name == "harmony") {
         return std::unique_ptr<PruningBackend>(new HarmonyBackend());
     }
@@ -294,11 +349,14 @@ std::unique_ptr<PruningBackend> makeBackend(const std::string& name) {
     if (name == "residual_pca") {
         return std::unique_ptr<PruningBackend>(new ResidualPcaBackend());
     }
+    if (name == "adsampling") {
+        return std::unique_ptr<PruningBackend>(new AdSamplingBackend(adEps));
+    }
     return nullptr;
 }
 
 std::string backendNames() {
-    return "harmony, rotation, pca, residual_pca";
+    return "harmony, rotation, pca, residual_pca, adsampling";
 }
 
 }  // namespace harmony

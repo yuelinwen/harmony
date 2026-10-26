@@ -653,6 +653,17 @@ void MasterNode::distributeData() {
         setup[8] = cfg_.pruneVector ? 1 : 0;
         // MPI: blocking is fine for startup -- the order is fixed and nobody waits
         MPI_Send(setup, 9, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
+
+        // Every column's slice width, in column order. A worker derives the
+        // chain order itself, so what it cannot know is only how wide the
+        // workers ahead of it are -- which is what it needs to say how many
+        // dimensions a partial sum reaching it has already covered. The sum
+        // of these is the full dimension.
+        std::vector<int> widths(bDim_);
+        for (int c = 0; c < bDim_; ++c) {
+            widths[c] = plan_.end(c) - plan_.begin(c);
+        }
+        MPI_Send(widths.data(), bDim_, MPI_INT, w, TAG_SETUP, MPI_COMM_WORLD);
     }
 
     probeNetwork();
@@ -1128,7 +1139,7 @@ int MasterNode::run() {
 
     // Before anything is loaded: an unknown name should cost a typo, not a
     // minute of clustering.
-    backend_ = makeBackend(cfg_.backend);
+    backend_ = makeBackend(cfg_.backend, cfg_.adEps);
     if (backend_ == nullptr) {
         std::cerr << "unknown backend: " << cfg_.backend
                   << "   (" << backendNames() << ")" << std::endl;

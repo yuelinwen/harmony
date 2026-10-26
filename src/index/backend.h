@@ -30,10 +30,17 @@
 // them sends every query to the wrong clusters while still returning
 // plausible-looking results.
 //
-// An orthogonal transform preserves distances exactly, so backends 1-4 must
-// leave `differing` at 0. That is the regression test for this whole file:
-// a non-zero differing after a rotation means the transform was applied
-// somewhere incompletely, not that the method is approximate.
+// An orthogonal transform preserves distances exactly, so a backend that
+// only changes the basis must leave `differing` at 0. That is the
+// regression test for those: a non-zero differing after a rotation means
+// the transform was applied somewhere incompletely, not that the method is
+// approximate.
+//
+// It does not apply to a backend that also changes the decision, through
+// thresholdScale below. Those are approximate on purpose -- they drop
+// candidates on an estimate rather than on proof -- so differing is
+// expected to be non-zero and recall to fall, and what is measured is what
+// the speed cost.
 
 namespace harmony {
 
@@ -55,13 +62,34 @@ public:
         (void)index;
     }
 
+    // How much to scale the pruning threshold at a hop that has summed
+    // dimsSoFar of dimsTotal dimensions.
+    //
+    // 1.0 is the exact test, and the reason it is safe is that a partial sum
+    // only grows: one already past the threshold can never come back under
+    // it. A method that is willing to guess from the partial sum -- that the
+    // remaining dimensions will not rescue this candidate -- expresses it by
+    // returning less than 1.0, which prunes earlier at the cost of being
+    // wrong sometimes.
+    //
+    // Asked once per block per hop, never per candidate: the result is
+    // folded into the threshold before the loop, so the inner test keeps its
+    // shape and a backend costs nothing in there.
+    virtual float thresholdScale(int dimsSoFar, int dimsTotal) const {
+        (void)dimsSoFar;
+        (void)dimsTotal;
+        return 1.0f;
+    }
+
     // As given to --backend, and as recorded in the backend column.
     virtual const char* name() const = 0;
 };
 
 // Returns nullptr for a name that is not a backend, so the caller can print
 // the list rather than run something the user did not ask for.
-std::unique_ptr<PruningBackend> makeBackend(const std::string& name);
+// adEps is --adeps, which only the ADSampling backend reads.
+std::unique_ptr<PruningBackend> makeBackend(const std::string& name,
+                                            float adEps);
 
 // Every name makeBackend accepts, for the error message and for --help.
 std::string backendNames();
