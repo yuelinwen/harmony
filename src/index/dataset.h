@@ -31,6 +31,13 @@ public:
         return &data_[(size_t)i * dim_];
     }
 
+    // The whole array, to be rewritten in place by a backend's transform.
+    // Non-const on purpose: a transform rotates every vector where it lies
+    // rather than building a second copy of the dataset.
+    float* data() {
+        return data_.data();
+    }
+
     int getN() const {
         return n_;
     }

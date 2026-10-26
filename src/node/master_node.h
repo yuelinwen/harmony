@@ -11,6 +11,7 @@
 #include "../engine/slice_plan.h"
 #include "../engine/stopwatch.h"
 #include "../index/dataset.h"
+#include "../index/backend.h"
 #include "../index/ivf_index.h"
 #include "../test/metrics.h"
 #include "../test/verify.h"
@@ -263,6 +264,9 @@ private:
     // WORKER_TIMES numbers per worker, in the order comm/messages.h lists
     // them, filled by collectStats().
     std::vector<std::vector<double>> workerTimes_;
+
+    // Which pruning strategy this run uses. Fixed for the run.
+    std::unique_ptr<PruningBackend> backend_;
 
     // Wall time from the start of run(), so a CSV row can say how long the
     // whole thing took -- loading, clustering and distribution included, none

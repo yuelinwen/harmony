@@ -126,7 +126,7 @@ if [ -f "$FAISS_LIB" ]; then
     # src/test/verify.cpp so recall and r2 mean the same thing on both sides
     # of the comparison, which is the whole point of having it.
     g++ $FLAGS -I third_party/faiss tools/faissbase.cpp \
-        src/index/dataset.cpp src/index/ivf_index.cpp src/test/verify.cpp \
+        src/index/dataset.cpp src/index/ivf_index.cpp src/index/backend.cpp src/test/verify.cpp \
         -o faissbase "$FAISS_LIB" $LIBS
     echo "built ./faissbase"
 else

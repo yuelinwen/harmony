@@ -34,15 +34,6 @@ public:
     void build(const Dataset& base, int nlist, int iterations,
                int perCentroid);
 
-    // Writes the clustering to a file, and reads one back. A run with the
-    // same data and the same parameters produces the same index, so it is
-    // worth keeping: kmeans is the slowest part of startup, and reusing one
-    // file also means two runs being compared share a clustering exactly.
-    //
-    // save returns false if the file cannot be written; load returns false if
-    // it is missing, truncated, or was built for a different dataset, and
-    // leaves the index untouched so the caller can just build instead.
-
     // Returns the k nearest neighbors of one query vector, scanning only
     // the nprobe nearest clusters.
     // Same, but told which clusters to scan instead of working them out. The
@@ -81,6 +72,16 @@ public:
     // The ids of the vectors inside cluster c.
     const std::vector<int>& clusterIds(int c) const {
         return invlists_[c];
+    }
+
+    // The centroids, to be rewritten in place by a backend's transform. A
+    // query reaches a cluster by its distance to the centroid, so a basis
+    // change that misses these sends every query to the wrong clusters.
+    float* centroids() {
+        return centroids_.data();
+    }
+    const float* centroid(int c) const {
+        return &centroids_[(size_t)c * dim_];
     }
 
 private:

@@ -1126,6 +1126,15 @@ std::vector<std::vector<Candidate>> MasterNode::queryPipeline(int firstQuery, in
 int MasterNode::run() {
     wall_.reset();
 
+    // Before anything is loaded: an unknown name should cost a typo, not a
+    // minute of clustering.
+    backend_ = makeBackend(cfg_.backend);
+    if (backend_ == nullptr) {
+        std::cerr << "unknown backend: " << cfg_.backend
+                  << "   (" << backendNames() << ")" << std::endl;
+        return 1;
+    }
+
     // Printed before anything can go wrong, so a run that dies half way still
     // says which binary died. The same three values go into every CSV row.
     std::cout << "run " << timestampNow()
@@ -1145,6 +1154,12 @@ int MasterNode::run() {
     // pass comes first (paper Fig. 3, step 1). It runs whatever the mode is:
     // the cost model is one consumer of the cluster hit counts, splitGrid is
     // the other, and it only costs one centroid scan per profiled query.
+    // After the index, because residual PCA needs the centroids; before the
+    // profiling, because that walks query-to-centroid distances and both
+    // sides have to already be in the new basis.
+    backend_->fit(base_, index_);
+    backend_->apply(base_, query_, index_);
+
     warmupPlan(cfg_.warmup, cfg_.nprobe);
     if (cfg_.costModel) {
         choosePlan();
