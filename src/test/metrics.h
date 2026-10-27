@@ -96,8 +96,8 @@ struct Metrics {
     // The whole "5. results" section, in order.
     void print() const;
 
-    // One row appended to cfg.csv, header first if the file is new. Nothing
-    // happens when --csv was not given.
+    // One row per run appended to each file under test/, header first if the
+    // file is new: one file per measurement, plus runs.csv for the rest.
     void writeCsv() const;
 
     // The two pruning switches as one word: both | dim | vector | none. dim
